@@ -817,10 +817,15 @@ function runFfmpegSegments(opts) {
 
   return new Promise((resolve, reject) => {
     const outPattern = path.join(dir, `${baseName}_%03d.flv`);
+    // segment_list 每个连接独立一份，避免重连时互相覆盖
+    const listPath = path.join(dir, `.segments-${startNumber}.csv`);
 
     const args = [
       '-hide_banner',
       '-loglevel', 'warning',
+      // 限制 ffmpeg 自身缓冲，避免在 1GB 内存容器里被 OOM kill
+      '-probesize', '2M',
+      '-analyzeduration', '2M',
       '-fflags', '+genpts',
       '-i', url,
       '-c', 'copy',
@@ -829,7 +834,7 @@ function runFfmpegSegments(opts) {
       '-segment_time', String(segmentSeconds),
       '-reset_timestamps', '1',
       '-segment_start_number', String(startNumber + 1),
-      '-segment_list', path.join(dir, '.segments.csv'),
+      '-segment_list', listPath,
       '-segment_list_type', 'csv',
       outPattern,
     ];
@@ -844,40 +849,50 @@ function runFfmpegSegments(opts) {
       if (stderr.length > 8000) stderr = stderr.slice(-8000);
     });
 
-    // 监视分段目录：ffmpeg 每写完一段，会关闭文件。用轮询发现新段。
+    /**
+     * 用 ffmpeg 自己维护的 segment_list 判定「哪些段已写完」。
+     *
+     * 为什么不用 readdir + stat 两次比对大小：
+     *  ffmpeg 写文件有页缓存，stat 大小可能长时间不变但其实没写完；
+     *  而且高频 readdir 在 1GB 内存的容器里会造成明显压力。
+     * segment_list 是 ffmpeg 主动追加的，只有真正关闭上一段时才写入，
+     * 是判断分段完成的唯一可靠信号。
+     */
     const seen = new Set();
     let watchTimer = null;
     let stopped = false;
-
     const scan = async () => {
       if (stopped) return;
       try {
-        const files = await fsp.readdir(dir);
-        const mine = files
-          .filter((f) => f.startsWith(`${baseName}_`) && f.endsWith('.flv'))
-          .sort();
-        for (const f of mine) {
-          if (seen.has(f)) continue;
-          const full = path.join(dir, f);
-          // 判断是否还在写：连续两次大小不变视为写完
-          const s1 = await sizeOf(full);
-          await sleep(300);
-          const s2 = await sizeOf(full);
-          if (s1 !== s2 && s1 > 0) continue; // 还在增长，下轮再看
-          if (s2 <= 0) continue;
-          seen.add(f);
+        let txt;
+        try {
+          txt = await fsp.readFile(listPath, 'utf8');
+        } catch {
+          return; // 列表还没生成
+        }
+        // csv 每行：文件名,起始秒,结束秒
+        const lines = txt.split(/\r?\n/).filter(Boolean);
+        for (const line of lines) {
+          const fname = line.split(',')[0]?.trim();
+          if (!fname || seen.has(fname)) continue;
+          // segment_list 会在切下一段时才写入上一段，所以列表里出现的段都已写完
+          const full = path.join(dir, path.basename(fname));
+          const sz = await sizeOf(full);
+          if (sz <= 0) continue;
+          seen.add(fname);
           try {
             await onSegmentFile(full);
           } catch (e) {
-            onLog?.(`处理分段 ${f} 失败：${e.message}`);
+            onLog?.(`处理分段 ${fname} 失败：${e.message}`);
           }
         }
       } catch {
-        /* 目录读取失败忽略 */
+        /* 忽略 */
       }
     };
 
-    watchTimer = setInterval(scan, 1500);
+    // 扫描间隔放宽到 3 秒，进一步降低内存/IO 压力
+    watchTimer = setInterval(scan, 3000);
 
     const cleanup = () => {
       stopped = true;
@@ -909,14 +924,37 @@ function runFfmpegSegments(opts) {
     child.on('close', async (code) => {
       cleanup();
       signal?.removeEventListener('abort', kill);
-      // 收尾：把最后一段也处理掉
+
+      // 收尾：先扫一次 segment_list，再兜底扫目录
+      // （ffmpeg 被 SIGINT 终止时，最后一段可能没写进 list）
       await scan();
-      // 清理 segment_list 临时文件
-      await fsp.rm(path.join(dir, '.segments.csv'), { force: true });
+      try {
+        const files = await fsp.readdir(dir);
+        const mine = files
+          .filter((f) => f.startsWith(`${baseName}_`) && f.endsWith('.flv'))
+          .sort();
+        for (const f of mine) {
+          if (seen.has(f)) continue;
+          const full = path.join(dir, f);
+          const sz = await sizeOf(full);
+          if (sz <= 0) continue;
+          seen.add(f);
+          try {
+            await onSegmentFile(full);
+          } catch (e) {
+            onLog?.(`收尾处理 ${f} 失败：${e.message}`);
+          }
+        }
+      } catch {
+        /* 忽略 */
+      }
+
+      // 清理本轮的 segment_list
+      await fsp.rm(listPath, { force: true });
 
       if (signal?.aborted) return resolve({ aborted: true });
       if (code === 0) return resolve({ aborted: false });
-      if (/Connection|timed out|Server error|End of file|Invalid data/i.test(stderr)) {
+      if (/Connection|timed out|Server error|End of file|Invalid data|Broken pipe|error while decoding/i.test(stderr)) {
         return resolve({ aborted: false, interrupted: true });
       }
       reject(new Error(`ffmpeg 退出码 ${code}：${stderr.slice(-400)}`));
