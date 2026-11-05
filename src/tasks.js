@@ -317,6 +317,10 @@ export class TaskManager extends EventEmitter {
 
     try {
       // ---------- 1. 下载 ----------
+      // 注意：onSegment 必须无条件传入。
+      // 之前写成 `t.live ? uploadSegment : undefined`，但 t.live 是在
+      // downloadLive 内部才置 true 的，调用时还是 undefined，
+      // 导致 onSegment 恒为 undefined，直播分段上传从未被触发。
       const dl = await runDownload(t, {
         url: t.url,
         dir: jobDir,
@@ -324,7 +328,7 @@ export class TaskManager extends EventEmitter {
         signal: ac.signal,
         onProgress,
         onLog,
-        onSegment: t.live ? uploadSegment : undefined,
+        onSegment: uploadSegment,
       });
 
       if (ac.signal.aborted) throw new Error('已取消');
