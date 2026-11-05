@@ -55,6 +55,11 @@ export const config = {
     chunkConcurrency: num(env.CHUNK_CONCURRENCY, 4),
     /** 进度上报间隔（毫秒） */
     progressInterval: num(env.PROGRESS_INTERVAL, 500),
+    /**
+     * 直播分段时长（秒）。每段独立成文件、独立上传，**不合并**。
+     * 300 = 5 分钟一段（推荐，理由见 README「直播分段时长怎么选」）
+     */
+    liveSegmentSeconds: num(env.LIVE_SEGMENT_SECONDS, 300),
   },
 
   // ---------- 重试 ----------

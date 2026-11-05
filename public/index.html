@@ -271,6 +271,16 @@ function renderTask(t) {
   if (t.status === 'uploading' && t.uploaded) {
     metaHtml += `<span>已上传 <b>${fmtBytes(t.uploaded)}</b></span>`;
   }
+  // 直播分段信息
+  if (t.live) {
+    const done = t.segmentsDone || 0;
+    const up = t.segmentsUploaded || 0;
+    if (done > 0) {
+      metaHtml += `<span>已录 <b>${done}</b> 段${t.segmentSeconds ? `（每段 ${Math.round(t.segmentSeconds / 60)} 分钟）` : ''}</span>`;
+    }
+    if (t.upload && up > 0) metaHtml += `<span class="ok">☁ 已传 ${up} 段</span>`;
+    if (t.segmentCount && !running) metaHtml += `<span>共 <b>${t.segmentCount}</b> 段</span>`;
+  }
   if (t.remotePath) metaHtml += `<span class="ok">☁ ${esc(t.remotePath)}</span>`;
   if (t.error) metaHtml += `<span class="err">✕ ${esc(t.error)}</span>`;
 

@@ -275,6 +275,32 @@ export class TaskManager extends EventEmitter {
 
     const onLog = (m) => this._log(t, m);
 
+    // 直播分段上传：每段产出后立即上传并删本地，不占磁盘
+    const uploadSegment = async (rec) => {
+      if (!t.upload) return;
+      const ol = getOpenList();
+      if (!ol.configured) return;
+
+      const remote = buildRemotePath(rec.filename);
+      await ol.uploadFile(rec.path, remote, {
+        signal: ac.signal,
+        onLog,
+      });
+      rec.remotePath = remote;
+      t.segmentsUploaded = (t.segmentsUploaded || 0) + 1;
+      onLog(`第 ${rec.index} 段已上传：${remote}`);
+      this._emit(t);
+
+      if (config.openlist.deleteAfterUpload) {
+        try {
+          await fsp.rm(rec.path, { force: true });
+          rec.deleted = true;
+        } catch (e) {
+          onLog(`第 ${rec.index} 段删除失败：${e.message}`);
+        }
+      }
+    };
+
     try {
       // ---------- 1. 下载 ----------
       const dl = await runDownload(t, {
@@ -284,10 +310,47 @@ export class TaskManager extends EventEmitter {
         signal: ac.signal,
         onProgress,
         onLog,
+        onSegment: t.live ? uploadSegment : undefined,
       });
 
       if (ac.signal.aborted) throw new Error('已取消');
 
+      // ---------- 直播：多文件，逐段收尾 ----------
+      if (dl.multiFile) {
+        t.filename = dl.filename;
+        t.size = dl.size;
+        t.downloaded = dl.size;
+        t.total = dl.size;
+        t.percent = 100;
+        t.speed = 0;
+        t.localPath = '';
+
+        const segs = dl.segments || [];
+        t.segments = segs.map((s) => ({
+          index: s.index,
+          filename: s.filename,
+          size: s.size,
+          remotePath: s.remotePath || '',
+          deleted: Boolean(s.deleted),
+        }));
+        t.segmentCount = segs.length;
+
+        // 未上传的段（关闭了上传或未配置 OpenList）留在本地
+        const kept = segs.filter((s) => !s.deleted && !s.remotePath).length;
+        onLog(
+          `直播录制完成：共 ${segs.length} 段` +
+            (t.upload ? `，已上传 ${t.segmentsUploaded || 0} 段` : `，全部保留本地（${kept} 段）`),
+        );
+
+        t.phase = '已完成';
+        t.status = STATUS.DONE;
+        t.finishedAt = Date.now();
+        this._emit(t);
+        this._saveState();
+        return;
+      }
+
+      // ---------- 单文件：原有流程 ----------
       t.localPath = dl.filePath;
       t.filename = dl.filename;
       t.size = dl.size;

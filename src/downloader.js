@@ -670,66 +670,106 @@ async function fetchToFile(url, dest, signal, byteRange) {
 }
 
 /**
- * 直播流下载（http-flv / rtmp）
+ * 直播流下载（http-flv / rtmp）—— 按时间分段
  *
- * 关键行为：**不分段**。一次连接写一个文件，直到流结束或取消。
- * 只有连接意外中断时，才把已下内容另存为分片并重连续写新文件，
- * 最后由 mergeLiveParts 合并——这样既保证正常情况是单个完整文件，
- * 又能在源不稳定时避免整段丢失。
+ * 行为：
+ *  - 每 LIVE_SEGMENT_SECONDS 秒切一个独立文件（默认 300 秒 = 5 分钟）
+ *  - 每段都是完整可播的 FLV（自带文件头），**不合并**
+ *  - 分段点对齐到关键帧，避免段首花屏
+ *  - 段文件通过 onSegment 回调立即交给上层上传，上传后即可删除，不占磁盘
+ *  - 连接中断时，当前段照常收尾，然后重连开新段继续录
+ *
+ * 为什么用 ffmpeg 而不是自己按字节切：
+ *  直播流是持续不断的 tag 序列，只有 ffmpeg 能准确在关键帧边界切分并保证每段可独立播放。
  */
 async function downloadLive(job, ctx) {
-  const { url, signal, onProgress, onLog } = ctx;
-  const kind = detectKind(url);
+  const { url, signal, onProgress, onLog, onSegment } = ctx;
+  const segSec = Math.max(10, config.download.liveSegmentSeconds || 300);
+
   const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
   const baseName = (ctx.filename || `live_${ts}`).replace(/\.[a-z0-9]+$/i, '');
-  const ext = kind === 'rtmp' ? 'flv' : guessLiveExt(url);
-  const finalName = `${baseName}.${ext}`;
-  const dest = path.join(ctx.dir, finalName);
-  job.filename = finalName;
+  job.filename = `${baseName}_%03d.flv`;
   job.live = true;
+  job.segmentSeconds = segSec;
+  job.segments = [];
+  job.segmentsDone = 0;
 
-  const parts = [];
+  onLog?.(`直播分段录制：每段 ${segSec} 秒，按关键帧对齐，段与段之间不合并`);
+
   let attempt = 0;
   let emptyStreak = 0;
-  let partIndex = 0;
+  let segOffset = 0; // 已产出的段数，用于续接编号
+  let totalBytes = 0;
 
-  // 已完成分段的总字节数（用于进度展示）。
-  // 不能用增量累加，否则重试/重连会把同一批数据重复计入。
-  // 每轮结束后以 parts 里各文件的真实大小为准重算。
-  const recount = async () => {
-    let sum = 0;
-    for (const p of parts) sum += await sizeOf(p);
-    job.downloaded = sum;
-    onProgress?.(sum, 0);
-    return sum;
+  // 每段产出后立即回调（上传/删本地由上层负责）
+  const handleSegment = async (filePath) => {
+    const sz = await sizeOf(filePath);
+    if (sz <= 0) {
+      await fsp.rm(filePath, { force: true });
+      return false;
+    }
+    segOffset++;
+    const idx = segOffset;
+    const name = `${baseName}_${String(idx).padStart(3, '0')}.flv`;
+    const finalPath = path.join(ctx.dir, name);
+
+    // ffmpeg 生成的文件名是 base_%03d.flv，需要改名成统一编号
+    try {
+      await fsp.rename(filePath, finalPath);
+    } catch {
+      /* 若已在目标名则忽略 */
+    }
+
+    totalBytes += sz;
+    job.downloaded = totalBytes;
+    job.segmentsDone = idx;
+    onProgress?.(totalBytes, 0);
+    onLog?.(`第 ${idx} 段完成：${name}  ${humanSize(sz)}`);
+
+    const rec = { index: idx, filename: name, path: finalPath, size: sz };
+    job.segments.push(rec);
+
+    // 立即交给上层（上传后会被删除）
+    if (onSegment) {
+      try {
+        await onSegment(rec);
+      } catch (e) {
+        onLog?.(`第 ${idx} 段上传失败：${e.message}（保留本地）`);
+      }
+    }
+    return true;
   };
 
   while (true) {
     if (signal?.aborted) break;
     attempt++;
 
-    const partPath = parts.length === 0 ? dest + '.live0' : dest + `.live${partIndex}`;
-    partIndex++;
-    onLog?.(`直播连接 #${attempt} → ${path.basename(partPath)}`);
+    onLog?.(`直播连接 #${attempt}，开始录制第 ${segOffset + 1} 段起`);
+    const before = segOffset;
 
-    // 本轮起点：已完成分段总大小
-    let baseBytes = 0;
-    for (const p of parts) baseBytes += await sizeOf(p);
-
-    // 进度以「磁盘上已落盘的字节」为准，避免写流缓冲区导致的虚高。
-    // 每 500ms 采样一次当前分段文件大小。
     let sampler = null;
     try {
+      // 采样当前正在写的段，用于实时进度
       sampler = setInterval(() => {
-        fs.stat(partPath, (err, st) => {
+        const cur = path.join(ctx.dir, `${baseName}_${String(segOffset + 1).padStart(3, '0')}.flv`);
+        fs.stat(cur, (err, st) => {
           if (!err && st.size > 0) {
-            job.downloaded = baseBytes + st.size;
+            job.downloaded = totalBytes + st.size;
             onProgress?.(job.downloaded, 0);
           }
         });
-      }, 500);
+      }, 1000);
 
-      await streamOnce(url, partPath, signal, () => {}, onLog);
+      await runFfmpegSegments({
+        url,
+        dir: ctx.dir,
+        baseName,
+        startNumber: segOffset,
+        segmentSeconds: segSec,
+        signal,
+        onLog,
+        onSegmentFile: handleSegment,
+      });
     } catch (e) {
       if (signal?.aborted) break;
       onLog?.(`连接中断：${e.message}`);
@@ -737,41 +777,151 @@ async function downloadLive(job, ctx) {
       if (sampler) clearInterval(sampler);
     }
 
-    const sz = await sizeOf(partPath);
-    if (sz > 0) {
-      parts.push(partPath);
+    const produced = segOffset - before;
+    if (produced > 0) {
       emptyStreak = 0;
-      onLog?.(`本次收到 ${humanSize(sz)}`);
-      await recount();
     } else {
-      await fsp.rm(partPath, { force: true });
       emptyStreak++;
-      onLog?.(`本次无数据（连续 ${emptyStreak}/${config.retry.liveMaxEmptyRetries}）`);
+      onLog?.(`本次未产出分段（连续 ${emptyStreak}/${config.retry.liveMaxEmptyRetries}）`);
       if (emptyStreak >= config.retry.liveMaxEmptyRetries) {
-        if (parts.length === 0) throw new FatalError('连续多次未收到任何数据，直播可能已结束或地址无效');
+        if (segOffset === 0) throw new FatalError('连续多次未收到任何数据，直播可能已结束或地址无效');
         onLog?.('连续无数据，判定直播已结束');
         break;
       }
     }
 
-    // 直播是无限流：正常读到结束说明源已关闭，稍等再试；已有数据且再次无数据则收尾
-    if (parts.length > 0 && sz === 0 && emptyStreak >= 2) break;
-
     await sleep(config.retry.liveReconnectDelay);
   }
 
-  if (parts.length === 0) throw new FatalError('未下载到任何数据');
+  if (segOffset === 0) throw new FatalError('未录制到任何分段');
 
-  // 合并所有分段（含正常结束的单段）
-  if (parts.length === 1) {
-    await fsp.rename(parts[0], dest);
-  } else {
-    onLog?.(`合并 ${parts.length} 个分段...`);
-    await mergeFiles(parts, dest);
-    for (const p of parts) await fsp.rm(p, { force: true });
-  }
+  onLog?.(`录制结束，共 ${segOffset} 段`);
+  return {
+    // 直播是多文件，这里返回最后一段作为占位，真正的多文件列表在 job.segments
+    filePath: job.segments.length ? job.segments[job.segments.length - 1].path : '',
+    filename: `${baseName}_*.flv`,
+    size: totalBytes,
+    segments: job.segments.slice(),
+    multiFile: true,
+  };
+}
 
-  return { filePath: dest, filename: finalName, size: await sizeOf(dest), parts: parts.length };
+/**
+ * 用 ffmpeg 的 segment muxer 按时间切片。
+ * -c copy 不转码，CPU 占用极低
+ * -reset_timestamps 1 让每段时间戳从 0 开始，可独立播放
+ * -segment_time 按秒切，ffmpeg 会自动找关键帧对齐
+ */
+function runFfmpegSegments(opts) {
+  const { url, dir, baseName, startNumber, segmentSeconds, signal, onLog, onSegmentFile } = opts;
+
+  return new Promise((resolve, reject) => {
+    const outPattern = path.join(dir, `${baseName}_%03d.flv`);
+
+    const args = [
+      '-hide_banner',
+      '-loglevel', 'warning',
+      '-fflags', '+genpts',
+      '-i', url,
+      '-c', 'copy',
+      '-f', 'segment',
+      '-segment_format', 'flv',
+      '-segment_time', String(segmentSeconds),
+      '-reset_timestamps', '1',
+      '-segment_start_number', String(startNumber + 1),
+      '-segment_list', path.join(dir, '.segments.csv'),
+      '-segment_list_type', 'csv',
+      outPattern,
+    ];
+
+    onLog?.(`ffmpeg 启动：每 ${segmentSeconds}s 一段`);
+
+    const child = spawn(config.ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+
+    let stderr = '';
+    child.stderr.on('data', (d) => {
+      stderr += d.toString();
+      if (stderr.length > 8000) stderr = stderr.slice(-8000);
+    });
+
+    // 监视分段目录：ffmpeg 每写完一段，会关闭文件。用轮询发现新段。
+    const seen = new Set();
+    let watchTimer = null;
+    let stopped = false;
+
+    const scan = async () => {
+      if (stopped) return;
+      try {
+        const files = await fsp.readdir(dir);
+        const mine = files
+          .filter((f) => f.startsWith(`${baseName}_`) && f.endsWith('.flv'))
+          .sort();
+        for (const f of mine) {
+          if (seen.has(f)) continue;
+          const full = path.join(dir, f);
+          // 判断是否还在写：连续两次大小不变视为写完
+          const s1 = await sizeOf(full);
+          await sleep(300);
+          const s2 = await sizeOf(full);
+          if (s1 !== s2 && s1 > 0) continue; // 还在增长，下轮再看
+          if (s2 <= 0) continue;
+          seen.add(f);
+          try {
+            await onSegmentFile(full);
+          } catch (e) {
+            onLog?.(`处理分段 ${f} 失败：${e.message}`);
+          }
+        }
+      } catch {
+        /* 目录读取失败忽略 */
+      }
+    };
+
+    watchTimer = setInterval(scan, 1500);
+
+    const cleanup = () => {
+      stopped = true;
+      if (watchTimer) clearInterval(watchTimer);
+    };
+
+    const kill = () => {
+      try {
+        child.kill('SIGINT'); // SIGINT 让 ffmpeg 优雅收尾，写完当前段
+      } catch {
+        /* ignore */
+      }
+      setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* ignore */
+        }
+      }, 3000).unref?.();
+    };
+    signal?.addEventListener('abort', kill, { once: true });
+
+    child.on('error', (e) => {
+      cleanup();
+      signal?.removeEventListener('abort', kill);
+      reject(new Error(`ffmpeg 启动失败：${e.message}`));
+    });
+
+    child.on('close', async (code) => {
+      cleanup();
+      signal?.removeEventListener('abort', kill);
+      // 收尾：把最后一段也处理掉
+      await scan();
+      // 清理 segment_list 临时文件
+      await fsp.rm(path.join(dir, '.segments.csv'), { force: true });
+
+      if (signal?.aborted) return resolve({ aborted: true });
+      if (code === 0) return resolve({ aborted: false });
+      if (/Connection|timed out|Server error|End of file|Invalid data/i.test(stderr)) {
+        return resolve({ aborted: false, interrupted: true });
+      }
+      reject(new Error(`ffmpeg 退出码 ${code}：${stderr.slice(-400)}`));
+    });
+  });
 }
 
 function guessLiveExt(url) {
