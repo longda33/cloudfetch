@@ -14,6 +14,7 @@
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 import { config } from './config.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -175,30 +176,26 @@ export class OpenListClient {
       let lastReport = 0;
 
       try {
-        // 用 Node 的 Readable 作为 body，Node 18+ 的 fetch 需要 duplex: 'half'
-        const nodeStream = fs.createReadStream(localPath);
+        /**
+         * 用 Readable.toWeb() 把 Node 流转成 Web 流。
+         *
+         * 不要手写 new ReadableStream({ start }) 挂 on('data')：
+         * 那样没有背压控制，大文件会把整个内容堆进内存，
+         * 且 controller.enqueue 在队列满时会抛错导致请求卡死。
+         * toWeb() 内部实现了正确的背压和取消传播。
+         */
+        const nodeStream = fs.createReadStream(localPath, { highWaterMark: 256 * 1024 });
 
-        const body = new ReadableStream({
-          start(controller) {
-            nodeStream.on('data', (chunk) => {
-              uploaded += chunk.length;
-              const now = Date.now();
-              if (now - lastReport > 300) {
-                lastReport = now;
-                onProgress?.(total, uploaded);
-              }
-              controller.enqueue(new Uint8Array(chunk));
-            });
-            nodeStream.on('end', () => {
-              onProgress?.(total, total);
-              controller.close();
-            });
-            nodeStream.on('error', (e) => controller.error(e));
-          },
-          cancel() {
-            nodeStream.destroy();
-          },
+        nodeStream.on('data', (chunk) => {
+          uploaded += chunk.length;
+          const now = Date.now();
+          if (now - lastReport > 500) {
+            lastReport = now;
+            onProgress?.(total, uploaded);
+          }
         });
+
+        const body = Readable.toWeb(nodeStream);
 
         const res = await fetch(this.url('/api/fs/put'), {
           method: 'PUT',
@@ -229,6 +226,7 @@ export class OpenListClient {
           if (res.status >= 500 || res.status === 429) err.retryable = true;
           throw err;
         }
+        onProgress?.(total, total);
         return { remotePath, size: total };
       } finally {
         signal?.removeEventListener('abort', onAbort);
