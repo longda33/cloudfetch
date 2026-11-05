@@ -276,16 +276,30 @@ export class TaskManager extends EventEmitter {
     const onLog = (m) => this._log(t, m);
 
     // 直播分段上传：每段产出后立即上传并删本地，不占磁盘
+    t.segmentsUploaded = 0;
     const uploadSegment = async (rec) => {
-      if (!t.upload) return;
+      if (!t.upload) {
+        onLog(`第 ${rec.index} 段：未开启上传，保留本地`);
+        return;
+      }
       const ol = getOpenList();
-      if (!ol.configured) return;
+      if (!ol.configured) {
+        onLog(`第 ${rec.index} 段：OpenList 未配置，保留本地`);
+        return;
+      }
 
       const remote = buildRemotePath(rec.filename);
-      await ol.uploadFile(rec.path, remote, {
-        signal: ac.signal,
-        onLog,
-      });
+      onLog(`第 ${rec.index} 段开始上传 → ${remote}（${humanSize(rec.size)}）`);
+      try {
+        await ol.uploadFile(rec.path, remote, {
+          signal: ac.signal,
+          onLog,
+        });
+      } catch (e) {
+        onLog(`第 ${rec.index} 段上传失败：${e.message}`);
+        throw e;
+      }
+
       rec.remotePath = remote;
       t.segmentsUploaded = (t.segmentsUploaded || 0) + 1;
       onLog(`第 ${rec.index} 段已上传：${remote}`);

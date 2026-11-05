@@ -729,13 +729,19 @@ async function downloadLive(job, ctx) {
     const rec = { index: idx, filename: name, path: finalPath, size: sz };
     job.segments.push(rec);
 
-    // 立即交给上层（上传后会被删除）
+    /**
+     * 上传放到后台，不阻塞分段循环。
+     *
+     * 为什么必须异步：一段 60 秒的直播约 18MB，上传要十几秒。
+     * 如果 await，ffmpeg 写下一段的进度会被拖住，最终导致
+     * segment_list 落后、内存积压、容器被重启。
+     */
     if (onSegment) {
-      try {
-        await onSegment(rec);
-      } catch (e) {
-        onLog?.(`第 ${idx} 段上传失败：${e.message}（保留本地）`);
-      }
+      Promise.resolve()
+        .then(() => onSegment(rec))
+        .catch((e) => {
+          onLog?.(`第 ${idx} 段上传失败：${e.message}（保留本地）`);
+        });
     }
     return true;
   };
