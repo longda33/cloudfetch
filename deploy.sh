@@ -13,7 +13,8 @@
 #   PANEL_PASSWORD 面板密码
 #   OPENLIST_URL   OpenList 地址
 #   OPENLIST_TOKEN OpenList 令牌
-#   UPLOAD_DIR     上传目录，默认 /cloudfetch
+#   OPENLIST_UPLOAD_DIR  上传目录，默认 /cloudfetch
+#                        （也接受旧名 UPLOAD_DIR，两者等价）
 # =====================================================================
 set -euo pipefail
 
@@ -22,7 +23,8 @@ API="https://cloady.com"
 : "${GIT_REPO_URL:?需要 GIT_REPO_URL（仓库地址）}"
 
 APP_NAME="${APP_NAME:-cloudfetch}"
-UPLOAD_DIR="${UPLOAD_DIR:-/cloudfetch}"
+# 兼容两种写法：优先 OPENLIST_UPLOAD_DIR，其次 UPLOAD_DIR
+UPLOAD_DIR="${OPENLIST_UPLOAD_DIR:-${UPLOAD_DIR:-/cloudfetch}}"
 AUTH=(-H "Authorization: Bearer ${CLOADY_TOKEN}")
 
 jqget() { python -c "import sys,json;d=json.load(sys.stdin);print(eval(sys.argv[1]))" "$1" 2>/dev/null || true; }
