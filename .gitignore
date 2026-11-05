@@ -1,0 +1,20 @@
+# 依赖
+node_modules/
+npm-debug.log*
+
+# 运行时数据
+data/
+tmp/
+downloads/
+*.log
+
+# 环境变量（含密钥，绝不提交）
+.env
+.env.local
+.env.*.local
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

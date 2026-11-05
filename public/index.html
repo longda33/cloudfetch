@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CloudFetch · 云端下载器</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☁️</text></svg>">
+<style>
+:root{
+  --bg:#0b0e14; --panel:#131822; --panel2:#1a2130; --border:#242c3d;
+  --text:#e6edf7; --muted:#8b97ad; --accent:#3b82f6; --accent2:#06b6d4;
+  --ok:#10b981; --warn:#f59e0b; --err:#ef4444; --radius:12px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  background:var(--bg);color:var(--text);min-height:100vh;line-height:1.6;
+  background-image:radial-gradient(ellipse 80% 50% at 50% -20%,rgba(59,130,246,.15),transparent);
+}
+.wrap{max-width:1180px;margin:0 auto;padding:28px 20px 60px}
+
+header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:26px;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:12px}
+.logo{
+  width:42px;height:42px;border-radius:11px;display:grid;place-items:center;font-size:22px;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:0 4px 16px rgba(59,130,246,.35);
+}
+h1{font-size:19px;font-weight:650;letter-spacing:-.01em}
+.brand small{color:var(--muted);font-size:12px;display:block;font-weight:400}
+.status-chips{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.chip{
+  display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:20px;
+  background:var(--panel);border:1px solid var(--border);font-size:12px;color:var(--muted);
+}
+.chip .dot{width:7px;height:7px;border-radius:50%;background:var(--muted)}
+.chip.on .dot{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.chip.off .dot{background:var(--err)}
+.chip.warn .dot{background:var(--warn)}
+
+.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:18px}
+.card h2{font-size:14px;font-weight:600;margin-bottom:14px;color:var(--text);display:flex;align-items:center;gap:8px}
+.card h2 .badge{font-size:11px;font-weight:400;color:var(--muted);background:var(--panel2);padding:2px 8px;border-radius:10px}
+
+textarea,input[type=text],input[type=password]{
+  width:100%;background:var(--bg);border:1px solid var(--border);border-radius:9px;
+  padding:12px 14px;color:var(--text);font-size:13px;font-family:inherit;outline:none;
+  transition:border-color .15s,box-shadow .15s;
+}
+textarea{resize:vertical;min-height:96px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;line-height:1.65}
+textarea:focus,input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(59,130,246,.14)}
+textarea::placeholder,input::placeholder{color:#5a6577}
+
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}
+.btn{
+  display:inline-flex;align-items:center;gap:7px;padding:9px 18px;border-radius:9px;border:1px solid transparent;
+  font-size:13px;font-weight:550;cursor:pointer;transition:all .15s;font-family:inherit;white-space:nowrap;
+}
+.btn-primary{background:linear-gradient(135deg,var(--accent),#2563eb);color:#fff;box-shadow:0 3px 12px rgba(59,130,246,.3)}
+.btn-primary:hover{transform:translateY(-1px);box-shadow:0 5px 18px rgba(59,130,246,.42)}
+.btn-primary:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none}
+.btn-ghost{background:var(--panel2);color:var(--muted);border-color:var(--border)}
+.btn-ghost:hover{color:var(--text);border-color:#35405a}
+.btn-danger{background:rgba(239,68,68,.12);color:#fca5a5;border-color:rgba(239,68,68,.28)}
+.btn-danger:hover{background:rgba(239,68,68,.2)}
+.btn-sm{padding:5px 11px;font-size:12px;border-radius:7px}
+.hint{font-size:12px;color:var(--muted);margin-top:8px}
+.hint code{background:var(--panel2);padding:1px 6px;border-radius:4px;font-size:11.5px;color:#93c5fd}
+
+/* 任务列表 */
+.task{
+  background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
+  padding:15px 17px;margin-bottom:11px;transition:border-color .2s,transform .15s;
+}
+.task:hover{border-color:#2d3a52}
+.task.running{border-color:rgba(59,130,246,.4);background:linear-gradient(180deg,rgba(59,130,246,.055),transparent)}
+.task.done{border-color:rgba(16,185,129,.28)}
+.task.failed{border-color:rgba(239,68,68,.3)}
+.task-head{display:flex;align-items:flex-start;gap:12px;margin-bottom:11px}
+.task-icon{
+  width:34px;height:34px;border-radius:9px;display:grid;place-items:center;font-size:16px;
+  background:var(--panel2);flex-shrink:0;
+}
+.task.running .task-icon{background:rgba(59,130,246,.16)}
+.task.done .task-icon{background:rgba(16,185,129,.16)}
+.task.failed .task-icon{background:rgba(239,68,68,.16)}
+.task-main{flex:1;min-width:0}
+.task-name{font-size:13.5px;font-weight:560;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:3px}
+.task-url{font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:ui-monospace,monospace}
+.task-actions{display:flex;gap:6px;flex-shrink:0}
+
+.bar{height:6px;background:var(--bg);border-radius:4px;overflow:hidden;position:relative;margin:10px 0 8px}
+.bar-fill{
+  height:100%;border-radius:4px;transition:width .3s ease;
+  background:linear-gradient(90deg,var(--accent),var(--accent2));position:relative;
+}
+.bar-fill::after{
+  content:'';position:absolute;inset:0;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.35),transparent);
+  animation:shimmer 1.6s infinite;
+}
+@keyframes shimmer{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
+.task.done .bar-fill{background:var(--ok)}
+.task.done .bar-fill::after{display:none}
+.task.failed .bar-fill{background:var(--err)}
+.task.failed .bar-fill::after{display:none}
+.bar.indeterminate .bar-fill{width:35%!important;animation:slide 1.3s ease-in-out infinite}
+@keyframes slide{0%{margin-left:0}50%{margin-left:65%}100%{margin-left:0}}
+
+.meta{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.meta b{color:#b9c5d8;font-weight:550}
+.meta .err{color:#fca5a5}
+.meta .ok{color:#6ee7b7}
+
+.logs{
+  margin-top:10px;background:var(--bg);border-radius:8px;padding:9px 12px;
+  font-family:ui-monospace,monospace;font-size:11px;line-height:1.75;color:var(--muted);
+  max-height:132px;overflow-y:auto;display:none;
+}
+.logs.show{display:block}
+.logs div{white-space:pre-wrap;word-break:break-all}
+
+.empty{text-align:center;padding:52px 20px;color:var(--muted)}
+.empty .big{font-size:42px;margin-bottom:12px;opacity:.45}
+.empty p{font-size:13px}
+
+.toast{
+  position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(90px);
+  background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:11px 20px;
+  font-size:13px;box-shadow:0 8px 30px rgba(0,0,0,.5);transition:transform .28s cubic-bezier(.2,.8,.3,1);
+  z-index:100;max-width:90vw;
+}
+.toast.show{transform:translateX(-50%) translateY(0)}
+.toast.err{border-color:rgba(239,68,68,.4);color:#fca5a5}
+.toast.ok{border-color:rgba(16,185,129,.4);color:#6ee7b7}
+
+/* 登录遮罩 */
+#loginMask{
+  position:fixed;inset:0;background:rgba(11,14,20,.94);display:none;place-items:center;z-index:200;
+  backdrop-filter:blur(6px);
+}
+#loginMask.show{display:grid}
+.login-box{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:32px;width:min(360px,90vw);text-align:center}
+.login-box h3{font-size:16px;margin-bottom:6px}
+.login-box p{font-size:12.5px;color:var(--muted);margin-bottom:18px}
+.login-box input{margin-bottom:12px;text-align:center}
+
+@media(max-width:640px){
+  .wrap{padding:18px 13px 50px}
+  .task-head{flex-wrap:wrap}
+  .task-actions{width:100%;justify-content:flex-end}
+  h1{font-size:17px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <div class="logo">☁️</div>
+      <div>
+        <h1>CloudFetch</h1>
+        <small>云端下载 · 自动上传 OpenList</small>
+      </div>
+    </div>
+    <div class="status-chips">
+      <span class="chip" id="chipSse"><span class="dot"></span><span id="sseText">连接中</span></span>
+      <span class="chip" id="chipOpenlist"><span class="dot"></span><span id="olText">OpenList</span></span>
+      <span class="chip" id="chipDisk"><span class="dot"></span><span id="diskText">磁盘</span></span>
+    </div>
+  </header>
+
+  <!-- 新建任务 -->
+  <div class="card" id="newCard">
+    <h2>新建下载任务</h2>
+    <textarea id="urlInput" placeholder="粘贴下载链接，支持批量（每行一个）
+
+支持类型：
+  • HTTP 直链      https://example.com/video.mp4
+  • HLS 流         https://example.com/index.m3u8
+  • HTTP-FLV 直播   http://.../live/stream.flv
+  • RTMP 直播       rtmp://.../live/stream"></textarea>
+    <div class="row">
+      <button class="btn btn-primary" id="btnAdd">开始下载</button>
+      <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--muted);cursor:pointer">
+        <input type="checkbox" id="uploadToggle" checked style="width:15px;height:15px;cursor:pointer;accent-color:var(--accent)">
+        下载后上传 OpenList
+      </label>
+      <button class="btn btn-ghost btn-sm" id="btnClear" style="margin-left:auto">清空已结束</button>
+    </div>
+    <div class="hint">
+      直播流默认<b>不分段</b>，仅在连接中断时自动重连续写；文件下完自动上传并从本地删除。
+    </div>
+  </div>
+
+  <!-- 任务列表 -->
+  <div id="taskList"></div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<div id="loginMask">
+  <div class="login-box">
+    <h3>🔒 需要登录</h3>
+    <p>请输入访问密码</p>
+    <input type="password" id="pwdInput" placeholder="密码">
+    <button class="btn btn-primary" id="btnLogin" style="width:100%">进入</button>
+  </div>
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const state = { tasks: new Map(), es: null, authRequired: false };
+let toastTimer;
+
+function toast(msg, type = '') {
+  const el = $('#toast');
+  el.textContent = msg;
+  el.className = 'toast show ' + type;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (el.className = 'toast ' + type), 3200);
+}
+
+function fmtBytes(n) {
+  if (!n || n < 0) return '—';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(i === 0 ? 0 : 2) + ' ' + u[i];
+}
+function fmtSpeed(bps) {
+  if (!bps || bps <= 0) return '—';
+  return fmtBytes(bps) + '/s';
+}
+function fmtEta(s) {
+  if (!s || s <= 0 || !isFinite(s)) return '—';
+  if (s < 60) return Math.round(s) + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm' + Math.round(s % 60) + 's';
+  return Math.floor(s / 3600) + 'h' + Math.round((s % 3600) / 60) + 'm';
+}
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+const STATUS_LABEL = {
+  queued: '排队中', downloading: '下载中', uploading: '上传中',
+  done: '已完成', failed: '失败', canceled: '已取消',
+};
+const KIND_ICON = { http: '📄', hls: '🎬', rtmp: '📡', dash: '🎞', unknown: '❓' };
+
+function renderTask(t) {
+  const running = ['queued', 'downloading', 'uploading'].includes(t.status);
+  const cls = t.status === 'done' ? 'done' : t.status === 'failed' ? 'failed' : running ? 'running' : '';
+  const pct = t.percent || 0;
+  const indeterminate = t.status === 'downloading' && !t.total;
+
+  const sizeInfo = t.total
+    ? `${fmtBytes(t.downloaded)} / ${fmtBytes(t.total)}`
+    : t.downloaded ? fmtBytes(t.downloaded) : '—';
+
+  const phaseText = {
+    queued: '排队中', downloading: '下载中', uploading: '上传中',
+    done: '已完成', failed: '失败', canceled: '已取消',
+  }[t.status] || t.status;
+
+  let metaHtml = `<span>${esc(phaseText)}</span>`;
+  metaHtml += `<span>${sizeInfo}</span>`;
+  if (t.status === 'downloading' || t.status === 'uploading') {
+    metaHtml += `<span>速度 <b>${fmtSpeed(t.speed)}</b></span>`;
+    if (t.eta > 0) metaHtml += `<span>剩余 <b>${fmtEta(t.eta)}</b></span>`;
+  }
+  if (t.status === 'uploading' && t.uploaded) {
+    metaHtml += `<span>已上传 <b>${fmtBytes(t.uploaded)}</b></span>`;
+  }
+  if (t.remotePath) metaHtml += `<span class="ok">☁ ${esc(t.remotePath)}</span>`;
+  if (t.error) metaHtml += `<span class="err">✕ ${esc(t.error)}</span>`;
+
+  const showLogs = t.logs && t.logs.length > 0;
+  const logsHtml = showLogs
+    ? `<div class="logs${running || t.status === 'failed' ? ' show' : ''}" id="logs-${t.id}">${t.logs.slice(-40).map((l) => `<div>${esc(l)}</div>`).join('')}</div>`
+    : '';
+
+  return `
+    <div class="task ${cls}" data-id="${t.id}">
+      <div class="task-head">
+        <div class="task-icon">${KIND_ICON[t.kind] || '❓'}</div>
+        <div class="task-main">
+          <div class="task-name" title="${esc(t.filename || t.url)}">${esc(t.filename || '解析中…')}</div>
+          <div class="task-url" title="${esc(t.url)}">${esc(t.url)}</div>
+        </div>
+        <div class="task-actions">
+          ${running ? `<button class="btn btn-danger btn-sm" data-act="cancel" data-id="${t.id}">取消</button>` : ''}
+          ${!running ? `<button class="btn btn-ghost btn-sm" data-act="remove" data-id="${t.id}">删除</button>` : ''}
+          <button class="btn btn-ghost btn-sm" data-act="toggleLogs" data-id="${t.id}">日志</button>
+        </div>
+      </div>
+      <div class="bar${indeterminate ? ' indeterminate' : ''}">
+        <div class="bar-fill" style="width:${indeterminate ? 35 : pct.toFixed(1)}%"></div>
+      </div>
+      <div class="meta">${metaHtml}</div>
+      ${logsHtml}
+    </div>`;
+}
+
+function renderAll() {
+  const list = [...state.tasks.values()].sort((a, b) => b.createdAt - a.createdAt);
+  const el = $('#taskList');
+  if (!list.length) {
+    el.innerHTML = `<div class="empty"><div class="big">☁️</div><p>还没有任务，在上面粘贴链接开始下载</p></div>`;
+    return;
+  }
+  el.innerHTML = list.map(renderTask).join('');
+  // 日志框滚到底
+  el.querySelectorAll('.logs.show').forEach((d) => { d.scrollTop = d.scrollHeight; });
+}
+
+function upsertTask(t) {
+  const prev = state.tasks.get(t.id);
+  state.tasks.set(t.id, t);
+  // 只重绘这一条，避免整表闪烁
+  const list = [...state.tasks.values()].sort((a, b) => b.createdAt - a.createdAt);
+  const el = $('#taskList');
+  const existing = el.querySelector(`[data-id="${t.id}"]`);
+  if (existing) {
+    const tmp = document.createElement('div');
+    tmp.innerHTML = renderTask(t);
+    existing.replaceWith(tmp.firstElementChild);
+    const logs = el.querySelector(`#logs-${t.id}`);
+    if (logs && (prev?.logs?.length !== t.logs?.length)) logs.scrollTop = logs.scrollHeight;
+  } else {
+    el.innerHTML = list.map(renderTask).join('');
+  }
+}
+
+function connectSSE() {
+  if (state.es) state.es.close();
+  const es = new EventSource('/api/events');
+  state.es = es;
+
+  es.addEventListener('open', () => {
+    $('#chipSse').className = 'chip on';
+    $('#sseText').textContent = '已连接';
+  });
+
+  es.addEventListener('snapshot', (e) => {
+    const d = JSON.parse(e.data);
+    state.tasks.clear();
+    for (const t of d.tasks) state.tasks.set(t.id, t);
+    renderAll();
+  });
+
+  es.addEventListener('task', (e) => {
+    upsertTask(JSON.parse(e.data));
+  });
+
+  es.addEventListener('removed', (e) => {
+    const d = JSON.parse(e.data);
+    state.tasks.delete(d.id);
+    const el = document.querySelector(`[data-id="${d.id}"]`);
+    if (el) el.remove();
+    if (!state.tasks.size) renderAll();
+  });
+
+  es.addEventListener('log', (e) => {
+    // 日志随 task 事件整体更新，这里只兜底
+  });
+
+  es.onerror = () => {
+    $('#chipSse').className = 'chip off';
+    $('#sseText').textContent = '重连中';
+    // EventSource 自带重连；若被鉴权拒绝则提示登录
+    if (es.readyState === EventSource.CLOSED) {
+      setTimeout(connectSSE, 3000);
+    }
+  };
+}
+
+async function addTasks() {
+  const text = $('#urlInput').value.trim();
+  if (!text) return toast('请先粘贴链接', 'err');
+  const upload = $('#uploadToggle').checked;
+  const btn = $('#btnAdd');
+  btn.disabled = true;
+  btn.textContent = '提交中…';
+  try {
+    const res = await fetch('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, upload }),
+    });
+    if (res.status === 401) { showLogin(); return; }
+    const j = await res.json();
+    if (!res.ok) throw new Error(j.error || '创建失败');
+    $('#urlInput').value = '';
+    const n = j.created.length;
+    let msg = `已添加 ${n} 个任务`;
+    if (j.errors?.length) msg += `，${j.errors.length} 个失败`;
+    toast(msg, 'ok');
+    for (const t of j.created) upsertTask(t);
+  } catch (e) {
+    toast(e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '开始下载';
+  }
+}
+
+async function act(kind, id) {
+  try {
+    if (kind === 'cancel') {
+      const r = await fetch(`/api/tasks/${id}/cancel`, { method: 'POST' });
+      if (!r.ok) throw new Error((await r.json()).error);
+      toast('已取消');
+    } else if (kind === 'remove') {
+      const r = await fetch(`/api/tasks/${id}`, { method: 'DELETE' });
+      if (!r.ok) throw new Error((await r.json()).error);
+      state.tasks.delete(id);
+      document.querySelector(`[data-id="${id}"]`)?.remove();
+      if (!state.tasks.size) renderAll();
+    }
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+async function refreshChips() {
+  try {
+    const h = await (await fetch('/api/health')).json();
+    state.authRequired = h.authRequired;
+    const ol = $('#chipOpenlist');
+    if (h.openlist) { ol.className = 'chip on'; $('#olText').textContent = 'OpenList 已配置'; }
+    else { ol.className = 'chip warn'; $('#olText').textContent = 'OpenList 未配置'; }
+
+    const d = await (await fetch('/api/disk')).json();
+    const c = $('#chipDisk');
+    if (d.total > 0) {
+      const pct = ((d.total - d.free) / d.total) * 100;
+      c.className = 'chip ' + (pct > 90 ? 'off' : 'on');
+      $('#diskText').textContent = `磁盘 ${d.freeText} 可用`;
+    }
+  } catch { /* ignore */ }
+}
+
+function showLogin() { $('#loginMask').classList.add('show'); $('#pwdInput').focus(); }
+
+async function doLogin() {
+  const password = $('#pwdInput').value;
+  const r = await fetch('/api/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password }),
+  });
+  if (r.ok) {
+    $('#loginMask').classList.remove('show');
+    $('#pwdInput').value = '';
+    connectSSE();
+    toast('登录成功', 'ok');
+  } else {
+    toast('密码错误', 'err');
+  }
+}
+
+// 事件绑定
+$('#btnAdd').addEventListener('click', addTasks);
+$('#urlInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) addTasks();
+});
+$('#btnClear').addEventListener('click', async () => {
+  const r = await fetch('/api/tasks/clear', { method: 'POST' });
+  const j = await r.json();
+  for (const [id, t] of state.tasks) {
+    if (['done', 'failed', 'canceled'].includes(t.status)) state.tasks.delete(id);
+  }
+  renderAll();
+  toast(`已清空 ${j.removed} 条`);
+});
+$('#btnLogin').addEventListener('click', doLogin);
+$('#pwdInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
+
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-act]');
+  if (!btn) return;
+  const { act: kind, id } = btn.dataset;
+  if (kind === 'toggleLogs') {
+    document.getElementById(`logs-${id}`)?.classList.toggle('show');
+    return;
+  }
+  act(kind, id);
+});
+
+// 启动
+(async function init() {
+  await refreshChips();
+
+  // 先查健康状态：未配置密码时直接提示去配置，不给登录框
+  try {
+    const h = await (await fetch('/api/health')).json();
+    if (h.passwordConfigured === false) { showConfigMissing(); return; }
+  } catch { /* 忽略，继续常规流程 */ }
+
+  const r = await fetch('/api/tasks');
+  if (r.status === 401) { showLogin(); return; }
+  if (r.status === 503) { showConfigMissing(); return; }
+  connectSSE();
+  setInterval(refreshChips, 30000);
+})();
+
+function showConfigMissing() {
+  const mask = $('#loginMask');
+  mask.classList.add('show');
+  mask.innerHTML = `
+    <div class="login-box" style="border-color:rgba(245,158,11,.45);text-align:left">
+      <h3 style="text-align:center">⚠️ 未配置访问密码</h3>
+      <p style="line-height:1.9;margin-top:14px">
+        为安全起见，本服务必须设置 <code style="background:#1a2130;padding:2px 6px;border-radius:4px;font-size:11.5px">PANEL_PASSWORD</code> 才能使用。
+      </p>
+      <p style="line-height:1.9;margin-top:10px">
+        请前往 <b>GitHub 仓库 → Settings → Secrets and variables → Actions</b>，
+        添加 Secret <code style="background:#1a2130;padding:2px 6px;border-radius:4px;font-size:11.5px">PANEL_PASSWORD</code>，
+        然后重新运行 <b>Deploy to Cloady</b> 工作流。
+      </p>
+      <p style="font-size:12px;color:#8b97ad;margin-top:16px;text-align:center">
+        配置生效后刷新本页即可。
+      </p>
+    </div>`;
+}
+</script>
+</body>
+</html>

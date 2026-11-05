@@ -1,0 +1,88 @@
+name: Deploy to Cloady
+
+# =====================================================================
+# 部署到 Cloady PaaS
+#
+# 需要在仓库 Settings → Secrets and variables → Actions 配置：
+#
+#   Secrets（加密，不显示）:
+#     CLOADY_TOKEN       Cloady API 令牌（cldy_ 开头）
+#     PANEL_PASSWORD     网站访问密码
+#     OPENLIST_TOKEN     OpenList API 令牌
+#
+#   Variables（明文，可查看）:
+#     OPENLIST_URL       OpenList 站点地址，如 https://pan.example.com
+#     OPENLIST_UPLOAD_DIR  上传目录，默认 /cloudfetch
+#     APP_NAME           应用名，默认 cloudfetch
+#     REGION             地区，留空自动选
+#
+# 改配置后重新运行本 workflow 即可生效（Cloady 环境变量会同步更新）。
+# =====================================================================
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      region:
+        description: '地区（留空自动选可用 free 区）'
+        required: false
+        default: ''
+
+concurrency:
+  group: deploy-cloady
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 校验必要配置
+        env:
+          CLOADY_TOKEN: ${{ secrets.CLOADY_TOKEN }}
+          PANEL_PASSWORD: ${{ secrets.PANEL_PASSWORD }}
+        run: |
+          set -e
+          missing=""
+          [ -z "$CLOADY_TOKEN" ] && missing="$missing CLOADY_TOKEN"
+          [ -z "$PANEL_PASSWORD" ] && missing="$missing PANEL_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "::error::缺少必要 Secret:$missing"
+            echo "请在仓库 Settings → Secrets and variables → Actions 中配置。"
+            exit 1
+          fi
+          echo "配置校验通过"
+
+      - name: 部署到 Cloady
+        env:
+          CLOADY_TOKEN: ${{ secrets.CLOADY_TOKEN }}
+          PANEL_PASSWORD: ${{ secrets.PANEL_PASSWORD }}
+          OPENLIST_TOKEN: ${{ secrets.OPENLIST_TOKEN }}
+          OPENLIST_URL: ${{ vars.OPENLIST_URL }}
+          OPENLIST_UPLOAD_DIR: ${{ vars.OPENLIST_UPLOAD_DIR }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          REGION: ${{ inputs.region || vars.REGION }}
+          GIT_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # 默认值
+          export APP_NAME="${APP_NAME:-cloudfetch}"
+          export OPENLIST_UPLOAD_DIR="${OPENLIST_UPLOAD_DIR:-/cloudfetch}"
+
+          chmod +x deploy.sh
+          ./deploy.sh
+
+      - name: 输出部署结果
+        if: always()
+        run: |
+          echo "### 部署完成" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "应用：\`${{ vars.APP_NAME || 'cloudfetch' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "仓库：\`${{ github.repository }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> 若部署失败，请到 Cloady 控制台查看构建日志。" >> $GITHUB_STEP_SUMMARY

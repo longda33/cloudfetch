@@ -1,0 +1,19 @@
+{
+  "name": "cloudfetch",
+  "version": "1.0.0",
+  "description": "Cloud downloader with live progress, auto-upload to OpenList, and local cleanup",
+  "type": "module",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  },
+  "keywords": ["downloader", "openlist", "alist", "hls", "livestream"],
+  "license": "MIT"
+}
