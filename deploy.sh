@@ -64,10 +64,63 @@ print(hit[0].get('slug','') if hit else '')
 " 2>/dev/null || true)"
 
 if [ -n "${EXISTING}" ]; then
-  echo "    已存在，触发重新部署"
-  curl -fsS -X POST "${AUTH[@]}" -H "Content-Type: application/json" \
-    -d '{}' "${API}/api/workspaces/${WS}/apps/${EXISTING}/deploy" >/dev/null
+  echo "    应用已存在，同步环境变量后重新部署"
   APP_SLUG="${EXISTING}"
+
+  # 关键：已存在的应用不会自动继承新的 env，必须逐个写入。
+  # 先 GET 现有变量拿到 id，已存在则 PATCH 更新，不存在则 POST 创建。
+  VARS_JSON="$(curl -fsS "${AUTH[@]}" "${API}/api/workspaces/${WS}/apps/${APP_SLUG}/vars" || echo '{"vars":[]}')"
+
+  set_var() {
+    local key="$1" val="$2"
+    [ -z "${val}" ] && return 0
+
+    # 查这个 key 是否已存在
+    local vid
+    vid="$(echo "${VARS_JSON}" | python -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    for v in (d.get('vars') or []):
+        if v.get('key')=='$key': print(v.get('id','')); break
+except Exception: pass
+" 2>/dev/null || true)"
+
+    local body code
+    body="$(python -c 'import json,sys;print(json.dumps({"key":sys.argv[1],"value":sys.argv[2]}))' "$key" "$val")"
+
+    if [ -n "${vid}" ]; then
+      # 注意：不要带 ?env= 查询参数，服务端会把它当成 varId 解析而报 400
+      code="$(curl -s -o /tmp/_v.out -w '%{http_code}' -X PATCH "${AUTH[@]}" \
+        -H "Content-Type: application/json" -d "${body}" \
+        "${API}/api/workspaces/${WS}/apps/${APP_SLUG}/vars/${vid}")"
+    else
+      code="$(curl -s -o /tmp/_v.out -w '%{http_code}' -X POST "${AUTH[@]}" \
+        -H "Content-Type: application/json" -d "${body}" \
+        "${API}/api/workspaces/${WS}/apps/${APP_SLUG}/vars")"
+    fi
+
+    if [ "${code}" = "200" ] || [ "${code}" = "201" ]; then
+      echo "      ${key} = ${val} ✓"
+    else
+      echo "      ${key} 写入返回 HTTP ${code}：$(head -c 200 /tmp/_v.out)"
+    fi
+  }
+
+  set_var "PORT" "3000"
+  set_var "DATA_DIR" "/tmp/cloudfetch"
+  set_var "OPENLIST_UPLOAD_DIR" "${UPLOAD_DIR}"
+  set_var "DELETE_AFTER_UPLOAD" "true"
+  set_var "MAX_CONCURRENT" "2"
+  set_var "RETRY_MAX_ATTEMPTS" "8"
+  [ -n "${PANEL_PASSWORD:-}" ] && set_var "PANEL_PASSWORD" "${PANEL_PASSWORD}"
+  [ -n "${OPENLIST_URL:-}" ]   && set_var "OPENLIST_URL" "${OPENLIST_URL}"
+  [ -n "${OPENLIST_TOKEN:-}" ] && set_var "OPENLIST_TOKEN" "${OPENLIST_TOKEN}"
+  rm -f /tmp/_v.out
+
+  echo "    触发重新部署"
+  curl -fsS -X POST "${AUTH[@]}" -H "Content-Type: application/json" \
+    -d '{}' "${API}/api/workspaces/${WS}/apps/${APP_SLUG}/deploy" >/dev/null
 else
   # ---------- 创建应用 ----------
   echo "==> 创建应用"
