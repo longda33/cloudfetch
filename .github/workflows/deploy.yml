@@ -65,6 +65,7 @@ jobs:
           OPENLIST_TOKEN: ${{ secrets.OPENLIST_TOKEN }}
           OPENLIST_URL: ${{ vars.OPENLIST_URL }}
           OPENLIST_UPLOAD_DIR: ${{ vars.OPENLIST_UPLOAD_DIR }}
+          LIVE_SEGMENT_SECONDS: ${{ vars.LIVE_SEGMENT_SECONDS }}
           APP_NAME: ${{ vars.APP_NAME }}
           REGION: ${{ inputs.region || vars.REGION }}
           GIT_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
@@ -73,6 +74,7 @@ jobs:
           # 默认值
           export APP_NAME="${APP_NAME:-cloudfetch}"
           export OPENLIST_UPLOAD_DIR="${OPENLIST_UPLOAD_DIR:-/cloudfetch}"
+          export LIVE_SEGMENT_SECONDS="${LIVE_SEGMENT_SECONDS:-300}"
 
           chmod +x deploy.sh
           ./deploy.sh
