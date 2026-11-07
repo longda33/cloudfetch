@@ -708,17 +708,48 @@ async function downloadLive(job, ctx) {
       await fsp.rm(filePath, { force: true });
       return false;
     }
-    segOffset++;
-    const idx = segOffset;
-    const name = `${baseName}_${String(idx).padStart(3, '0')}.flv`;
+
+    /**
+     * 关键：先算出目标文件名，若它与源文件已经是同一个路径，
+     * 说明 ffmpeg 的编号正好接上了，无需 rename——直接用。
+     *
+     * 之前的 bug：无条件 segOffset++ 再 rename，
+     * 当 ffmpeg 写出的文件名恰好等于 baseName_${idx}.flv 时，
+     * rename 变成「自己重命名自己」，抛错被 catch 吞掉，
+     * 但 segOffset 已经加了，于是同一个文件被当成新段重复上传。
+     */
+    const nextIdx = segOffset + 1;
+    const name = `${baseName}_${String(nextIdx).padStart(3, '0')}.flv`;
     const finalPath = path.join(ctx.dir, name);
 
-    // ffmpeg 生成的文件名是 base_%03d.flv，需要改名成统一编号
-    try {
-      await fsp.rename(filePath, finalPath);
-    } catch {
-      /* 若已在目标名则忽略 */
+    // 源文件已在目标位置 → 不要 rename，也不重复计数
+    const samePath = path.resolve(filePath) === path.resolve(finalPath);
+    if (samePath) {
+      // 该文件已经被处理过（seen 集合在 runFfmpegSegments 里保证不会重复进来）
+      // 这里只需确保计数与文件名一致
+      segOffset = nextIdx;
+    } else {
+      // 目标已存在 → 说明这个文件之前处理过，跳过，避免重复
+      const exists = await fsp
+        .stat(finalPath)
+        .then((st) => st.size > 0)
+        .catch(() => false);
+      if (exists) {
+        onLog?.(`跳过重复分段：${name}（目标已存在）`);
+        // 删掉 ffmpeg 多写的这份，避免占磁盘
+        await fsp.rm(filePath, { force: true });
+        return false;
+      }
+      try {
+        await fsp.rename(filePath, finalPath);
+        segOffset = nextIdx;
+      } catch (e) {
+        onLog?.(`分段改名失败 ${path.basename(filePath)} → ${name}：${e.message}`);
+        return false;
+      }
     }
+
+    const idx = segOffset;
 
     totalBytes += sz;
     job.downloaded = totalBytes;
@@ -766,6 +797,13 @@ async function downloadLive(job, ctx) {
         });
       }, 1000);
 
+      /**
+       * segmentSeconds 直接传目标值。
+       *
+       * 不需要跨连接累积秒数：ffmpeg 已通过 -reconnect 参数在进程内
+       * 自动重连，segment 计时器不会因源站断流而重置。
+       * 这个外层循环只在 ffmpeg 真正退出（重连也失败）时才兜底重启。
+       */
       await runFfmpegSegments({
         url,
         dir: ctx.dir,
@@ -833,6 +871,22 @@ function runFfmpegSegments(opts) {
       '-probesize', '2M',
       '-analyzeduration', '2M',
       '-fflags', '+genpts',
+
+      /**
+       * HTTP 层自动重连 —— 这是让分段时长生效的关键。
+       *
+       * 实测：这个直播源每约 54 秒主动断流（Stream ends prematurely）。
+       * 不加这几个参数时，ffmpeg 一断就退出，segment 计时器归零，
+       * 于是每段被源站节奏切成 50-60 秒，-segment_time 600 永远不触发。
+       *
+       * 加上之后 ffmpeg 在同一个进程内自动重连，segment 计时器持续累加，
+       * 实测 200 秒只产出 1 个连续文件，分段时长才真正按设置走。
+       */
+      '-reconnect', '1',
+      '-reconnect_streamed', '1',
+      '-reconnect_delay_max', '5',
+      '-reconnect_at_eof', '1',
+
       '-i', url,
       '-c', 'copy',
       '-f', 'segment',
@@ -845,7 +899,7 @@ function runFfmpegSegments(opts) {
       outPattern,
     ];
 
-    onLog?.(`ffmpeg 启动：每 ${segmentSeconds}s 一段`);
+    onLog?.(`ffmpeg 启动：每 ${segmentSeconds}s 一段（含自动重连）`);
 
     const child = spawn(config.ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
 
