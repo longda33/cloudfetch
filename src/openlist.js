@@ -16,6 +16,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { config } from './config.js';
+ import { humanSize } from './util/links.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -74,7 +75,16 @@ export class OpenListClient {
   }
 
   /** 统一请求封装 */
-  async request(method, apiPath, { body, headers = {}, signal, timeout = 60000 } = {}) {
+  /**
+   * 发一个 OpenList API 请求。
+   *
+   * @param {object} [opts]
+   * @param {object} [opts.body]      JSON 请求体（会自动序列化）
+   * @param {Buffer} [opts.rawBody]   原始字节请求体（分片上传用）
+   * @param {boolean} [opts.raw]      true = 返回 {status, ok, text, json}，
+   *                                  不做错误检查，交给调用方判断
+   */
+  async request(method, apiPath, { body, rawBody, raw = false, headers = {}, signal, timeout = 60000 } = {}) {
     const token = await this.ensureToken();
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeout);
@@ -82,14 +92,22 @@ export class OpenListClient {
     signal?.addEventListener('abort', onAbort, { once: true });
 
     try {
+      const isJson = body && !(body instanceof FormData);
       const res = await fetch(this.url(apiPath), {
         method,
         headers: {
           Authorization: token,
-          ...(body && !(body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}),
+          ...(isJson ? { 'Content-Type': 'application/json' } : {}),
           ...headers,
         },
-        body: body instanceof FormData ? body : body ? JSON.stringify(body) : undefined,
+        body:
+          rawBody !== undefined
+            ? rawBody
+            : body instanceof FormData
+              ? body
+              : body
+                ? JSON.stringify(body)
+                : undefined,
         signal: ac.signal,
       });
 
@@ -99,6 +117,11 @@ export class OpenListClient {
         json = JSON.parse(text);
       } catch {
         /* 非 JSON 响应 */
+      }
+
+      // 分片协议要自己看 status / code，不能在这里抛
+      if (raw) {
+        return { status: res.status, ok: res.ok, text, json };
       }
 
       if (!res.ok) {
@@ -152,6 +175,200 @@ export class OpenListClient {
   }
 
   /**
+   * 分片上传（OpenList 的 resumable multipart 协议）。
+   *
+   * 为什么需要：单请求 PUT /api/fs/put 受 Cloudflare 请求体上限约束，
+   * 实测超过约 130MB 直接被 413 挡回，请求到不了 OpenList。
+   * 分片上传把文件切成 10MB 一片，每片单独 PUT，最后合并，
+   * 每片体积远低于 CDN 限制，因此可以传任意大小的文件。
+   *
+   * 协议（参考 cf-music-dl-py，经实测验证）：
+   *   POST /api/fs/multipart/init
+   *       必需头：File-Path（URL 编码的完整路径）、X-File-Size、
+   *               X-Chunk-Size、Last-Modified、Content-Type、Overwrite
+   *       返回：{ upload_id, chunk_size, total_chunks, received }
+   *   PUT  /api/fs/multipart/chunk
+   *       必需头：X-Upload-Id、X-Chunk-Index
+   *       体：该片的原始字节
+   *   POST /api/fs/multipart/complete
+   *       必需头：X-Upload-Id
+   *
+   * 缺任何一个头都会失败：只给 X-File-Size 会报
+   * "storage not found; please add a storage first"（误导性错误）。
+   *
+   * @returns {Promise<{ok:boolean, reason?:string}>}
+   *   ok=false 表示服务端不支持分片，调用方应回退到单请求上传。
+   */
+  async uploadFileMultipart(localPath, remotePath, opts = {}) {
+    const { signal, onProgress, onLog } = opts;
+    const st = await fsp.stat(localPath);
+    const size = st.size;
+    if (size <= 0) throw new OpenListError('文件为空，无需上传');
+
+    const remoteDir = path.posix.dirname(remotePath);
+    await this.ensureDir(remoteDir, signal);
+    const token = await this.ensureToken();
+
+    const CHUNK = 10 * 1024 * 1024; // 10MB，参考项目实测可用
+
+    // ---- 1) init ----
+    const initRes = await this.request('POST', '/api/fs/multipart/init', {
+      raw: true,
+      headers: {
+        'File-Path': encodeURIComponent(remotePath),
+        'X-File-Size': String(size),
+        'X-Chunk-Size': String(CHUNK),
+        'Content-Type': 'application/octet-stream',
+        'Last-Modified': String(Math.floor(st.mtimeMs)),
+        Overwrite: 'true',
+      },
+      signal,
+      timeout: 60000,
+    });
+
+    if (initRes.status === 404 || initRes.status === 405) {
+      return { ok: false, reason: `multipart 端点不存在（HTTP ${initRes.status}）` };
+    }
+
+    let initJson = null;
+    try {
+      initJson = JSON.parse(initRes.text);
+    } catch {
+      /* ignore */
+    }
+    if (!initJson || (initJson.code !== undefined && initJson.code !== 200)) {
+      const msg = initJson?.message || initRes.text.slice(0, 160);
+      // storage 不支持分片时会返回这类消息，交给调用方回退
+      if (/not found|unsupported|not implement/i.test(msg)) {
+        return { ok: false, reason: msg };
+      }
+      throw new OpenListError(`分片初始化失败：${msg}`);
+    }
+
+    const sess = initJson.data;
+    if (!sess || !sess.upload_id) {
+      return { ok: false, reason: '服务端未返回 upload_id（存储驱动不支持分片）' };
+    }
+
+    const uploadId = String(sess.upload_id);
+    const chunkSize = Number(sess.chunk_size) || CHUNK;
+    const totalChunks =
+      Number(sess.total_chunks) || Math.ceil(size / chunkSize);
+
+    // 断点续传：服务端可能已经收到部分片
+    const received = new Set();
+    if (Array.isArray(sess.received)) {
+      for (const item of sess.received) {
+        if (Array.isArray(item) && item.length === 2) {
+          for (let i = Number(item[0]); i <= Number(item[1]); i++) received.add(i);
+        }
+      }
+    }
+    if (received.size) onLog?.(`续传：服务端已有 ${received.size}/${totalChunks} 片`);
+
+    onLog?.(
+      `分片上传：${humanSize(size)}，每片 ${humanSize(chunkSize)}，共 ${totalChunks} 片`,
+    );
+
+    // ---- 2) 逐片上传 ----
+    const fh = await fsp.open(localPath, 'r');
+    let done = received.size;
+    let uploadedBytes = done * chunkSize;
+
+    try {
+      for (let idx = 0; idx < totalChunks; idx++) {
+        if (signal?.aborted) throw new OpenListError('已取消');
+
+        if (received.has(idx)) continue;
+
+        const start = idx * chunkSize;
+        const len = Math.min(chunkSize, size - start);
+        const buf = Buffer.allocUnsafe(len);
+        await fh.read(buf, 0, len, start);
+
+        // 单片失败重试 5 次，409/429 退避
+        let lastErr;
+        for (let attempt = 1; attempt <= 5; attempt++) {
+          if (signal?.aborted) throw new OpenListError('已取消');
+          try {
+            const r = await this.request('PUT', '/api/fs/multipart/chunk', {
+              raw: true,
+              rawBody: buf,
+              headers: {
+                'X-Upload-Id': uploadId,
+                'X-Chunk-Index': String(idx),
+                'Content-Type': 'application/octet-stream',
+              },
+              signal,
+              timeout: 600000,
+            });
+            let j = null;
+            try {
+              j = JSON.parse(r.text);
+            } catch {
+              /* ignore */
+            }
+            if (r.status === 409 || r.status === 429) {
+              const e = new OpenListError(`HTTP ${r.status}`, r.status);
+              e.retryable = true;
+              throw e;
+            }
+            if (!r.ok || (j && j.code !== undefined && j.code !== 200)) {
+              throw new OpenListError(
+                `第 ${idx + 1} 片失败：HTTP ${r.status} ${(j?.message || r.text).slice(0, 120)}`,
+              );
+            }
+            lastErr = null;
+            break;
+          } catch (e) {
+            lastErr = e;
+            if (attempt < 5) {
+              const wait = Math.min(attempt * 2, 8) * 1000;
+              onLog?.(`第 ${idx + 1} 片异常，${attempt}/5 重试：${e.message}`);
+              await new Promise((r) => setTimeout(r, wait));
+            }
+          }
+        }
+        if (lastErr) throw new OpenListError(`第 ${idx + 1}/${totalChunks} 片上传失败：${lastErr.message}`);
+
+        done++;
+        uploadedBytes = Math.min(size, uploadedBytes + len);
+        onProgress?.(size, uploadedBytes);
+        if (done % 5 === 0 || done === totalChunks) {
+          onLog?.(`分片进度：${done}/${totalChunks}（${humanSize(uploadedBytes)}）`);
+        }
+      }
+    } finally {
+      await fh.close();
+    }
+
+    // ---- 3) 合并 ----
+    const compRes = await this.request('POST', '/api/fs/multipart/complete', {
+      raw: true,
+      headers: { 'X-Upload-Id': uploadId },
+      signal,
+      timeout: 600000,
+    });
+    let compJson = null;
+    try {
+      compJson = JSON.parse(compRes.text);
+    } catch {
+      /* ignore */
+    }
+    if (
+      !compRes.ok ||
+      (compJson && compJson.code !== undefined && compJson.code !== 200)
+    ) {
+      throw new OpenListError(
+        `分片合并失败：${(compJson?.message || compRes.text).slice(0, 160)}`,
+      );
+    }
+
+    onProgress?.(size, size);
+    return { ok: true, remotePath, size };
+  }
+
+  /**
    * 上传单个文件
    * @param {string} localPath 本地绝对路径
    * @param {string} remotePath OpenList 里的完整路径，如 /cloudfetch/2026-11-05/a.mp4
@@ -161,6 +378,23 @@ export class OpenListClient {
     const { signal, onProgress, onLog } = opts;
     const st = await fsp.stat(localPath);
     const total = st.size;
+
+    /**
+     * 优先走分片上传。
+     *
+     * 单请求 PUT 受 Cloudflare 请求体上限约束（实测 >130MB 直接 413），
+     * 而分片上传每片只有 10MB，可以传任意大小的文件。
+     * 只有当服务端/存储驱动不支持分片时才回退到单请求。
+     */
+    try {
+      const mp = await this.uploadFileMultipart(localPath, remotePath, opts);
+      if (mp.ok) return { remotePath, size: total };
+      onLog?.(`分片上传不可用（${mp.reason}），回退到单请求上传`);
+    } catch (e) {
+      if (signal?.aborted) throw e;
+      // 分片中途失败也回退，但要把原因写清楚
+      onLog?.(`分片上传失败：${e.message}，回退到单请求上传`);
+    }
 
     const remoteDir = path.posix.dirname(remotePath);
     await this.ensureDir(remoteDir, signal);
