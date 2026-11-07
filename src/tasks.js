@@ -10,6 +10,7 @@ import crypto from 'node:crypto';
 import { config } from './config.js';
 import { runDownload } from './downloader.js';
 import { getOpenList, buildRemotePath } from './openlist.js';
+import { getHistoryStore } from './history.js';
 import { detectKind, humanSize } from './util/links.js';
 
 /** 任务状态机 */
@@ -454,7 +455,45 @@ export class TaskManager extends EventEmitter {
       }
     } finally {
       t._abort = null;
+
+      // 写入历史记录（存到 OpenList，容器重建也不丢）
+      try {
+        await getHistoryStore().upsert(this._historyRecord(t));
+      } catch (e) {
+        console.error(`[history] 记录任务失败：${e.message}`);
+      }
     }
+  }
+
+  /** 从任务对象提炼一条精简的历史记录（不含日志，避免体积过大） */
+  _historyRecord(t) {
+    const segs = t.segments || [];
+    return {
+      id: t.id,
+      url: t.url,
+      filename: t.filename,
+      kind: t.kind,
+      live: Boolean(t.live),
+      upload: Boolean(t.upload),
+      status: t.status,
+      size: t.size || 0,
+      createdAt: t.createdAt,
+      startedAt: t.startedAt,
+      finishedAt: t.finishedAt,
+      remotePath: t.remotePath || '',
+      segmentCount: t.segmentCount || segs.length || 0,
+      segmentsUploaded: t.segmentsUploaded || 0,
+      // 直播分段只记远端路径，不记本地路径
+      segments: segs.map((s) => ({
+        index: s.index,
+        filename: s.filename,
+        size: s.size,
+        remotePath: s.remotePath || '',
+      })),
+      error: t.error || '',
+      duration:
+        t.startedAt && t.finishedAt ? Math.round((t.finishedAt - t.startedAt) / 1000) : 0,
+    };
   }
 }
 

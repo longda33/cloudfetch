@@ -88,23 +88,45 @@ textarea::placeholder,input::placeholder{color:#5a6577}
 .task-url{font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:ui-monospace,monospace}
 .task-actions{display:flex;gap:6px;flex-shrink:0}
 
-.bar{height:6px;background:var(--bg);border-radius:4px;overflow:hidden;position:relative;margin:10px 0 8px}
+/* 进度条：细线 + 渐变流动 + 端点脉冲，替代原来的大块 shimmer */
+.bar{
+  height:4px;background:rgba(255,255,255,.06);border-radius:99px;overflow:hidden;
+  position:relative;margin:11px 0 9px;
+}
 .bar-fill{
-  height:100%;border-radius:4px;transition:width .3s ease;
-  background:linear-gradient(90deg,var(--accent),var(--accent2));position:relative;
+  height:100%;border-radius:99px;transition:width .45s cubic-bezier(.4,0,.2,1);
+  background:linear-gradient(90deg,#3b82f6,#22d3ee,#3b82f6);
+  background-size:200% 100%;
+  animation:flow 2.4s linear infinite;
+  position:relative;
 }
+@keyframes flow{0%{background-position:0% 0}100%{background-position:200% 0}}
+/* 右端亮点，像水流的前锋 */
 .bar-fill::after{
-  content:'';position:absolute;inset:0;
-  background:linear-gradient(90deg,transparent,rgba(255,255,255,.35),transparent);
-  animation:shimmer 1.6s infinite;
+  content:'';position:absolute;right:0;top:50%;transform:translateY(-50%);
+  width:14px;height:14px;border-radius:50%;
+  background:radial-gradient(circle,#67e8f9 0%,rgba(34,211,238,.5) 45%,transparent 70%);
+  animation:pulse 1.4s ease-in-out infinite;
 }
-@keyframes shimmer{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
-.task.done .bar-fill{background:var(--ok)}
+@keyframes pulse{0%,100%{opacity:.55;transform:translateY(-50%) scale(.85)}50%{opacity:1;transform:translateY(-50%) scale(1.15)}}
+
+.task.done .bar-fill{background:linear-gradient(90deg,#10b981,#34d399);animation:none}
 .task.done .bar-fill::after{display:none}
-.task.failed .bar-fill{background:var(--err)}
+.task.failed .bar-fill{background:linear-gradient(90deg,#ef4444,#f87171);animation:none}
 .task.failed .bar-fill::after{display:none}
-.bar.indeterminate .bar-fill{width:35%!important;animation:slide 1.3s ease-in-out infinite}
-@keyframes slide{0%{margin-left:0}50%{margin-left:65%}100%{margin-left:0}}
+
+/* 不确定进度（直播等未知总大小）：来回扫光，不用 margin 动画 */
+.bar.indeterminate .bar-fill{
+  width:38%!important;
+  background:linear-gradient(90deg,transparent,#3b82f6,#22d3ee,transparent);
+  background-size:200% 100%;
+  animation:sweep 1.8s ease-in-out infinite;
+}
+@keyframes sweep{
+  0%{transform:translateX(-100%)}
+  100%{transform:translateX(365%)}
+}
+.bar.indeterminate .bar-fill::after{display:none}
 
 .meta{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums}
 .meta b{color:#b9c5d8;font-weight:550}
@@ -115,9 +137,66 @@ textarea::placeholder,input::placeholder{color:#5a6577}
   margin-top:10px;background:var(--bg);border-radius:8px;padding:9px 12px;
   font-family:ui-monospace,monospace;font-size:11px;line-height:1.75;color:var(--muted);
   max-height:132px;overflow-y:auto;display:none;
+  overscroll-behavior:contain;
 }
 .logs.show{display:block}
 .logs div{white-space:pre-wrap;word-break:break-all}
+
+/* ===== 标签切换 ===== */
+.tabs{display:flex;gap:4px;margin-bottom:16px;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:4px}
+.tab{
+  flex:1;padding:8px 14px;border-radius:7px;border:none;background:transparent;color:var(--muted);
+  font-size:13px;font-weight:550;cursor:pointer;font-family:inherit;transition:all .15s;
+  display:flex;align-items:center;justify-content:center;gap:6px;
+}
+.tab:hover{color:var(--text)}
+.tab.active{background:var(--panel2);color:var(--text);box-shadow:0 1px 4px rgba(0,0,0,.25)}
+.tab .cnt{
+  font-size:11px;background:rgba(59,130,246,.2);color:#93c5fd;
+  padding:1px 7px;border-radius:99px;font-weight:600;
+}
+
+/* ===== 历史记录 ===== */
+.hist-toolbar{display:flex;gap:9px;margin-bottom:14px;flex-wrap:wrap;align-items:center}
+.hist-toolbar input[type=text]{
+  flex:1;min-width:160px;background:var(--bg);border:1px solid var(--border);border-radius:8px;
+  padding:8px 12px;color:var(--text);font-size:13px;outline:none;font-family:inherit;
+}
+.hist-toolbar input[type=text]:focus{border-color:var(--accent)}
+.hist-toolbar select{
+  background:var(--bg);border:1px solid var(--border);border-radius:8px;
+  padding:8px 10px;color:var(--text);font-size:13px;outline:none;font-family:inherit;cursor:pointer;
+}
+
+.hist-item{
+  background:var(--panel);border:1px solid var(--border);border-radius:10px;
+  padding:13px 15px;margin-bottom:9px;transition:border-color .15s;
+}
+.hist-item:hover{border-color:#2d3a52}
+.hist-row{display:flex;align-items:flex-start;gap:11px}
+.hist-ico{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;font-size:15px;background:var(--panel2);flex-shrink:0}
+.hist-body{flex:1;min-width:0}
+.hist-title{font-size:13px;font-weight:550;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px}
+.hist-sub{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:ui-monospace,monospace}
+.hist-meta{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin-top:7px;font-variant-numeric:tabular-nums}
+.hist-meta b{color:#b9c5d8;font-weight:550}
+.hist-acts{display:flex;gap:6px;flex-shrink:0}
+.badge{
+  font-size:10.5px;padding:2px 8px;border-radius:99px;font-weight:600;
+  display:inline-flex;align-items:center;gap:4px;
+}
+.badge.done{background:rgba(16,185,129,.16);color:#6ee7b7}
+.badge.failed{background:rgba(239,68,68,.16);color:#fca5a5}
+.badge.canceled{background:rgba(148,163,184,.16);color:#cbd5e1}
+.badge.live{background:rgba(168,85,247,.16);color:#d8b4fe}
+
+.pager{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:16px;font-size:12.5px;color:var(--muted)}
+.pager button{
+  background:var(--panel2);border:1px solid var(--border);color:var(--muted);
+  padding:6px 13px;border-radius:7px;cursor:pointer;font-size:12.5px;font-family:inherit;
+}
+.pager button:hover:not(:disabled){color:var(--text);border-color:#35405a}
+.pager button:disabled{opacity:.35;cursor:not-allowed}
 
 .empty{text-align:center;padding:52px 20px;color:var(--muted)}
 .empty .big{font-size:42px;margin-bottom:12px;opacity:.45}
@@ -169,31 +248,68 @@ textarea::placeholder,input::placeholder{color:#5a6577}
     </div>
   </header>
 
-  <!-- 新建任务 -->
-  <div class="card" id="newCard">
-    <h2>新建下载任务</h2>
-    <textarea id="urlInput" placeholder="粘贴下载链接，支持批量（每行一个）
+  <!-- 标签切换 -->
+  <div class="tabs">
+    <button class="tab active" data-tab="active" id="tabActive">
+      进行中 <span class="cnt" id="cntActive">0</span>
+    </button>
+    <button class="tab" data-tab="history" id="tabHistory">
+      历史记录 <span class="cnt" id="cntHistory">0</span>
+    </button>
+  </div>
+
+  <!-- ===== 进行中面板 ===== -->
+  <div id="panelActive">
+    <!-- 新建任务 -->
+    <div class="card" id="newCard">
+      <h2>新建下载任务</h2>
+      <textarea id="urlInput" placeholder="粘贴下载链接，支持批量（每行一个）
 
 支持类型：
   • HTTP 直链      https://example.com/video.mp4
   • HLS 流         https://example.com/index.m3u8
   • HTTP-FLV 直播   http://.../live/stream.flv
   • RTMP 直播       rtmp://.../live/stream"></textarea>
-    <div class="row">
-      <button class="btn btn-primary" id="btnAdd">开始下载</button>
-      <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--muted);cursor:pointer">
-        <input type="checkbox" id="uploadToggle" checked style="width:15px;height:15px;cursor:pointer;accent-color:var(--accent)">
-        下载后上传 OpenList
-      </label>
-      <button class="btn btn-ghost btn-sm" id="btnClear" style="margin-left:auto">清空已结束</button>
+      <div class="row">
+        <button class="btn btn-primary" id="btnAdd">开始下载</button>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--muted);cursor:pointer">
+          <input type="checkbox" id="uploadToggle" checked style="width:15px;height:15px;cursor:pointer;accent-color:var(--accent)">
+          下载后上传 OpenList
+        </label>
+        <button class="btn btn-ghost btn-sm" id="btnClear" style="margin-left:auto">清空已结束</button>
+      </div>
+      <div class="hint">
+        直播流按<b>时间分段</b>录制（默认 10 分钟一段），每段独立上传 OpenList，<b>不合并</b>；上传成功后删除本地文件。
+      </div>
     </div>
-    <div class="hint">
-      直播流默认<b>不分段</b>，仅在连接中断时自动重连续写；文件下完自动上传并从本地删除。
-    </div>
+
+    <!-- 任务列表 -->
+    <div id="taskList"></div>
   </div>
 
-  <!-- 任务列表 -->
-  <div id="taskList"></div>
+  <!-- ===== 历史记录面板 ===== -->
+  <div id="panelHistory" style="display:none">
+    <div class="card">
+      <h2>历史记录 <span class="badge" style="background:rgba(59,130,246,.15);color:#93c5fd" id="histTotal">0 条</span></h2>
+      <div class="hist-toolbar">
+        <input type="text" id="histSearch" placeholder="搜索文件名 / 链接 / 远端路径…">
+        <select id="histStatus">
+          <option value="">全部状态</option>
+          <option value="done">已完成</option>
+          <option value="failed">失败</option>
+          <option value="canceled">已取消</option>
+        </select>
+        <button class="btn btn-ghost btn-sm" id="btnHistRefresh">刷新</button>
+        <button class="btn btn-danger btn-sm" id="btnHistClear">清空</button>
+      </div>
+      <div id="histList"></div>
+      <div class="pager" id="histPager" style="display:none">
+        <button id="histPrev">上一页</button>
+        <span id="histPageInfo">1 / 1</span>
+        <button id="histNext">下一页</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -304,41 +420,93 @@ function renderTask(t) {
         </div>
       </div>
       <div class="bar${indeterminate ? ' indeterminate' : ''}">
-        <div class="bar-fill" style="width:${indeterminate ? 35 : pct.toFixed(1)}%"></div>
+        <div class="bar-fill" style="width:${indeterminate ? 38 : pct.toFixed(1)}%"></div>
       </div>
       <div class="meta">${metaHtml}</div>
       ${logsHtml}
     </div>`;
 }
 
+/**
+ * 日志框滚动状态记录。
+ *
+ * 为什么需要：每次 upsertTask 都会 replaceWith 重建整张任务卡，
+ * 新建的 .logs 元素 scrollTop 是 0，于是用户往下翻看日志后
+ * 下一帧就被拽回顶部。
+ *
+ * 解法：重建前记下 scrollTop，重建后还原；
+ * 并且只有「用户本来就贴在底部」时才自动跟随新日志。
+ */
+const logScrollState = new Map(); // id -> { top, atBottom }
+
+function captureLogScroll() {
+  document.querySelectorAll('.logs').forEach((el) => {
+    const id = el.id.replace(/^logs-/, '');
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+    logScrollState.set(id, { top: el.scrollTop, atBottom });
+  });
+}
+
+function restoreLogScroll() {
+  document.querySelectorAll('.logs').forEach((el) => {
+    const id = el.id.replace(/^logs-/, '');
+    const st = logScrollState.get(id);
+    if (!st) {
+      // 第一次出现：默认贴底
+      el.scrollTop = el.scrollHeight;
+      return;
+    }
+    if (st.atBottom) {
+      el.scrollTop = el.scrollHeight;   // 本来就在底部 → 继续跟随
+    } else {
+      el.scrollTop = st.top;            // 用户在上方看 → 保持原位
+    }
+  });
+}
+
 function renderAll() {
   const list = [...state.tasks.values()].sort((a, b) => b.createdAt - a.createdAt);
   const el = $('#taskList');
+  captureLogScroll();                    // 记下当前滚动位置
   if (!list.length) {
     el.innerHTML = `<div class="empty"><div class="big">☁️</div><p>还没有任务，在上面粘贴链接开始下载</p></div>`;
+    updateTabCounts();
     return;
   }
   el.innerHTML = list.map(renderTask).join('');
-  // 日志框滚到底
-  el.querySelectorAll('.logs.show').forEach((d) => { d.scrollTop = d.scrollHeight; });
+  restoreLogScroll();                    // 还原滚动位置
+  updateTabCounts();
 }
 
 function upsertTask(t) {
-  const prev = state.tasks.get(t.id);
   state.tasks.set(t.id, t);
-  // 只重绘这一条，避免整表闪烁
   const list = [...state.tasks.values()].sort((a, b) => b.createdAt - a.createdAt);
   const el = $('#taskList');
   const existing = el.querySelector(`[data-id="${t.id}"]`);
+
+  captureLogScroll();                    // 关键：重绘前记住每个日志框的位置
+
   if (existing) {
     const tmp = document.createElement('div');
     tmp.innerHTML = renderTask(t);
     existing.replaceWith(tmp.firstElementChild);
-    const logs = el.querySelector(`#logs-${t.id}`);
-    if (logs && (prev?.logs?.length !== t.logs?.length)) logs.scrollTop = logs.scrollHeight;
   } else {
     el.innerHTML = list.map(renderTask).join('');
   }
+
+  restoreLogScroll();                    // 关键：重绘后还原
+  updateTabCounts();
+}
+
+/** 更新两个标签上的计数 */
+function updateTabCounts() {
+  const tasks = [...state.tasks.values()];
+  const running = tasks.filter((t) => ['queued', 'downloading', 'uploading'].includes(t.status));
+  const done = tasks.filter((t) => ['done', 'failed', 'canceled'].includes(t.status));
+  const a = $('#cntActive');
+  const h = $('#cntHistory');
+  if (a) a.textContent = running.length;
+  if (h) h.textContent = state.histTotal || done.length;
 }
 
 function connectSSE() {
@@ -359,7 +527,14 @@ function connectSSE() {
   });
 
   es.addEventListener('task', (e) => {
-    upsertTask(JSON.parse(e.data));
+    const t = JSON.parse(e.data);
+    const wasRunning = ['queued', 'downloading', 'uploading'].includes(t.status);
+    upsertTask(t);
+    // 任务刚结束 → 刷新历史计数（历史面板打开时顺带刷新列表）
+    if (!wasRunning && t.finishedAt) {
+      if ($('#panelHistory')?.style.display !== 'none') loadHistory();
+      else updateTabCounts();
+    }
   });
 
   es.addEventListener('removed', (e) => {
@@ -469,6 +644,107 @@ async function doLogin() {
   }
 }
 
+// ===== 历史记录 =====
+const hist = { page: 1, pageSize: 20, q: '', status: '', total: 0, pages: 1 };
+
+function fmtTime(ms) {
+  if (!ms) return '—';
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function fmtDuration(sec) {
+  if (!sec || sec <= 0) return '—';
+  if (sec < 60) return sec + ' 秒';
+  const m = Math.floor(sec / 60);
+  if (m < 60) return m + ' 分' + (sec % 60 ? (sec % 60) + ' 秒' : '');
+  return Math.floor(m / 60) + ' 时' + (m % 60) + ' 分';
+}
+
+function renderHistItem(h) {
+  const icon = h.live ? '📡' : (KIND_ICON[h.kind] || '📄');
+  const badge = {
+    done: '<span class="badge done">✓ 完成</span>',
+    failed: '<span class="badge failed">✕ 失败</span>',
+    canceled: '<span class="badge canceled">⊘ 取消</span>',
+  }[h.status] || '';
+
+  let meta = `<span>${fmtTime(h.createdAt)}</span>`;
+  if (h.size) meta += `<span>大小 <b>${fmtBytes(h.size)}</b></span>`;
+  if (h.duration) meta += `<span>耗时 <b>${fmtDuration(h.duration)}</b></span>`;
+  if (h.live) meta += `<span>分段 <b>${h.segmentCount || 0}</b> 段</span>`;
+  if (h.segmentsUploaded) meta += `<span class="ok">☁ 已传 ${h.segmentsUploaded}</span>`;
+  if (h.remotePath) meta += `<span class="ok" title="${esc(h.remotePath)}">☁ ${esc(h.remotePath)}</span>`;
+  if (h.error) meta += `<span class="err">✕ ${esc(h.error)}</span>`;
+
+  return `
+    <div class="hist-item" data-hid="${h.id}">
+      <div class="hist-row">
+        <div class="hist-ico">${icon}</div>
+        <div class="hist-body">
+          <div class="hist-title" title="${esc(h.filename || h.url)}">
+            ${esc(h.filename || '(未命名)')} ${badge}
+          </div>
+          <div class="hist-sub" title="${esc(h.url)}">${esc(h.url)}</div>
+          <div class="hist-meta">${meta}</div>
+        </div>
+        <div class="hist-acts">
+          <button class="btn btn-ghost btn-sm" data-hact="copy" data-hid="${h.id}">复制链接</button>
+          <button class="btn btn-ghost btn-sm" data-hact="retry" data-hid="${h.id}">重下</button>
+          <button class="btn btn-danger btn-sm" data-hact="del" data-hid="${h.id}">删除</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function loadHistory() {
+  const el = $('#histList');
+  if (!el) return;
+  el.innerHTML = '<div class="empty"><p>加载中…</p></div>';
+  try {
+    const qs = new URLSearchParams({
+      page: hist.page, pageSize: hist.pageSize, q: hist.q, status: hist.status,
+    });
+    const r = await fetch(`/api/history?${qs}`);
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) throw new Error((await r.json()).error || '加载失败');
+    const d = await r.json();
+
+    hist.total = d.total;
+    hist.pages = d.pages;
+    state.histTotal = d.total;
+
+    const t = $('#histTotal');
+    if (t) t.textContent = `${d.total} 条`;
+
+    if (!d.items.length) {
+      el.innerHTML = `<div class="empty"><div class="big">🗂️</div><p>${hist.q || hist.status ? '没有匹配的记录' : '还没有历史记录'}</p></div>`;
+    } else {
+      el.innerHTML = d.items.map(renderHistItem).join('');
+    }
+
+    const pager = $('#histPager');
+    if (pager) {
+      pager.style.display = d.pages > 1 ? 'flex' : 'none';
+      $('#histPageInfo').textContent = `${d.page} / ${d.pages}`;
+      $('#histPrev').disabled = d.page <= 1;
+      $('#histNext').disabled = d.page >= d.pages;
+    }
+    updateTabCounts();
+  } catch (e) {
+    el.innerHTML = `<div class="empty"><p>加载失败：${esc(e.message)}</p></div>`;
+  }
+}
+
+function switchTab(name) {
+  const isHist = name === 'history';
+  $('#panelActive').style.display = isHist ? 'none' : '';
+  $('#panelHistory').style.display = isHist ? '' : 'none';
+  $('#tabActive').classList.toggle('active', !isHist);
+  $('#tabHistory').classList.toggle('active', isHist);
+  if (isHist) loadHistory();
+}
+
 // 事件绑定
 $('#btnAdd').addEventListener('click', addTasks);
 $('#urlInput').addEventListener('keydown', (e) => {
@@ -486,12 +762,95 @@ $('#btnClear').addEventListener('click', async () => {
 $('#btnLogin').addEventListener('click', doLogin);
 $('#pwdInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
 
+// 标签切换
+$('#tabActive').addEventListener('click', () => switchTab('active'));
+$('#tabHistory').addEventListener('click', () => switchTab('history'));
+
+// 历史：搜索（防抖）、筛选、翻页、刷新、清空
+let histTimer;
+$('#histSearch').addEventListener('input', (e) => {
+  clearTimeout(histTimer);
+  histTimer = setTimeout(() => {
+    hist.q = e.target.value.trim();
+    hist.page = 1;
+    loadHistory();
+  }, 320);
+});
+$('#histStatus').addEventListener('change', (e) => {
+  hist.status = e.target.value;
+  hist.page = 1;
+  loadHistory();
+});
+$('#histPrev').addEventListener('click', () => {
+  if (hist.page > 1) { hist.page--; loadHistory(); }
+});
+$('#histNext').addEventListener('click', () => {
+  if (hist.page < hist.pages) { hist.page++; loadHistory(); }
+});
+$('#btnHistRefresh').addEventListener('click', loadHistory);
+$('#btnHistClear').addEventListener('click', async () => {
+  if (!confirm('确定清空全部历史记录？此操作不可恢复。')) return;
+  const r = await fetch('/api/history', { method: 'DELETE' });
+  const j = await r.json();
+  toast(`已清空 ${j.removed} 条历史`);
+  hist.page = 1;
+  loadHistory();
+});
+
+// 历史条目操作
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-hact]');
+  if (!btn) return;
+  const { hact, hid } = btn.dataset;
+  const item = document.querySelector(`[data-hid="${hid}"]`);
+  const url = item?.querySelector('.hist-sub')?.textContent?.trim() || '';
+
+  if (hact === 'copy') {
+    try {
+      await navigator.clipboard.writeText(url);
+      toast('链接已复制', 'ok');
+    } catch {
+      toast('复制失败，请手动选择', 'err');
+    }
+  } else if (hact === 'retry') {
+    try {
+      const r = await fetch('/api/tasks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, upload: true }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error);
+      for (const t of j.created) upsertTask(t);
+      toast('已重新加入下载队列', 'ok');
+      switchTab('active');
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  } else if (hact === 'del') {
+    const r = await fetch(`/api/history/${hid}`, { method: 'DELETE' });
+    if (r.ok) {
+      toast('已删除');
+      loadHistory();
+    } else {
+      toast('删除失败', 'err');
+    }
+  }
+});
+
 document.addEventListener('click', (e) => {
   const btn = e.target.closest('[data-act]');
   if (!btn) return;
   const { act: kind, id } = btn.dataset;
   if (kind === 'toggleLogs') {
-    document.getElementById(`logs-${id}`)?.classList.toggle('show');
+    const el = document.getElementById(`logs-${id}`);
+    if (!el) return;
+    el.classList.toggle('show');
+    // 展开时滚到底部看最新日志，并同步记录状态
+    if (el.classList.contains('show')) {
+      el.scrollTop = el.scrollHeight;
+      logScrollState.set(id, { top: el.scrollTop, atBottom: true });
+    }
     return;
   }
   act(kind, id);

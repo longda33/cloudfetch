@@ -9,6 +9,7 @@ import crypto from 'node:crypto';
 import { config, openlistConfigured } from './config.js';
 import { getTaskManager, STATUS } from './tasks.js';
 import { getOpenList } from './openlist.js';
+import { getHistoryStore } from './history.js';
 import { detectKind, humanSize } from './util/links.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -189,8 +190,7 @@ app.post('/api/tasks/:id/cancel', (req, res) => {
 app.delete('/api/tasks/:id', (req, res) => {
   const ok = mgr.remove(req.params.id);
   if (!ok) return res.status(400).json({ error: '无法删除（任务进行中）' });
-  res.json({ ok: true });
-});
+  res.json({ ok: true });});
 
 /** 清空已结束 */
 app.post('/api/tasks/clear', (req, res) => {
@@ -203,6 +203,45 @@ app.post('/api/probe', (req, res) => {
   const { url } = req.body || {};
   if (!url) return res.status(400).json({ error: '缺少 url' });
   res.json({ url, kind: detectKind(url) });
+});
+
+// ---------------- 历史记录 ----------------
+/** 查询历史：分页 + 关键字 + 状态筛选 */
+app.get('/api/history', async (req, res) => {
+  try {
+    const { page, pageSize, q, status } = req.query;
+    const hs = getHistoryStore();
+    await hs.load();
+    res.json(hs.query({ page, pageSize, q, status }));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/** 删除单条历史 */
+app.delete('/api/history/:id', async (req, res) => {
+  try {
+    const hs = getHistoryStore();
+    await hs.load();
+    const ok = await hs.remove(req.params.id);
+    if (!ok) return res.status(404).json({ error: '记录不存在' });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/** 清空历史 */
+app.delete('/api/history', async (req, res) => {
+  try {
+    const hs = getHistoryStore();
+    await hs.load();
+    const n = await hs.clear();
+    await hs.flush();
+    res.json({ ok: true, removed: n });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 /** OpenList 连接测试 */

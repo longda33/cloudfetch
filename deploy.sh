@@ -13,7 +13,7 @@
 #   PANEL_PASSWORD 面板密码
 #   OPENLIST_URL   OpenList 地址
 #   OPENLIST_TOKEN OpenList 令牌
-#   LIVE_SEGMENT_SECONDS 直播分段时长（秒），默认 300
+#   LIVE_SEGMENT_SECONDS 直播分段时长（秒），默认 600（10 分钟）
 #   OPENLIST_UPLOAD_DIR  上传目录，默认 /cloudfetch
 #                        （也接受旧名 UPLOAD_DIR，两者等价）
 # =====================================================================
@@ -116,7 +116,7 @@ except Exception: pass
   set_var "DELETE_AFTER_UPLOAD" "true"
   set_var "MAX_CONCURRENT" "2"
   set_var "RETRY_MAX_ATTEMPTS" "8"
-  set_var "LIVE_SEGMENT_SECONDS" "${LIVE_SEGMENT_SECONDS:-300}"
+  set_var "LIVE_SEGMENT_SECONDS" "${LIVE_SEGMENT_SECONDS:-600}"
   [ -n "${PANEL_PASSWORD:-}" ] && set_var "PANEL_PASSWORD" "${PANEL_PASSWORD}"
   [ -n "${OPENLIST_URL:-}" ]   && set_var "OPENLIST_URL" "${OPENLIST_URL}"
   [ -n "${OPENLIST_TOKEN:-}" ] && set_var "OPENLIST_TOKEN" "${OPENLIST_TOKEN}"
@@ -143,7 +143,7 @@ env = {
     "DELETE_AFTER_UPLOAD": "true",
     "MAX_CONCURRENT": "2",
     "RETRY_MAX_ATTEMPTS": "8",
-    "LIVE_SEGMENT_SECONDS": os.environ.get("LIVE_SEGMENT_SECONDS","300"),
+    "LIVE_SEGMENT_SECONDS": os.environ.get("LIVE_SEGMENT_SECONDS","600"),
 }
 secret = []
 if pw:    env["PANEL_PASSWORD"]=pw; secret.append("PANEL_PASSWORD")

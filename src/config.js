@@ -57,9 +57,9 @@ export const config = {
     progressInterval: num(env.PROGRESS_INTERVAL, 500),
     /**
      * 直播分段时长（秒）。每段独立成文件、独立上传，**不合并**。
-     * 300 = 5 分钟一段（推荐，理由见 README「直播分段时长怎么选」）
+     * 600 = 10 分钟一段
      */
-    liveSegmentSeconds: num(env.LIVE_SEGMENT_SECONDS, 300),
+    liveSegmentSeconds: num(env.LIVE_SEGMENT_SECONDS, 600),
   },
 
   // ---------- 重试 ----------

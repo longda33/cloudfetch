@@ -74,7 +74,7 @@ jobs:
           # 默认值
           export APP_NAME="${APP_NAME:-cloudfetch}"
           export OPENLIST_UPLOAD_DIR="${OPENLIST_UPLOAD_DIR:-/cloudfetch}"
-          export LIVE_SEGMENT_SECONDS="${LIVE_SEGMENT_SECONDS:-300}"
+          export LIVE_SEGMENT_SECONDS="${LIVE_SEGMENT_SECONDS:-600}"
 
           chmod +x deploy.sh
           ./deploy.sh
