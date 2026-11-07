@@ -896,7 +896,8 @@ async function downloadLive(job, ctx) {
   let segStartAt = Date.now(); // 当前段的起始时间，用于反推码率
 
   // 每段产出后立即回调（上传/删本地由上层负责）
-  const handleSegment = async (filePath) => {
+  // segDurSec: 本段的真实媒体时长（由 segment_list 的 CSV 解析而来）
+  const handleSegment = async (filePath, segDurSec = 0) => {
     const sz = await sizeOf(filePath);
     if (sz <= 0) {
       await fsp.rm(filePath, { force: true });
@@ -954,19 +955,24 @@ async function downloadLive(job, ctx) {
     /**
      * 用本段真实大小反推码率，若单段会超上传上限，就缩短后续分段时长。
      *
-     * 这样无论源是 1Mbps 还是 8Mbps，单段体积都稳定落在 Cloudflare
-     * 能接受的范围（实测 130MB 可传、202MB 被 413 拒绝）。
+     * 关键：必须用 ffmpeg 报的**真实段时长**，不能用墙钟时间。
+     * 墙钟会混入重连等待、上传阻塞等空档，把码率算虚高，
+     * 实测因此把 366s（48MB，完全安全）误判成需要缩到 30s。
+     *
+     * segDurSec 由 runFfmpegSegments 从 segment_list 的 CSV 里解析出来
+     * （格式：文件名,起始秒,结束秒），是这段媒体真正的时长。
      */
-    const elapsedSec = Math.max(1, (Date.now() - segStartAt) / 1000);
+    const elapsedSec = segDurSec > 0 ? segDurSec : Math.max(1, (Date.now() - segStartAt) / 1000);
     const bytesPerSec = sz / elapsedSec;
     if (bytesPerSec > 0) {
       const safeSec = Math.floor(SEG_MAX_BYTES / bytesPerSec);
       if (safeSec < effectiveSec) {
-        const newSec = Math.max(30, safeSec);
-        if (newSec < effectiveSec) {
+        const newSec = Math.max(60, safeSec);
+        // 只有明显超出才调整，避免在安全线附近来回抖动
+        if (newSec < effectiveSec * 0.85) {
           onLog?.(
             `单段体积偏大（${humanSize(sz)} / ${Math.round(elapsedSec)}s ≈ ${fmtRate(bytesPerSec)}），` +
-              `分段时长自动由 ${effectiveSec}s 调整为 ${newSec}s 以适配上传限制`,
+              `分段时长由 ${effectiveSec}s 调整为 ${newSec}s 以适配上传限制`,
           );
           effectiveSec = newSec;
           job.segmentSeconds = newSec;
@@ -1037,6 +1043,20 @@ async function downloadLive(job, ctx) {
     } catch (e) {
       if (signal?.aborted) break;
       onLog?.(`连接中断：${e.message}`);
+
+      /**
+       * 403 / 401 / 404 是「权限或地址问题」，不是网络抖动，重试没用。
+       * 之前遇到 403 会一直重连到 liveMaxEmptyRetries 才停，
+       * 期间疯狂打源站，反而更容易被拉黑。
+       * 这里直接判为致命错误，让任务尽快结束并把原因写进日志。
+       */
+      if (/(^|\D)40[134](\D|$)|Forbidden|Unauthorized|Not Found/i.test(e.message)) {
+        if (segOffset === 0) {
+          throw new FatalError(`直播源拒绝访问（${e.message.slice(0, 120)}），可能是链接过期或被限流`);
+        }
+        onLog?.('源站拒绝访问，已录分段会正常上传，录制结束');
+        break;
+      }
     } finally {
       if (sampler) clearInterval(sampler);
     }
@@ -1153,15 +1173,27 @@ function runFfmpegSegments(opts) {
         // csv 每行：文件名,起始秒,结束秒
         const lines = txt.split(/\r?\n/).filter(Boolean);
         for (const line of lines) {
-          const fname = line.split(',')[0]?.trim();
+          const cols = line.split(',');
+          const fname = cols[0]?.trim();
           if (!fname || seen.has(fname)) continue;
           // segment_list 会在切下一段时才写入上一段，所以列表里出现的段都已写完
           const full = path.join(dir, path.basename(fname));
           const sz = await sizeOf(full);
           if (sz <= 0) continue;
           seen.add(fname);
+
+          // 真实媒体时长 = 结束秒 - 起始秒
+          let durSec = 0;
+          if (cols.length >= 3) {
+            const start = parseFloat(cols[1]);
+            const end = parseFloat(cols[2]);
+            if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+              durSec = end - start;
+            }
+          }
+
           try {
-            await onSegmentFile(full);
+            await onSegmentFile(full, durSec);
           } catch (e) {
             onLog?.(`处理分段 ${fname} 失败：${e.message}`);
           }
