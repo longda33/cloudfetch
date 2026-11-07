@@ -69,16 +69,28 @@ export function filenameFromDisposition(cd) {
 
 /** 从 URL 路径推断文件名 */
 export function filenameFromUrl(url, fallbackExt = '') {
+  const fallback = `download${fallbackExt ? '.' + fallbackExt : ''}`;
   let u;
   try {
     u = new URL(url);
   } catch {
-    return `download${fallbackExt ? '.' + fallbackExt : ''}`;
+    return fallback;
   }
-  let base = decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || '');
-  base = sanitizeFilename(base);
 
-  if (!base) return `download${fallbackExt ? '.' + fallbackExt : ''}`;
+  /**
+   * decodeURIComponent 遇到畸形百分号编码（如 /%zz）会抛 URIError。
+   * 之前没接，整个任务会以一句"URI malformed"失败，用户完全看不懂。
+   */
+  const raw = u.pathname.split('/').filter(Boolean).pop() || '';
+  let decoded = raw;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    /* 保持原始编码 */
+  }
+  const base = sanitizeFilename(decoded);
+
+  if (!base) return fallback;
 
   const ext = path.extname(base).replace('.', '').toLowerCase();
   if (ext && KNOWN_EXT.has(ext)) return base;

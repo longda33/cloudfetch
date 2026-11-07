@@ -31,6 +31,8 @@ const KIND = {
 
 const state = {
   tasks: new Map(),
+  /** id → 日志行数组。日志走独立的 log 事件，不随每次进度推送 */
+  logs: new Map(),
   es: null,
   authRequired: false,
   limits: {},
@@ -295,7 +297,8 @@ function patchTask(card, t) {
 /** 日志：只在内容变化时重建，且贴底时才自动跟随 */
 function syncLogs(card, t) {
   const box = $('[data-role="logs"]', card);
-  const logs = Array.isArray(t.logs) ? t.logs.slice(-60) : [];
+  const all = state.logs.get(t.id) || t.logs || [];
+  const logs = Array.isArray(all) ? all.slice(-60) : [];
 
   if (!logs.length) {
     box.hidden = true;
@@ -368,6 +371,7 @@ function renderAll() {
 
 function upsertTask(t) {
   state.tasks.set(t.id, t);
+  if (Array.isArray(t.logs)) state.logs.set(t.id, t.logs);
   const el = $('#taskList');
 
   // 结束超过保留时间的任务，不进「进行中」列表
@@ -425,12 +429,18 @@ function connectSSE() {
   es.addEventListener('snapshot', (e) => {
     const d = JSON.parse(e.data);
     state.tasks.clear();
-    for (const t of d.tasks) state.tasks.set(t.id, t);
+    state.logs.clear();
+    for (const t of d.tasks) {
+      state.tasks.set(t.id, t);
+      if (Array.isArray(t.logs)) state.logs.set(t.id, t.logs);
+    }
     renderAll();
   });
 
   es.addEventListener('task', (e) => {
     const t = JSON.parse(e.data);
+    // 全量快照里带日志，增量更新不带（省带宽）
+    if (Array.isArray(t.logs)) state.logs.set(t.id, t.logs);
     const wasRunning = RUNNING.includes(t.status);
     upsertTask(t);
     // 任务刚结束 → 刷新历史计数（历史面板打开时顺带刷新列表）
@@ -443,14 +453,22 @@ function connectSSE() {
   es.addEventListener('removed', (e) => {
     const d = JSON.parse(e.data);
     state.tasks.delete(d.id);
+    state.logs.delete(d.id);
     $(`[data-id="${d.id}"]`)?.remove();
     if (!state.tasks.size) renderAll();
     updateStats();
     updateTabCounts();
   });
 
-  es.addEventListener('log', () => {
-    /* 日志随 task 事件整体更新，这里无需处理 */
+  es.addEventListener('log', (e) => {
+    const d = JSON.parse(e.data);
+    const arr = state.logs.get(d.id) || [];
+    arr.push(d.line);
+    if (arr.length > 200) arr.shift();
+    state.logs.set(d.id, arr);
+    // 日志面板开着就实时追加，不必等下一次 task 事件
+    const card = $(`[data-id="${d.id}"]`);
+    if (card) syncLogs(card, { id: d.id });
   });
 
   es.onerror = () => {
@@ -529,6 +547,7 @@ async function act(kind, id) {
       const r = await fetch(`/api/tasks/${id}`, { method: 'DELETE' });
       if (!r.ok) throw new Error((await r.json()).error);
       state.tasks.delete(id);
+      state.logs.delete(id);
       $(`[data-id="${id}"]`)?.remove();
       if (!state.tasks.size) renderAll();
       updateStats();
@@ -590,6 +609,8 @@ async function doLogin() {
     $('#loginMask').classList.remove('show');
     $('#pwdInput').value = '';
     connectSSE();
+    // 未登录时 /api/health 不下发 openlistUrl，登录后立刻补一次
+    refreshChips();
     toast('登录成功', 'ok');
   } else {
     toast('密码错误', 'err');
@@ -603,7 +624,7 @@ function showConfigMissing() {
     <div class="dialog-body">
       <p>为安全起见，本服务必须设置 <code>PANEL_PASSWORD</code> 才能使用 —— 它能往你的 OpenList 写入任意文件。</p>
       <p>前往 <b>GitHub 仓库 → Settings → Secrets and variables → Actions</b>，添加 Secret <code>PANEL_PASSWORD</code>，然后重新运行 <b>Deploy to Cloady</b> 工作流。</p>
-      <p style="text-align:center">配置生效后刷新本页即可。</p>
+      <p class="center">配置生效后刷新本页即可。</p>
     </div>`;
   $('#loginMask').classList.add('show');
 }
@@ -790,7 +811,10 @@ $('#btnClear').addEventListener('click', async () => {
   const r = await fetch('/api/tasks/clear', { method: 'POST' });
   const j = await r.json();
   for (const [id, t] of state.tasks) {
-    if (!RUNNING.includes(t.status)) state.tasks.delete(id);
+    if (!RUNNING.includes(t.status)) {
+      state.tasks.delete(id);
+      state.logs.delete(id);
+    }
   }
   renderAll();
   toast(`已清空 ${j.removed} 条`);

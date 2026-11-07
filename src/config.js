@@ -4,9 +4,18 @@
  */
 import path from 'node:path';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 
 const env = process.env;
+/**
+ * 解析数字型环境变量。
+ *
+ * 必须把空串当"未设置"：`Number('') === 0`，而不少 PaaS 会把没填的变量
+ * 注入成空字符串。之前 MAX_CONCURRENT="" 会被解析成 0，结果是并发上限 0、
+ * 所有任务永远排队；MAX_FILE_SIZE="" 则让每个文件都"超过上限"。
+ */
 const num = (v, d) => {
+  if (v === undefined || v === null || String(v).trim() === '') return d;
   const n = Number(v);
   return Number.isFinite(n) ? n : d;
 };
@@ -37,6 +46,22 @@ function pickDataDir() {
 
 const DATA_DIR = pickDataDir();
 const TMP_DIR = env.TMP_DIR || path.join(DATA_DIR, 'tmp');
+
+/**
+ * 会话签名密钥。
+ *
+ * 绝不能有硬编码默认值：签名算法是公开的，默认密钥也是公开的，
+ * 两者一凑，任何人都能自己算出合法的会话 token —— 等于认证完全失效。
+ * 没配就随机生成一个，代价只是重启后需要重新登录。
+ */
+const SESSION_SECRET =
+  env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+if (!env.SESSION_SECRET) {
+  console.warn(
+    '[config] 未设置 SESSION_SECRET，已生成随机密钥（重启后所有登录会话失效）。' +
+      '如需会话跨重启保持，请显式配置一个长随机串。',
+  );
+}
 
 // 确保目录存在
 for (const d of [DATA_DIR, TMP_DIR]) {
@@ -72,8 +97,6 @@ export const config = {
     chunkSize: num(env.CHUNK_SIZE, 8 * 1024 * 1024),
     /** 分片下载并发数 */
     chunkConcurrency: num(env.CHUNK_CONCURRENCY, 4),
-    /** 进度上报间隔（毫秒） */
-    progressInterval: num(env.PROGRESS_INTERVAL, 500),
     /**
      * 直播分段时长（秒）。每段独立成文件、独立上传，**不合并**。
      * 1800 = 30 分钟一段。
@@ -83,6 +106,11 @@ export const config = {
      * 30 分钟 × 2.7MB/s ≈ 4.8GB 也能正常传上去。
      */
     liveSegmentSeconds: num(env.LIVE_SEGMENT_SECONDS, 1800),
+    /**
+     * 队列长度上限（排队中 + 运行中）。
+     * 没有这个上限时，一次请求塞几千条链接就能把进程拖死。
+     */
+    maxQueue: num(env.MAX_QUEUE, 100),
   },
 
   // ---------- 重试 ----------
@@ -110,10 +138,6 @@ export const config = {
     password: env.OPENLIST_PASSWORD || '',
     /** 上传目标目录，默认 /cloudfetch */
     uploadDir: env.OPENLIST_UPLOAD_DIR || '/cloudfetch',
-    /** 上传分块大小（字节），0 表示不切片直接 PUT */
-    putChunkSize: num(env.OPENLIST_CHUNK_SIZE, 0),
-    /** 上传并发（OpenList 并发上传线程数） */
-    putConcurrency: num(env.OPENLIST_PUT_CONCURRENCY, 3),
     /** 上传失败重试次数 */
     uploadRetries: num(env.UPLOAD_RETRIES, 5),
     /** 按日期建子目录，如 2026-11-05 */
@@ -124,10 +148,10 @@ export const config = {
 
   // ---------- 鉴权 ----------
   auth: {
-    /** 访问面板需要的密码，留空则不鉴权（不建议） */
+    /** 访问面板需要的密码。留空时服务拒绝所有访问（不是放行） */
     password: env.PANEL_PASSWORD || '',
-    /** 会话签名密钥 */
-    secret: env.SESSION_SECRET || 'cloudfetch-default-secret-change-me',
+    /** 会话签名密钥。未配置时随机生成，见上方 SESSION_SECRET */
+    secret: SESSION_SECRET,
   },
 
   // ---------- 其他 ----------
@@ -155,11 +179,14 @@ export function printConfig() {
   console.log(`  监听端口     : ${config.port}`);
   console.log(`  数据目录     : ${config.dataDir}`);
   console.log(`  临时目录     : ${config.tmpDir}`);
-  console.log(`  最大并发     : ${config.download.maxConcurrent}`);
+  console.log(`  最大并发     : ${config.download.maxConcurrent}（队列上限 ${config.download.maxQueue}）`);
   console.log(`  OpenList     : ${config.openlist.baseUrl || '(未配置)'}`);
   console.log(`  OpenList令牌 : ${mask(config.openlist.token)}`);
   console.log(`  上传目录     : ${config.openlist.uploadDir}`);
   console.log(`  传完删本地   : ${config.openlist.deleteAfterUpload ? '是' : '否'}`);
-  console.log(`  面板密码     : ${config.auth.password ? '已设置' : '(无，公开访问)'}`);
+  console.log(
+    `  面板密码     : ${config.auth.password ? '已设置' : '(未设置 → 拒绝所有访问，请配置 PANEL_PASSWORD)'}`,
+  );
+  console.log(`  会话密钥     : ${env.SESSION_SECRET ? '来自 SESSION_SECRET' : '随机生成（重启后需重新登录）'}`);
   console.log('─'.repeat(58));
 }

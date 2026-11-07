@@ -13,6 +13,16 @@ import { getOpenList, buildRemotePath } from './openlist.js';
 import { getHistoryStore } from './history.js';
 import { detectKind, humanSize } from './util/links.js';
 
+/** 目录剩余空间（字节）；拿不到就返回 null，不要因为探测失败就阻断任务 */
+async function freeDiskBytes(dir) {
+  try {
+    const s = await fsp.statfs(dir);
+    return s.bfree * s.bsize;
+  } catch {
+    return null;
+  }
+}
+
 /** 任务状态机 */
 export const STATUS = {
   QUEUED: 'queued',       // 排队中
@@ -26,11 +36,14 @@ export const STATUS = {
 export class TaskManager extends EventEmitter {
   constructor() {
     super();
+    // 每个 SSE 客户端都会挂一个 'update' 监听，默认上限 10 会一直刷警告
+    this.setMaxListeners(0);
     /** @type {Map<string, object>} */
     this.tasks = new Map();
     this.queue = [];
     this.running = new Set();
     this._saveTimer = null;
+    this._shuttingDown = false;
     this._loadState();
     this._startCleaner();
   }
@@ -62,14 +75,40 @@ export class TaskManager extends EventEmitter {
     this._saveTimer = setTimeout(async () => {
       this._saveTimer = null;
       try {
-        const arr = [...this.tasks.values()]
-          .sort((a, b) => b.createdAt - a.createdAt)
-          .slice(0, config.maxTasks);
-        await fsp.writeFile(config.stateFile, JSON.stringify(arr, null, 2), 'utf8');
+        await fsp.writeFile(config.stateFile, this._serialize(), 'utf8');
       } catch (e) {
         console.error(`[tasks] 保存状态失败：${e.message}`);
       }
     }, 1000);
+  }
+
+  /**
+   * 进程退出前同步落盘。
+   * _saveState 是 1 秒防抖的异步写，SIGTERM 时很可能来不及。
+   */
+  flushState() {
+    if (this._saveTimer) {
+      clearTimeout(this._saveTimer);
+      this._saveTimer = null;
+    }
+    try {
+      fs.writeFileSync(config.stateFile, this._serialize(), 'utf8');
+    } catch (e) {
+      console.error(`[tasks] 退出前保存状态失败：${e.message}`);
+    }
+  }
+
+  /**
+   * 序列化任务列表。
+   * 必须去掉运行时字段：_abort 是 AbortController，序列化成 {} 之后
+   * 再读回来 `t._abort?.abort()` 会变成"不是函数"。
+   */
+  _serialize() {
+    const arr = [...this.tasks.values()]
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, config.maxTasks)
+      .map(({ _abort, _stopRequested, ...rest }) => rest);
+    return JSON.stringify(arr, null, 2);
   }
 
   _startCleaner() {
@@ -83,6 +122,7 @@ export class TaskManager extends EventEmitter {
           now - t.finishedAt > config.taskRetention
         ) {
           this.tasks.delete(id);
+          this._dropJobDir(id);
           changed = true;
         }
       }
@@ -92,12 +132,25 @@ export class TaskManager extends EventEmitter {
           .filter((t) => [STATUS.DONE, STATUS.FAILED, STATUS.CANCELED].includes(t.status))
           .sort((a, b) => a.createdAt - b.createdAt);
         while (this.tasks.size > config.maxTasks && finished.length) {
-          this.tasks.delete(finished.shift().id);
+          const id = finished.shift().id;
+          this.tasks.delete(id);
+          this._dropJobDir(id);
           changed = true;
         }
       }
       if (changed) this._saveState();
     }, 5 * 60 * 1000).unref?.();
+  }
+
+  /**
+   * 删掉任务对应的本地目录。
+   *
+   * 只删记录不删文件的话，失败/取消的任务会一直占着磁盘，
+   * 5GB 配额下几场直播就能把盘吃满。异步删除，不阻塞调用方。
+   */
+  _dropJobDir(id) {
+    const dir = path.join(config.tmpDir, id);
+    fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 
   // ---------------- 任务操作 ----------------
@@ -121,6 +174,11 @@ export class TaskManager extends EventEmitter {
     }
     if (parsed && !['http:', 'https:', 'rtmp:', 'rtmps:'].includes(parsed.protocol)) {
       throw new Error(`不支持的协议：${parsed.protocol}`);
+    }
+
+    // 队列上限：否则一次请求塞几千条链接就能把进程拖死
+    if (this.queue.length + this.running.size >= config.download.maxQueue) {
+      throw new Error(`队列已满（上限 ${config.download.maxQueue} 个），请等现有任务结束`);
     }
 
     const id = crypto.randomUUID();
@@ -217,6 +275,7 @@ export class TaskManager extends EventEmitter {
     if (!t) return false;
     if (this.running.has(id)) return false;
     this.tasks.delete(id);
+    this._dropJobDir(id);
     this._saveState();
     this.emit('removed', { id });
     return true;
@@ -227,6 +286,7 @@ export class TaskManager extends EventEmitter {
     for (const [id, t] of this.tasks) {
       if ([STATUS.DONE, STATUS.FAILED, STATUS.CANCELED].includes(t.status)) {
         this.tasks.delete(id);
+        this._dropJobDir(id);
         n++;
       }
     }
@@ -237,18 +297,25 @@ export class TaskManager extends EventEmitter {
   list() {
     return [...this.tasks.values()]
       .sort((a, b) => b.createdAt - a.createdAt)
-      .map((t) => this._public(t));
+      .map((t) => this._public(t, true));
   }
 
   get(id) {
     const t = this.tasks.get(id);
-    return t ? this._public(t) : null;
+    return t ? this._public(t, true) : null;
   }
 
-  _public(t) {
-    // 去掉内部字段
-    const { _abort, _stopRequested, ...rest } = t;
-    return rest;
+  /**
+   * 对外暴露的任务快照。
+   *
+   * @param {object} t
+   * @param {boolean} [withLogs=false] 是否带日志。
+   *   SSE 的进度事件每 500ms 一次，每次都带 200 行日志纯属浪费带宽；
+   *   日志单独走 'log' 事件推送，只有列表/详情这类一次性请求才需要带全量。
+   */
+  _public(t, withLogs = false) {
+    const { _abort, _stopRequested, logs, ...rest } = t;
+    return withLogs ? { ...rest, logs } : rest;
   }
 
   /**
@@ -265,6 +332,16 @@ export class TaskManager extends EventEmitter {
   async retryFailedSegments(id) {
     const t = this.tasks.get(id);
     if (!t) throw new Error('任务不存在');
+
+    /**
+     * 只允许对已结束的任务补传。
+     *
+     * 任务还在跑的时候，直播的分段上传是后台异步进行的，
+     * 这时候再起一路补传会两路同时写同一个远端文件，互相覆盖。
+     */
+    if (this.running.has(id) || [STATUS.QUEUED, STATUS.DOWNLOADING, STATUS.UPLOADING].includes(t.status)) {
+      throw new Error('任务仍在进行中，请等它结束后再重试上传');
+    }
 
     const ol = getOpenList();
     if (!ol.configured) throw new Error('OpenList 未配置，无法上传');
@@ -309,6 +386,9 @@ export class TaskManager extends EventEmitter {
       const remote = buildRemotePath(item.filename, {
         taskId: t.id,
         baseName: t.baseName,
+        // 用任务创建时间算日期目录：跨零点补传不该落到"第二天"的目录里，
+        // 否则一次录制会被拆成两个文件夹
+        date: t.createdAt,
       });
       try {
         await ol.uploadFile(local, remote, { onLog: (m) => this._log(t, m) });
@@ -342,6 +422,7 @@ export class TaskManager extends EventEmitter {
   }
 
   _emit(t) {
+    // 不带 logs：进度事件很密集，日志由 'log' 事件单独推送
     this.emit('update', this._public(t));
   }
 
@@ -354,6 +435,7 @@ export class TaskManager extends EventEmitter {
 
   // ---------------- 调度 ----------------
   _pump() {
+    if (this._shuttingDown) return;
     while (this.running.size < config.download.maxConcurrent && this.queue.length) {
       const id = this.queue.shift();
       const t = this.tasks.get(id);
@@ -364,6 +446,20 @@ export class TaskManager extends EventEmitter {
         this._pump();
       });
     }
+  }
+
+  /**
+   * 进程退出前的收尾：不再接新任务，并 abort 所有在跑的。
+   * 不 abort 的话，server 已经关了但下载还在写盘，ffmpeg 也会变成孤儿进程。
+   */
+  shutdown() {
+    this._shuttingDown = true;
+    this.queue.length = 0;
+    for (const id of this.running) {
+      this.tasks.get(id)?._abort?.abort();
+    }
+    // 把当前状态同步写盘，异步的 _saveState 来不及
+    this.flushState();
   }
 
   async _run(t) {
@@ -377,7 +473,6 @@ export class TaskManager extends EventEmitter {
 
     // 每个任务独立目录
     const jobDir = path.join(config.tmpDir, t.id);
-    await fsp.mkdir(jobDir, { recursive: true });
 
     let lastBytes = 0;
     let lastTime = Date.now();
@@ -413,7 +508,17 @@ export class TaskManager extends EventEmitter {
     t.segmentsUploaded = 0;
     /** 上传失败的段，前端据此显示「重试」按钮 */
     t.failedSegments = [];
-    const uploadSegment = async (rec) => {
+
+    /**
+     * 在飞的分段上传集合。
+     *
+     * 上传必须 fire-and-forget（不能阻塞 ffmpeg 继续切段），但任务收尾时
+     * 一定要等它们落定：否则下面用 dl.segments 快照算出来的 segmentsUploaded
+     * 是旧值，历史记录里会显示「N 段未传」，而实际上几秒后就传完了。
+     */
+    const pendingUploads = new Set();
+
+    const doUploadSegment = async (rec) => {
       if (!t.upload) {
         onLog(`第 ${rec.index} 段：未开启上传，保留本地`);
         return;
@@ -427,6 +532,7 @@ export class TaskManager extends EventEmitter {
       const remote = buildRemotePath(rec.filename, {
         taskId: t.id,
         baseName: t.baseName,
+        date: t.createdAt,
       });
       onLog(`第 ${rec.index} 段开始上传 → ${remote}（${humanSize(rec.size)}）`);
       try {
@@ -468,7 +574,30 @@ export class TaskManager extends EventEmitter {
       }
     };
 
+    /** 包装一层，把 promise 登记进集合；错误仍原样抛给下载器去记日志 */
+    const uploadSegment = (rec) => {
+      const task = doUploadSegment(rec);
+      pendingUploads.add(task);
+      task.catch(() => {}).finally(() => pendingUploads.delete(task));
+      return task;
+    };
+
     try {
+      // mkdir 必须在 try 里：磁盘满/权限异常时，否则任务会永远停在 downloading
+      await fsp.mkdir(jobDir, { recursive: true });
+
+      /**
+       * 磁盘余量闸门。
+       * 5GB 配额下，一场长直播很容易把盘写满，写满后连状态文件都存不下，
+       * 服务会进入"看起来还活着但什么都做不了"的状态。宁可提前拒绝。
+       */
+      const free = await freeDiskBytes(config.tmpDir);
+      if (free !== null && free < config.download.minFreeSpace) {
+        throw new Error(
+          `磁盘剩余 ${humanSize(free)}，低于安全阈值 ${humanSize(config.download.minFreeSpace)}，已拒绝启动`,
+        );
+      }
+
       // ---------- 1. 下载 ----------
       // 注意：onSegment 必须无条件传入。
       // 之前写成 `t.live ? uploadSegment : undefined`，但 t.live 是在
@@ -486,6 +615,12 @@ export class TaskManager extends EventEmitter {
       });
 
       if (ac.signal.aborted && !t._stopRequested) throw new Error('已取消');
+
+      // 等所有分段上传落定，再计算最终状态（历史记录才不会漏记已传的段）
+      if (pendingUploads.size) {
+        onLog(`等待 ${pendingUploads.size} 段上传收尾…`);
+        await Promise.allSettled([...pendingUploads]);
+      }
 
       // ---------- 直播：多文件，逐段收尾 ----------
       if (dl.multiFile) {
@@ -562,6 +697,7 @@ export class TaskManager extends EventEmitter {
         const remote = buildRemotePath(dl.filename, {
           taskId: t.id,
           baseName: t.baseName,
+          date: t.createdAt,
         });
         onLog(`开始上传 → ${remote}`);
 
@@ -611,12 +747,25 @@ export class TaskManager extends EventEmitter {
        * 已录好的文件被丢掉不上传。
        */
       const canceled = ac.signal.aborted && !t._stopRequested;
-      if (t._stopRequested) {
-        // 停止时如果已经有内容，尽量保住并给出提示
+      /**
+       * 用户点了停止，但也要看有没有真的录到东西。
+       *
+       * 之前只要有 _stopRequested 就标 done，于是"刚点开始就取消"的任务
+       * 会显示成绿色「已完成 / 已停止」，实际一个字节都没有。
+       */
+      const hasContent = (t.size || 0) > 0 || (t.segments || []).length > 0;
+      if (t._stopRequested && hasContent) {
+        // 停止时已经有内容 → 保住成果
         t.status = STATUS.DONE;
         t.phase = '已停止';
         t.error = '';
         this._log(t, '已停止录制');
+      } else if (t._stopRequested) {
+        // 停了但什么都没录到 → 就是取消
+        t.status = STATUS.CANCELED;
+        t.phase = '已取消';
+        t.error = '';
+        this._log(t, '已取消（未录到任何内容）');
       } else {
         t.status = canceled ? STATUS.CANCELED : STATUS.FAILED;
         t.phase = canceled ? '已取消' : '失败';
@@ -668,18 +817,18 @@ export class TaskManager extends EventEmitter {
       remotePath: t.remotePath || '',
       segmentCount: t.segmentCount || segs.length || 0,
       segmentsUploaded: segs.filter((s) => s.remotePath).length,
-        failedSegments: (t.failedSegments || []).map((f) => ({
-          index: f.index,
-          filename: f.filename,
-          size: f.size,
-          error: f.error,
-        })),
-        remoteDir: (() => {
-          const first = segs.find((s) => s.remotePath)?.remotePath || t.remotePath || '';
-          if (!first) return '';
-          const k = first.lastIndexOf('/');
-          return k > 0 ? first.slice(0, k) : '';
-        })(),
+      failedSegments: (t.failedSegments || []).map((f) => ({
+        index: f.index,
+        filename: f.filename,
+        size: f.size,
+        error: f.error,
+      })),
+      remoteDir: (() => {
+        const first = segs.find((s) => s.remotePath)?.remotePath || t.remotePath || '';
+        if (!first) return '';
+        const k = first.lastIndexOf('/');
+        return k > 0 ? first.slice(0, k) : '';
+      })(),
       // 直播分段只记远端路径，不记本地路径
       segments: segs.map((s) => ({
         index: s.index,

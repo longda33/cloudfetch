@@ -16,7 +16,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { config } from './config.js';
- import { humanSize } from './util/links.js';
+import { humanSize } from './util/links.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -74,7 +74,26 @@ export class OpenListClient {
     return this.token;
   }
 
-  /** 统一请求封装 */
+  /**
+   * 统一请求封装。
+   *
+   * 账号密码模式下 token 会过期（OpenList 默认 48 小时）。过期后所有请求
+   * 都是 401，如果不重登，上传会一直失败到进程重启为止。
+   */
+  async request(method, apiPath, opts = {}) {
+    try {
+      return await this._request(method, apiPath, opts);
+    } catch (e) {
+      const canRelogin = this.username && this.password;
+      if (canRelogin && e instanceof OpenListError && (e.status === 401 || e.status === 403)) {
+        this.token = '';
+        this._loginPromise = null;
+        return await this._request(method, apiPath, opts);
+      }
+      throw e;
+    }
+  }
+
   /**
    * 发一个 OpenList API 请求。
    *
@@ -84,7 +103,7 @@ export class OpenListClient {
    * @param {boolean} [opts.raw]      true = 返回 {status, ok, text, json}，
    *                                  不做错误检查，交给调用方判断
    */
-  async request(method, apiPath, { body, rawBody, raw = false, headers = {}, signal, timeout = 60000 } = {}) {
+  async _request(method, apiPath, { body, rawBody, raw = false, headers = {}, signal, timeout = 60000 } = {}) {
     const token = await this.ensureToken();
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeout);
@@ -283,8 +302,23 @@ export class OpenListClient {
 
         const start = idx * chunkSize;
         const len = Math.min(chunkSize, size - start);
-        const buf = Buffer.allocUnsafe(len);
-        await fh.read(buf, 0, len, start);
+        /**
+         * 必须用 alloc（清零）而不是 allocUnsafe：
+         * 一旦下面出现短读，未写满的部分就是进程堆里的残留内存，
+         * 会连同文件内容一起被上传到远端。
+         */
+        const buf = Buffer.alloc(len);
+        let filled = 0;
+        while (filled < len) {
+          // fh.read 允许短读，必须循环补齐，否则这一片会长度不足、内容错位
+          const { bytesRead } = await fh.read(buf, filled, len - filled, start + filled);
+          if (bytesRead === 0) {
+            throw new OpenListError(
+              `读取本地文件不完整（第 ${idx + 1} 片 ${filled}/${len} 字节）`,
+            );
+          }
+          filled += bytesRead;
+        }
 
         // 单片失败重试 5 次，409/429 退避
         let lastErr;
@@ -392,7 +426,17 @@ export class OpenListClient {
       onLog?.(`分片上传不可用（${mp.reason}），回退到单请求上传`);
     } catch (e) {
       if (signal?.aborted) throw e;
-      // 分片中途失败也回退，但要把原因写清楚
+      /**
+       * 分片传到一半才失败时，回退到单请求等于把整个文件重传一遍。
+       * 文件本身又超过单请求上限（实测约 130MB）的话，回退只会换来一个 413，
+       * 白白多传一次，所以这种情况直接把原因抛出去。
+       */
+      const SINGLE_PUT_LIMIT = 130 * 1024 * 1024;
+      if (total > SINGLE_PUT_LIMIT) {
+        throw new Error(
+          `分片上传失败：${e.message}（文件 ${humanSize(total)} 超过单请求上限，无法回退）`,
+        );
+      }
       onLog?.(`分片上传失败：${e.message}，回退到单请求上传`);
     }
 
@@ -542,9 +586,10 @@ export function resetOpenList() {
  *   分不清哪个文件属于哪一次录制。加一层任务目录彻底隔开。
  *
  * @param {string} filename 文件名
- * @param {{ taskId?: string, baseName?: string }} [opts]
+ * @param {{ taskId?: string, baseName?: string, date?: number }} [opts]
  *        taskId  任务 id，取前 8 位做短标识
  *        baseName 任务基础名（如 live_20261107120000），拼在短 id 前面便于人眼识别
+ *        date    任务创建时间。日期目录按它算，跨零点补传才不会落到第二天
  */
 export function buildRemotePath(filename, opts = {}) {
   const o = config.openlist;
@@ -553,7 +598,7 @@ export function buildRemotePath(filename, opts = {}) {
   dir = dir.replace(/\/+$/, '');
 
   if (o.dateSubdir) {
-    const d = new Date();
+    const d = new Date(opts.date || Date.now());
     const ymd = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
     dir += '/' + ymd;
   }

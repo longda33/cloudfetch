@@ -3,8 +3,10 @@
  *
  * 设计要点：
  *  1. HTTP 直链 —— 支持 Range 分片并行下载，断点续传
- *  2. HLS (m3u8) —— 拉取分片列表，串行/有限并发下载并拼接，失败重试
- *  3. 直播流 (http-flv / rtmp) —— 单次长连接写盘，**不分段**；
+ *  2. HLS (m3u8) —— 拉取分片列表，串行/有限并发下载并拼接，失败重试；
+ *     加密（EXT-X-KEY）与 fMP4（EXT-X-MAP）转交 ffmpeg
+ *  3. DASH (mpd) —— 同样交给 ffmpeg（SegmentTemplate / 音视频分离 / init 段）
+ *  4. 直播流 (http-flv / rtmp) —— 单次长连接写盘，**不分段**；
  *     仅当连接中断时自动重连续写，实现"中途失败才分段"
  */
 import fs from 'node:fs';
@@ -13,6 +15,34 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { config } from './config.js';
 import { detectKind, resolveFilename, humanSize, fmtRate } from './util/links.js';
+import { openWriter, pipeInto } from './util/writer.js';
+
+/**
+ * 跟踪所有 ffmpeg 子进程。
+ * 进程退出时如果不主动杀掉，本地 `npm start` 重启一次就会留下一个孤儿进程
+ * 继续往磁盘写数据。
+ */
+const children = new Set();
+
+function spawnTracked(cmd, args, opts) {
+  const child = spawn(cmd, args, opts);
+  children.add(child);
+  child.once('close', () => children.delete(child));
+  child.once('error', () => children.delete(child));
+  return child;
+}
+
+/** 杀掉所有在跑的子进程（供 server 优雅退出调用） */
+export function killAllChildren() {
+  for (const child of children) {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      /* ignore */
+    }
+  }
+  children.clear();
+}
 
 /** 自定义可重试错误 */
 class RetryableError extends Error {
@@ -31,6 +61,28 @@ class FatalError extends Error {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 已取消就立刻抛，不要等到网络超时。
+ *
+ * 为什么需要这个：`signal.addEventListener('abort', ...)` 只对"将来"的 abort 生效。
+ * 如果 signal 在进入这个函数之前就已经 abort 了（比如用户在上一个网络请求
+ * 还没返回时就点了取消），监听器永远不会触发，fetch 会一直等到 connectTimeout
+ * 才失败 —— 表现为「点了取消，任务还卡在正在停止…几十秒」。
+ */
+function ensureNotAborted(signal) {
+  if (signal?.aborted) throw new FatalError('已取消');
+}
+
+/** 注册 abort 回调；若 signal 已经 abort 过，立即执行一次（addEventListener 不会补发） */
+function onAbortOnce(signal, fn) {
+  if (!signal) return;
+  if (signal.aborted) {
+    fn();
+    return;
+  }
+  signal.addEventListener('abort', fn, { once: true });
+}
 
 /** 指数退避，带抖动 */
 function backoff(attempt, base = config.retry.baseDelay, max = config.retry.maxDelay) {
@@ -65,6 +117,7 @@ async function withRetry({ label, fn, onRetry, maxAttempts = config.retry.maxAtt
 
 /** 探测远端信息：大小、是否支持 Range、文件名 */
 async function probe(url, signal) {
+  ensureNotAborted(signal);
   const ac = new AbortController();
   const onAbort = () => ac.abort();
   signal?.addEventListener('abort', onAbort, { once: true });
@@ -203,12 +256,13 @@ async function downloadSingleStream(url, dest, job, ctx, expectedTotal) {
 
       // 服务端忽略 Range 返回 200：只能从头写
       const appending = res.status === 206;
-      const ws = fs.createWriteStream(partPath, { flags: appending ? 'a' : 'w' });
+      const w = openWriter(partPath, appending ? 'a' : 'w');
       if (!appending) startAt = 0;
 
       resetIdle();
       let written = startAt;
       let stopped = false;
+      let endErr = null;
 
       try {
         for await (const chunk of res.body) {
@@ -217,9 +271,7 @@ async function downloadSingleStream(url, dest, job, ctx, expectedTotal) {
             break;
           }
           resetIdle();
-          if (!ws.write(chunk)) {
-            await new Promise((r) => ws.once('drain', r));
-          }
+          await w.write(chunk);
           written += chunk.length;
           job.downloaded = written;
           onProgress?.(written, expectedTotal || written);
@@ -243,8 +295,15 @@ async function downloadSingleStream(url, dest, job, ctx, expectedTotal) {
         }
       } finally {
         clearTimeout(idleTimer);
-        await new Promise((r) => ws.end(r));
+        // end 的失败（如 ENOSPC 落盘失败）不能吞，否则会 rename 出一个截断的文件
+        try {
+          await w.end();
+        } catch (e) {
+          endErr = e;
+        }
       }
+
+      if (endErr && !stopped) throw endErr;
 
       // 用户主动停止：把已下载的部分当作完成，不做长度校验
       if (stopped) {
@@ -368,7 +427,15 @@ async function downloadChunked(url, dest, job, ctx, total) {
             have = 0;
           }
           const want = end - start + 1;
-          if (have >= want) return;
+          if (have === want) return;
+          /**
+           * 分片文件比预期还大，说明它是上一次用不同 CHUNK_SIZE 跑出来的残留。
+           * 直接当成"已下完"会让合并后的文件偏大且内容错位，必须清掉重下。
+           */
+          if (have > want) {
+            await fsp.truncate(p, 0).catch(() => {});
+            have = 0;
+          }
 
           const ac = new AbortController();
           const onAbort = () => ac.abort();
@@ -398,24 +465,30 @@ async function downloadChunked(url, dest, job, ctx, total) {
               throw new FatalError(`HTTP ${res.status}`);
             }
 
-            const ws = fs.createWriteStream(p, { flags: have > 0 ? 'a' : 'w' });
-            let w = have;
+            const w = openWriter(p, have > 0 ? 'a' : 'w');
+            let written = have;
+            let endErr = null;
             resetIdle();
             try {
               for await (const chunk of res.body) {
                 if (signal?.aborted) throw new FatalError('已取消');
                 resetIdle();
-                if (!ws.write(chunk)) await new Promise((r) => ws.once('drain', r));
-                w += chunk.length;
+                await w.write(chunk);
+                written += chunk.length;
                 doneBytes += chunk.length;
                 job.downloaded = doneBytes;
                 onProgress?.(doneBytes, total);
               }
             } finally {
               clearTimeout(idle);
-              await new Promise((r) => ws.end(r));
+              try {
+                await w.end();
+              } catch (e) {
+                endErr = e;
+              }
             }
-            if (w < want) throw new RetryableError(`分片不完整 ${w}/${want}`);
+            if (endErr) throw endErr;
+            if (written < want) throw new RetryableError(`分片不完整 ${written}/${want}`);
             chunkDone[ci] = true;
           } finally {
             clearTimeout(idle);
@@ -429,25 +502,20 @@ async function downloadChunked(url, dest, job, ctx, total) {
     pump();
   });
 
-  if (failed) throw failed;
-
-  // 合并分片
+  // 合并分片（pump 里已经 reject 过了，这里不再重复判断 failed）
   onLog?.('合并分片...');
   const tmpOut = dest + '.merging';
-  const ws = fs.createWriteStream(tmpOut);
+  const w = openWriter(tmpOut);
   try {
     for (let i = 0; i < chunkCount; i++) {
-      const p = path.join(partDir, `${i}.part`);
-      await new Promise((resolve, reject) => {
-        const rs = fs.createReadStream(p);
-        rs.on('error', reject);
-        rs.on('end', resolve);
-        rs.pipe(ws, { end: false });
-      });
+      await pipeInto(w, path.join(partDir, `${i}.part`));
     }
-  } finally {
-    await new Promise((r) => ws.end(r));
+  } catch (e) {
+    w.destroy();
+    await fsp.rm(tmpOut, { force: true }).catch(() => {});
+    throw e;
   }
+  await w.end();
 
   await fsp.rename(tmpOut, dest);
   await fsp.rm(partDir, { recursive: true, force: true });
@@ -463,6 +531,169 @@ async function sizeOf(p) {
   } catch {
     return 0;
   }
+}
+
+/**
+ * 判断 HLS 播放列表是否必须交给 ffmpeg。
+ *
+ *  - EXT-X-KEY（METHOD 不是 NONE）：分片是 AES-128 加密的，
+ *    直接拼接得到的是密文，文件能生成但根本播不了
+ *  - EXT-X-MAP：fMP4 格式，分片是 .m4s，必须先拼 init 段才能解码
+ *
+ * 这两种自己实现成本高、坑多（密钥轮换、IV 推导、init 段顺序），
+ * 而 ffmpeg 本来就处理得很完整。
+ */
+export function hlsNeedsFfmpeg(text) {
+  if (/^#EXT-X-KEY:(?!.*METHOD=NONE)/im.test(text)) return true;
+  if (/^#EXT-X-MAP:/im.test(text)) return true;
+  return false;
+}
+
+/**
+ * 用 ffmpeg 直接拉取一个流/清单到单个文件。
+ *
+ * 用于 DASH、加密 HLS、fMP4 —— 这些格式的解析与解密交给 ffmpeg 更稳。
+ * 进度只能按已写盘大小估算（总长度未知），前端会显示为不确定态进度条。
+ */
+async function downloadViaFfmpeg(job, ctx, opts) {
+  const { signal, onProgress, onLog } = ctx;
+  const { formats, hls = false } = opts;
+  const target = opts.url || ctx.url;
+
+  const rawName = (ctx.filename || opts.baseName || 'download').replace(/\.[a-z0-9]+$/i, '');
+  job.live = false;
+  job.segmentSeconds = 0;
+
+  let lastErr = null;
+  for (const fmt of formats) {
+    ensureNotAborted(signal);
+    const outName = `${rawName}${fmt.ext}`;
+    const outPath = path.join(ctx.dir, outName);
+    job.filename = outName;
+
+    onLog?.(`ffmpeg 拉流（${fmt.label}）→ ${outName}`);
+
+    const sampler = setInterval(() => {
+      fs.stat(outPath, (err, st) => {
+        if (!err && st.size > 0) {
+          job.downloaded = st.size;
+          onProgress?.(st.size, 0);
+        }
+      });
+    }, 1000);
+
+    try {
+      await runFfmpegPull({ url: target, outPath, signal, hls, format: fmt, onLog });
+    } catch (e) {
+      clearInterval(sampler);
+      lastErr = e;
+      await fsp.rm(outPath, { force: true }).catch(() => {});
+      if (signal?.aborted) throw e;
+      onLog?.(`ffmpeg 拉流失败（${e.message}），尝试下一种封装`);
+      continue;
+    }
+    clearInterval(sampler);
+
+    const size = await sizeOf(outPath);
+    if (size <= 0) {
+      lastErr = new Error('ffmpeg 未产出任何数据');
+      await fsp.rm(outPath, { force: true }).catch(() => {});
+      continue;
+    }
+
+    job.downloaded = size;
+    onLog?.(`拉流完成：${outName}  ${humanSize(size)}`);
+    return { filePath: outPath, filename: outName, size, segments: [], multiFile: false };
+  }
+
+  throw lastErr || new FatalError('ffmpeg 拉流失败');
+}
+
+/** 启动一次 ffmpeg 拉流，等到进程结束 */
+function runFfmpegPull({ url, outPath, signal, hls, format, onLog }) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-hide_banner',
+      '-loglevel', 'warning',
+      // 网络抖动时在进程内重连（不加 -reconnect_at_eof：点播流读完就该结束，
+      // 否则 ffmpeg 会以为断流、无限重新下载）
+      '-reconnect', '1',
+      '-reconnect_streamed', '1',
+      '-reconnect_delay_max', '5',
+      // 30 秒收不到任何数据就判定卡死，避免点播任务永久挂着
+      '-rw_timeout', '30000000',
+    ];
+    // HLS 的分片/密钥可能是非标准扩展名（.php 等），默认白名单会拒绝。
+    // 注意这是 hls 解复用器的私有选项，DASH 输入不能带，否则 ffmpeg 直接报错。
+    if (hls) args.push('-allowed_extensions', 'ALL');
+
+    args.push(
+      '-i', url,
+      // 只取一条视频 + 一条音频：DASH 常有多条音轨，全取会让封装失败
+      '-map', '0:v?',
+      '-map', '0:a?',
+      '-c', 'copy',
+      ...format.args,
+      '-y', outPath,
+    );
+
+    onLog?.(`ffmpeg 启动：${format.label}`);
+    const child = spawnTracked(config.ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+
+    let stderr = '';
+    child.stderr.on('data', (d) => {
+      stderr += d.toString();
+      if (stderr.length > 8000) stderr = stderr.slice(-8000);
+    });
+
+    const kill = () => {
+      try {
+        child.kill('SIGINT');
+      } catch {
+        /* ignore */
+      }
+      setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* ignore */
+        }
+      }, 3000).unref?.();
+    };
+    onAbortOnce(signal, kill);
+
+    child.on('error', (e) => {
+      signal?.removeEventListener('abort', kill);
+      const hint = e.code === 'ENOENT' ? '（未安装 ffmpeg？）' : '';
+      reject(new Error(`ffmpeg 启动失败：${e.message}${hint}`));
+    });
+
+    child.on('close', (code) => {
+      signal?.removeEventListener('abort', kill);
+      if (signal?.aborted) return reject(new FatalError('已取消'));
+      if (code === 0) return resolve();
+      // ffmpeg 的报错很长，取最后几行足够定位
+      reject(new Error(`ffmpeg 退出码 ${code}：${stderr.trim().split('\n').slice(-3).join(' | ').slice(-300)}`));
+    });
+  });
+}
+
+/**
+ * DASH（.mpd）下载。
+ *
+ * 自己解析 MPD 要处理 SegmentTemplate/SegmentList/SegmentBase、音视频分离、
+ * init 段、多码率选择…… ffmpeg 的 dash 解复用器已经全部覆盖，
+ * 而 ffmpeg 本来就是本项目的硬依赖（RTMP/直播录制都用它）。
+ */
+async function downloadDash(job, ctx) {
+  ctx.onLog?.('DASH（.mpd）：交给 ffmpeg 处理（SegmentTemplate / 音视频分离 / init 段）');
+  return downloadViaFfmpeg(job, ctx, {
+    baseName: (ctx.filename || resolveFilename(ctx.url)).replace(/\.[a-z0-9]+$/i, '') || 'dash',
+    formats: [
+      { ext: '.mp4', label: 'mp4', args: ['-f', 'mp4'] },
+      { ext: '.mkv', label: 'matroska', args: ['-f', 'matroska'] },
+    ],
+  });
 }
 
 /**
@@ -495,6 +726,20 @@ async function downloadHls(job, ctx) {
     throw new FatalError('不是有效的 HLS 媒体播放列表（可能是直播中或格式异常）');
   }
 
+  // 加密分片 / fMP4 自己拼不出可播放文件，交给 ffmpeg
+  if (hlsNeedsFfmpeg(mediaText)) {
+    onLog?.('播放列表含加密密钥或 fMP4 初始化段，改用 ffmpeg 拉流（内置解密与容器处理）');
+    return downloadViaFfmpeg(job, ctx, {
+      url: mediaUrl,
+      baseName,
+      hls: true,
+      formats: [
+        { ext: '.ts', label: 'mpegts', args: ['-f', 'mpegts'] },
+        { ext: '.mp4', label: 'mp4', args: ['-f', 'mp4'] },
+      ],
+    });
+  }
+
   const segs = parseSegments(mediaText, mediaUrl);
   if (!segs.length) throw new FatalError('播放列表里没有分片');
 
@@ -524,13 +769,24 @@ async function downloadHls(job, ctx) {
           signal,
           maxAttempts: 6,
           fn: async () => {
+            // 已经完整下过就直接跳过（.tmp 后缀保证这里只可能是完整文件）
             try {
               const st = await fsp.stat(p);
               if (st.size > 0) return st.size;
             } catch {
               /* ignore */
             }
-            return await fetchToFile(seg.url, p, signal, seg.byteRange);
+            /**
+             * 先写 .tmp，成功后再 rename 成正式文件名。
+             *
+             * 直接写 p 的话，中途失败会留下 size>0 的残片，
+             * 下一次重试看到 size>0 就当成"已下完"，最终拼出一个缺片的视频
+             * 而且完全没有任何报错。
+             */
+            const tmp = p + '.tmp';
+            const sz = await fetchToFile(seg.url, tmp, signal, seg.byteRange);
+            await fsp.rename(tmp, p);
+            return sz;
           },
           onRetry: (m) => onLog?.(m),
         });
@@ -560,32 +816,27 @@ async function downloadHls(job, ctx) {
 
   onLog?.(stopped ? '已停止，拼接已下载的分片...' : '拼接分片...');
   const tmpOut = dest + '.concat';
-  const ws = fs.createWriteStream(tmpOut);
+  const w = openWriter(tmpOut);
   let concatBytes = 0;
   try {
     for (let i = 0; i < segs.length; i++) {
       const p = path.join(partDir, String(i).padStart(6, '0') + '.ts');
       // 停止时跳过还没下完的分片，不要在这里抛错
-      const exists = await fsp
-        .stat(p)
-        .then((s) => s.size > 0)
-        .catch(() => false);
+      const st = await fsp.stat(p).catch(() => null);
+      const exists = Boolean(st && st.size > 0);
       if (!exists) {
         if (stopped) continue;
         throw new FatalError(`分片 ${i + 1} 缺失`);
       }
-      const sz = await new Promise((resolve, reject) => {
-        const rs = fs.createReadStream(p);
-        rs.on('error', reject);
-        rs.on('end', resolve);
-        rs.pipe(ws, { end: false });
-      });
-      const st = await fsp.stat(p);
+      await pipeInto(w, p);
       concatBytes += st.size;
     }
-  } finally {
-    await new Promise((r) => ws.end(r));
+  } catch (e) {
+    w.destroy();
+    await fsp.rm(tmpOut, { force: true }).catch(() => {});
+    throw e;
   }
+  await w.end();
 
   if (stopped && concatBytes === 0) {
     await fsp.rm(tmpOut, { force: true });
@@ -611,8 +862,15 @@ function parseVariants(text, baseUrl) {
       for (let j = i + 1; j < lines.length; j++) {
         const n = lines[j].trim();
         if (!n || n.startsWith('#')) continue;
+        // 畸形 URL 直接跳过，不要让整份播放列表解析失败
+        let href;
+        try {
+          href = new URL(n, baseUrl).href;
+        } catch {
+          break;
+        }
         out.push({
-          url: new URL(n, baseUrl).href,
+          url: href,
           bandwidth: bw ? Number(bw[1]) : 0,
           resolution: res ? res[1] : '',
         });
@@ -644,8 +902,16 @@ function parseSegments(text, baseUrl) {
     }
     if (l.startsWith('#')) continue;
 
+    // 畸形 URL 直接跳过，否则一条坏行会让整场 HLS 下载失败
+    let href;
+    try {
+      href = new URL(l, baseUrl).href;
+    } catch {
+      continue;
+    }
+
     out.push({
-      url: new URL(l, baseUrl).href,
+      url: href,
       duration: pendingDur,
       byteRange: pendingRange,
     });
@@ -682,6 +948,7 @@ async function fetchText(url, signal) {
 }
 
 async function fetchToFile(url, dest, signal, byteRange) {
+  ensureNotAborted(signal);
   const ac = new AbortController();
   const onAbort = () => ac.abort();
   signal?.addEventListener('abort', onAbort, { once: true });
@@ -703,18 +970,24 @@ async function fetchToFile(url, dest, signal, byteRange) {
     if (res.status >= 400) throw new FatalError(`分片 HTTP ${res.status}`);
 
     resetIdle();
-    const ws = fs.createWriteStream(dest);
+    const w = openWriter(dest);
     let n = 0;
+    let endErr = null;
     try {
       for await (const chunk of res.body) {
         resetIdle();
-        if (!ws.write(chunk)) await new Promise((r) => ws.once('drain', r));
+        await w.write(chunk);
         n += chunk.length;
       }
     } finally {
       clearTimeout(idle);
-      await new Promise((r) => ws.end(r));
+      try {
+        await w.end();
+      } catch (e) {
+        endErr = e;
+      }
     }
+    if (endErr) throw endErr;
     if (n === 0) throw new RetryableError('分片为空');
     return n;
   } finally {
@@ -744,6 +1017,7 @@ async function fetchToFile(url, dest, signal, byteRange) {
  */
 async function downloadLiveWhole(job, ctx) {
   const { url, signal, onProgress, onLog } = ctx;
+  ensureNotAborted(signal);
 
   const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
   const baseName = (ctx.filename || `live_${ts}`).replace(/\.[a-z0-9]+$/i, '');
@@ -859,7 +1133,7 @@ function runFfmpegWhole(opts) {
     if (append) args.push('-append', '1');
     args.push('-y', outPath);
 
-    const child = spawn(config.ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    const child = spawnTracked(config.ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
 
     let stderr = '';
     child.stderr.on('data', (d) => {
@@ -881,7 +1155,7 @@ function runFfmpegWhole(opts) {
         }
       }, 3000).unref?.();
     };
-    signal?.addEventListener('abort', kill, { once: true });
+    onAbortOnce(signal, kill);
 
     child.on('error', (e) => {
       signal?.removeEventListener('abort', kill);
@@ -893,7 +1167,7 @@ function runFfmpegWhole(opts) {
       if (signal?.aborted) return resolve({ aborted: true });
       if (code === 0) return resolve({ aborted: false });
       if (/Connection|timed out|Server error|End of file|Invalid data|Broken pipe|error while decoding|prematurely/i.test(stderr)) {
-        return resolve({ aborted: false, interrupted: true });
+        return resolve({ aborted: false });
       }
       reject(new Error(`ffmpeg 退出码 ${code}：${stderr.slice(-400)}`));
     });
@@ -902,6 +1176,7 @@ function runFfmpegWhole(opts) {
 
 async function downloadLive(job, ctx) {
   const { url, signal, onProgress, onLog, onSegment } = ctx;
+  ensureNotAborted(signal);
 
   /**
    * 全段下载（不分段）：把整个直播录成一个大文件。
@@ -1182,7 +1457,7 @@ function runFfmpegSegments(opts) {
 
     onLog?.(`ffmpeg 启动：每 ${segmentSeconds}s 一段（含自动重连）`);
 
-    const child = spawn(config.ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    const child = spawnTracked(config.ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
 
     let stderr = '';
     child.stderr.on('data', (d) => {
@@ -1266,7 +1541,7 @@ function runFfmpegSegments(opts) {
         }
       }, 3000).unref?.();
     };
-    signal?.addEventListener('abort', kill, { once: true });
+    onAbortOnce(signal, kill);
 
     child.on('error', (e) => {
       cleanup();
@@ -1308,17 +1583,11 @@ function runFfmpegSegments(opts) {
       if (signal?.aborted) return resolve({ aborted: true });
       if (code === 0) return resolve({ aborted: false });
       if (/Connection|timed out|Server error|End of file|Invalid data|Broken pipe|error while decoding/i.test(stderr)) {
-        return resolve({ aborted: false, interrupted: true });
+        return resolve({ aborted: false });
       }
       reject(new Error(`ffmpeg 退出码 ${code}：${stderr.slice(-400)}`));
     });
   });
-}
-
-function guessLiveExt(url) {
-  const s = url.toLowerCase();
-  if (s.includes('.m3u8')) return 'ts';
-  return 'flv';
 }
 
 /**
@@ -1327,6 +1596,9 @@ function guessLiveExt(url) {
  * 只要满足就按直播处理——普通视频文件一定有 Content-Length（或分块但有确定终点）。
  */
 async function looksLikeLiveStream(url, signal) {
+  // 放在 try 外面：这里的 catch 会把所有异常吞成 false，
+  // 取消信号不能被吞掉，否则后面还会继续发起新的请求
+  ensureNotAborted(signal);
   const ac = new AbortController();
   const onAbort = () => ac.abort();
   signal?.addEventListener('abort', onAbort, { once: true });
@@ -1375,142 +1647,13 @@ async function looksLikeLiveStream(url, signal) {
   }
 }
 
-/** 单次直播连接，写入指定文件，返回收到字节数 */
-function streamOnce(url, destPath, signal, onBytes, onLog) {
-  return new Promise((resolve, reject) => {
-    if (detectKind(url) === 'rtmp') {
-      return rtmpOnce(url, destPath, signal, onBytes, resolve, reject, onLog);
-    }
-    httpFlvOnce(url, destPath, signal, onBytes, resolve, reject, onLog);
-  });
-}
-
-async function httpFlvOnce(url, destPath, signal, onBytes, resolve, reject, onLog) {
-  const ac = new AbortController();
-  const onAbort = () => ac.abort();
-  signal?.addEventListener('abort', onAbort, { once: true });
-
-  let idle;
-  const resetIdle = () => {
-    clearTimeout(idle);
-    idle = setTimeout(() => {
-      onLog?.('直播流空闲超时，重连');
-      ac.abort();
-    }, config.download.idleTimeout);
-  };
-
-  let got = 0;
-  try {
-    const res = await fetch(url, {
-      headers: { 'User-Agent': 'CloudFetch/1.0', Accept: '*/*' },
-      signal: ac.signal,
-      redirect: 'follow',
-    });
-    if (res.status >= 400) {
-      throw new Error(`HTTP ${res.status}`);
-    }
-
-    resetIdle();
-    const ws = fs.createWriteStream(destPath);
-    try {
-      for await (const chunk of res.body) {
-        if (signal?.aborted) break;
-        resetIdle();
-        if (!ws.write(chunk)) await new Promise((r) => ws.once('drain', r));
-        got += chunk.length;
-        onBytes(chunk.length);
-      }
-    } finally {
-      clearTimeout(idle);
-      await new Promise((r) => ws.end(r));
-    }
-    resolve(got);
-  } catch (e) {
-    reject(e);
-  } finally {
-    clearTimeout(idle);
-    signal?.removeEventListener('abort', onAbort);
-  }
-}
-
-/** rtmp 走 ffmpeg */
-function rtmpOnce(url, destPath, signal, onBytes, resolve, reject, onLog) {
-  const args = [
-    '-hide_banner', '-loglevel', 'warning',
-    '-i', url,
-    '-c', 'copy',
-    '-f', 'flv',
-    '-y', destPath,
-  ];
-  const child = spawn(config.ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
-
-  let got = 0;
-  const timer = setInterval(() => {
-    // 通过文件大小估算进度
-    fs.stat(destPath, (err, st) => {
-      if (!err && st.size > got) {
-        const delta = st.size - got;
-        got = st.size;
-        onBytes(delta);
-      }
-    });
-  }, 1000);
-
-  let stderr = '';
-  child.stderr.on('data', (d) => {
-    stderr += d.toString();
-    if (stderr.length > 4000) stderr = stderr.slice(-4000);
-  });
-
-  const kill = () => {
-    try {
-      child.kill('SIGKILL');
-    } catch {
-      /* ignore */
-    }
-  };
-  signal?.addEventListener('abort', kill, { once: true });
-
-  child.on('error', (e) => {
-    clearInterval(timer);
-    signal?.removeEventListener('abort', kill);
-    reject(new Error(`ffmpeg 启动失败：${e.message}（是否未安装 ffmpeg？）`));
-  });
-
-  child.on('close', (code) => {
-    clearInterval(timer);
-    signal?.removeEventListener('abort', kill);
-    if (signal?.aborted) return resolve(got);
-    if (code === 0) return resolve(got);
-    onLog?.(`ffmpeg 退出码 ${code}`);
-    if (got > 0) return resolve(got);
-    reject(new Error(`ffmpeg 异常退出（${code}）${stderr.slice(-300)}`));
-  });
-}
-
-/** 二进制拼接文件 */
-async function mergeFiles(files, dest) {
-  const ws = fs.createWriteStream(dest);
-  try {
-    for (const f of files) {
-      await new Promise((resolve, reject) => {
-        const rs = fs.createReadStream(f);
-        rs.on('error', reject);
-        rs.on('end', resolve);
-        rs.pipe(ws, { end: false });
-      });
-    }
-  } finally {
-    await new Promise((r) => ws.end(r));
-  }
-}
-
 /**
  * 统一入口
  * @param {object} job 任务对象
  * @param {object} ctx { url, dir, filename, signal, onProgress, onLog }
  */
 export async function runDownload(job, ctx) {
+  ensureNotAborted(ctx.signal);
   const kind = detectKind(ctx.url);
   job.kind = kind;
 
@@ -1536,7 +1679,7 @@ export async function runDownload(job, ctx) {
     case 'rtmp':
       return await downloadLive(job, ctx);
     case 'dash':
-      throw new FatalError('暂不支持 DASH (.mpd) 格式');
+      return await downloadDash(job, ctx);
     default:
       // 未知协议，按直播流处理（http-flv 等无扩展名地址）
       if (/^https?:/i.test(ctx.url)) {

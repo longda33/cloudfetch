@@ -1,0 +1,30 @@
+name: Test
+
+# 最小校验：语法 + 单元测试。
+# 之前仓库没有任何自动化测试，像「HLS 残片被当成已完成」「取消后标成已完成」
+# 这类状态机 bug 只能靠人工发现，加这层至少能挡住回归。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 安装依赖
+        run: npm ci --no-audit --no-fund
+
+      - name: 语法检查
+        run: npm run check
+
+      - name: 单元测试
+        run: npm test

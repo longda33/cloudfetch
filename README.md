@@ -8,7 +8,8 @@
 
 - **多种链接类型**
   - HTTP 直链（支持 Range 分片并行 + 断点续传）
-  - HLS / m3u8（自动选最高码率，分片并发下载后拼接）
+  - HLS / m3u8（自动选最高码率，分片并发下载后拼接；**AES-128 加密流与 fMP4 走 ffmpeg**）
+  - DASH / mpd（交给 ffmpeg 处理 SegmentTemplate、音视频分离与 init 段）
   - HTTP-FLV 直播流（自动识别，按时间分段录制）
   - RTMP 直播（经 ffmpeg 录制）
 - **直播按时间分段**：每段独立文件、独立上传、**不合并**；分段点对齐关键帧，每段可单独播放
@@ -23,12 +24,26 @@
 
 ```bash
 npm install
+
+# 方式一：直接用环境变量启动
+PANEL_PASSWORD=your-password npm start
+
+# 方式二：用 Node 内置的 .env 支持（Node 20.6+，注意本项目不自动读取 .env）
 cp .env.example .env      # 按需修改
-npm start
+node --env-file=.env src/server.js
+
 # 打开 http://localhost:3000
 ```
 
-需要 Node 20+。RTMP 直播需要系统装有 `ffmpeg`。
+需要 Node 20+。**以下场景需要系统装有 `ffmpeg`**：RTMP 录制、DASH（`.mpd`）、
+HLS 加密流（`EXT-X-KEY`）、HLS fMP4（`EXT-X-MAP`）。普通直链与未加密 HLS 不依赖 ffmpeg。
+
+跑测试：
+
+```bash
+npm test        # 单元测试（认证 / 写流 / 链接解析 / 配置）
+npm run check   # 语法检查
+```
 
 ### Docker
 
@@ -60,16 +75,22 @@ export GIT_REPO_URL=https://github.com/<user>/cloudfetch
 | 变量 | 说明 | 默认 |
 |---|---|---|
 | `PORT` | 监听端口 | `3000` |
-| `PANEL_PASSWORD` | 面板访问密码，留空则不鉴权 | 空 |
+| `PANEL_PASSWORD` | 面板访问密码。**留空时拒绝所有访问**（fail-closed） | 空 |
+| `SESSION_SECRET` | 会话签名密钥。留空则随机生成（重启后需重新登录） | 随机 |
 | `DATA_DIR` | 下载临时目录 | `/tmp/cloudfetch` |
 | `MAX_FILE_SIZE` | 单文件上限（字节） | 20 GB |
 | `MAX_CONCURRENT` | 最大并发任务数 | `2` |
+| `MAX_QUEUE` | 队列上限（排队 + 运行中） | `100` |
 | `OPENLIST_URL` | OpenList 站点地址 | 空 |
 | `OPENLIST_TOKEN` | OpenList API 令牌 | 空 |
 | `OPENLIST_UPLOAD_DIR` | 上传目标目录 | `/cloudfetch` |
 | `DELETE_AFTER_UPLOAD` | 传完删本地 | `true` |
 | `RETRY_MAX_ATTEMPTS` | 最大重试次数 | `8` |
 | `IDLE_TIMEOUT` | 空闲多久判定卡死（毫秒） | `60000` |
+
+> `SESSION_SECRET` 不再有硬编码默认值。旧版本用一个写死的字符串做 HMAC 密钥，
+> 而签名算法是公开的，等于只要知道仓库内容就能伪造会话。现在没配置就随机生成，
+> 代价只是重启后需要重新登录一次。
 
 ### 获取 OpenList 令牌
 
@@ -203,8 +224,9 @@ POST /api/fs/multipart/complete
 ## 已知限制
 
 - Cloady 免费额度：0.5 CPU / 1 GB 内存 / 5 GB 存储。大文件需注意磁盘余量。
-- DASH（`.mpd`）暂不支持。
+- DASH / 加密 HLS / fMP4 依赖 ffmpeg，且**不支持 DRM**（Widevine / FairPlay 等），遇到会以 ffmpeg 报错结束。
 - RTMP 录制依赖 ffmpeg，且 `-c copy` 不做转码，源编码不兼容时可能失败。
+- 单请求上传受 Cloudflare 约 130MB 限制，超大文件依赖分片上传协议（见上）。
 
 ## License
 

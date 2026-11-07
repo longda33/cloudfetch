@@ -90,7 +90,8 @@ except Exception: pass
 " 2>/dev/null || true)"
 
     local body code
-    body="$(python -c 'import json,sys;print(json.dumps({"key":sys.argv[1],"value":sys.argv[2]}))' "$key" "$val")"
+    # 同样用环境变量传值，避免密钥出现在进程命令行里
+    body="$(CF_K="$key" CF_V="$val" python -c 'import json,os;print(json.dumps({"key":os.environ["CF_K"],"value":os.environ["CF_V"]}))')"
 
     if [ -n "${vid}" ]; then
       # 注意：不要带 ?env= 查询参数，服务端会把它当成 varId 解析而报 400
@@ -129,13 +130,25 @@ else
   # ---------- 创建应用 ----------
   echo "==> 创建应用"
   BODY="$(mktemp)"
-  python - "$BODY" "$APP_NAME" "$REGION" "$GIT_REPO_URL" "$PANEL_PASSWORD" "$OPENLIST_URL" "$OPENLIST_TOKEN" "$UPLOAD_DIR" <<'PY'
+  # 用环境变量传参，不要走 argv：命令行参数在 ps/proc 里对同机所有用户可见，
+  # 等于把 PANEL_PASSWORD / OPENLIST_TOKEN 明文挂出去。
+  export CF_APP_NAME="$APP_NAME" \
+         CF_REGION="$REGION" \
+         CF_REPO="$GIT_REPO_URL" \
+         CF_PANEL_PASSWORD="${PANEL_PASSWORD:-}" \
+         CF_OPENLIST_URL="${OPENLIST_URL:-}" \
+         CF_OPENLIST_TOKEN="${OPENLIST_TOKEN:-}" \
+         CF_UPLOAD_DIR="$UPLOAD_DIR"
+  python - "$BODY" <<'PY'
 import json,sys,os
-out, name, region, repo = sys.argv[1:5]
-pw   = sys.argv[5] if len(sys.argv)>5 else ''
-olurl= sys.argv[6] if len(sys.argv)>6 else ''
-oltok= sys.argv[7] if len(sys.argv)>7 else ''
-updir= sys.argv[8] if len(sys.argv)>8 else '/cloudfetch'
+out = sys.argv[1]
+name   = os.environ.get("CF_APP_NAME","cloudfetch")
+region = os.environ.get("CF_REGION","")
+repo   = os.environ.get("CF_REPO","")
+pw     = os.environ.get("CF_PANEL_PASSWORD","")
+olurl  = os.environ.get("CF_OPENLIST_URL","")
+oltok  = os.environ.get("CF_OPENLIST_TOKEN","")
+updir  = os.environ.get("CF_UPLOAD_DIR","/cloudfetch") or "/cloudfetch"
 env = {
     "PORT": "3000",
     "DATA_DIR": "/tmp/cloudfetch",
