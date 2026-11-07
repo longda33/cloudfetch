@@ -340,11 +340,59 @@ app.get('/api/events', requireAuth, (req, res) => {
 });
 
 // ---------------- 静态文件 ----------------
-app.use(express.static(PUBLIC_DIR, { extensions: ['html'], maxAge: '1h' }));
+
+/**
+ * 静态资源版本号：按文件 mtime 自动生成。
+ *
+ * 之前 index.html 里写死 `app.js?v=2`，每次改前端都得手动改这个数字，
+ * 忘了改就会出现「服务端已是新代码、浏览器还在跑旧缓存」。
+ * 加上 express.static 的 maxAge 1h，用户最长一小时看不到更新。
+ *
+ * 现在 index.html 用 {{V}} 占位，这里替换成真实的 mtime 指纹，
+ * 文件一改版本号就变，浏览器必然重新拉取。
+ */
+function assetVersion(name) {
+  try {
+    return String(Math.floor(fs.statSync(path.join(PUBLIC_DIR, name)).mtimeMs));
+  } catch {
+    return String(Date.now());
+  }
+}
+
+const INDEX_TPL = (() => {
+  try {
+    return fs.readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8');
+  } catch {
+    return '';
+  }
+})();
+
+function renderIndex() {
+  // 同一次响应里 app.js / styles.css 用各自 mtime，互不影响
+  const v = assetVersion('app.js');
+  const vc = assetVersion('styles.css');
+  return INDEX_TPL.replace(/\{\{V_JS\}\}/g, v).replace(/\{\{V_CSS\}\}/g, vc);
+}
+
+/**
+ * 静态资源。
+ *
+ * index 参数设为 false：不让 static 自动返回 index.html。
+ * 否则访问 / 时 static 会直接吐原始文件，下面的 app.get('*')
+ * 根本没机会执行，{{V_JS}} 占位符也就替换不掉。
+ */
+app.use(
+  express.static(PUBLIC_DIR, {
+    index: false,
+    extensions: ['html'],
+    maxAge: '1h',
+  }),
+);
 
 app.get('*', (req, res) => {
   if (req.path.startsWith('/api/')) return res.status(404).json({ error: 'not found' });
-  res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
+  res.setHeader('Cache-Control', 'no-cache');
+  res.type('html').send(renderIndex());
 });
 
 // ---------------- 启动 ----------------

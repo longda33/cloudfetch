@@ -327,8 +327,29 @@ function emptyTasksHtml() {
   </div>`;
 }
 
+/**
+ * 渲染「进行中」面板。
+ *
+ * 只显示未结束的任务（queued / downloading / uploading）。
+ * 之前这里把 state.tasks 全渲染出来，导致已完成的卡片一直挂在
+ * 进行中列表里，得手动删才消失。结束的任务应该去「历史记录」看。
+ *
+ * 例外：刚结束的任务先留一会儿，让用户能看到「完成」状态，
+ * 过 FINISHED_LINGER_MS 后自动移出。
+ */
+const FINISHED_LINGER_MS = 60 * 1000;
+
+function isActiveTask(t) {
+  if (RUNNING.includes(t.status)) return true;
+  // 刚结束不久的留一会儿
+  return Boolean(t.finishedAt && Date.now() - t.finishedAt < FINISHED_LINGER_MS);
+}
+
 function renderAll() {
-  const list = [...state.tasks.values()].sort((a, b) => b.createdAt - a.createdAt);
+  const all = [...state.tasks.values()];
+  const list = all
+    .filter(isActiveTask)
+    .sort((a, b) => b.createdAt - a.createdAt);
   const el = $('#taskList');
 
   if (!list.length) {
@@ -348,6 +369,15 @@ function renderAll() {
 function upsertTask(t) {
   state.tasks.set(t.id, t);
   const el = $('#taskList');
+
+  // 结束超过保留时间的任务，不进「进行中」列表
+  if (!isActiveTask(t)) {
+    el.querySelector(`[data-id="${t.id}"]`)?.remove();
+    if (!el.querySelector('.task')) el.innerHTML = emptyTasksHtml();
+    updateStats();
+    updateTabCounts();
+    return;
+  }
 
   let card = el.querySelector(`[data-id="${t.id}"]`);
   if (!card) {
@@ -600,15 +630,27 @@ function renderHistItem(h) {
   const meta = [`<span>${fmtTime(h.createdAt)}</span>`];
   if (h.size) meta.push(`<span>大小 <b>${fmtBytes(h.size)}</b></span>`);
   if (h.duration) meta.push(`<span>耗时 <b>${fmtDuration(h.duration)}</b></span>`);
+
+  /**
+   * 分段统计。
+   *
+   * 关键：缺的段 = 总数 - 已传数。
+   * 不能只看 failedSegments —— 那个数组只记「上传抛异常」的段，
+   * 而实际有几种情况都不会进数组：
+   *   - 上传任务还在后台排队（异步上传，任务结束时可能没跑完）
+   *   - 用户中途停止，后面的段压根没触发上传
+   *   - 容器重启打断
+   * 这些段同样需要「重传」，所以这里用差值兜底。
+   */
+  let missing = 0;
   if (h.live && h.segment !== false) {
     const total = h.segmentCount || 0;
     const up = h.segmentsUploaded || 0;
-    const bad = (h.failedSegments || []).length;
-    // 分段统计一律显示「已传/总数」，和进行中页面口径一致
+    missing = Math.max(0, total - up);
     let seg = `<span>分段 <b>${total}</b> 段`;
     if (total) {
       seg += `，已传 <b class="${up === total ? 'ok' : ''}">${up}</b> 段`;
-      if (bad) seg += `，<b class="err">${bad}</b> 段失败`;
+      if (missing) seg += `，<b class="err">${missing}</b> 段未传`;
     }
     seg += '</span>';
     meta.push(seg);
@@ -628,10 +670,10 @@ function renderHistItem(h) {
          title="在 OpenList 打开 ${esc(dir)}">${icon('inbox', 'ic ic-xs')}文件夹</button>`
     : '';
 
-  // 有失败分段才显示「重传」
-  const retryUpBtn = (h.failedSegments || []).length
+  // 有缺段就显示「重传」，用差值而不是只看 failedSegments
+  const retryUpBtn = missing
     ? `<button class="btn btn-warn btn-xs" data-hact="retryup" data-hid="${h.id}"
-         title="${(h.failedSegments || []).length} 段上传失败，点击重试">${icon('refresh', 'ic ic-xs')}重传 ${(h.failedSegments || []).length}</button>`
+         title="${missing} 段未上传，点击重试">${icon('refresh', 'ic ic-xs')}重传 ${missing}</button>`
     : '';
 
   return `
@@ -922,4 +964,28 @@ document.addEventListener('click', (e) => {
 
   connectSSE();
   setInterval(refreshChips, 30000);
+
+  /**
+   * 定时把「刚结束、已过保留期」的卡片从进行中列表移走。
+   *
+   * 没有这个定时器的话，结束的卡片会一直挂着，
+   * 直到下一次有任务更新触发重渲染才消失。
+   */
+  setInterval(() => {
+    const el = $('#taskList');
+    if (!el) return;
+    let removed = false;
+    $$('.task', el).forEach((card) => {
+      const t = state.tasks.get(card.dataset.id);
+      if (t && !isActiveTask(t)) {
+        card.remove();
+        removed = true;
+      }
+    });
+    if (removed) {
+      if (!el.querySelector('.task')) el.innerHTML = emptyTasksHtml();
+      updateStats();
+      updateTabCounts();
+    }
+  }, 15000);
 })();

@@ -252,28 +252,52 @@ export class TaskManager extends EventEmitter {
   }
 
   /**
-   * 重试上传失败的段。
+   * 重试上传没传成功的段。
    *
-   * 只处理「文件还在本地、但上传失败」的段。文件已经被删掉的
-   * （传完自动删本地）就没法重试了，会明确告知。
+   * 候选来源有两个，缺一不可：
+   *   1) t.failedSegments —— 上传过程抛过异常的段
+   *   2) t.segments 里 remotePath 为空的段 —— 从没成功上传的段
+   *
+   * 只靠 1) 是不够的：直播是异步上传，任务结束时可能还有段在排队没传完，
+   * 或者用户中途停止导致后面的段压根没走到上传。这些段不会进
+   * failedSegments，但确实需要补传。
    */
   async retryFailedSegments(id) {
     const t = this.tasks.get(id);
     if (!t) throw new Error('任务不存在');
-    const list = t.failedSegments || [];
-    if (!list.length) throw new Error('没有待重试的段');
 
     const ol = getOpenList();
     if (!ol.configured) throw new Error('OpenList 未配置，无法上传');
 
-    this._log(t, `开始重试 ${list.length} 个失败分段`);
+    // 合并两个来源，按 index 去重
+    const byIndex = new Map();
+    for (const s of t.segments || []) {
+      if (s.remotePath) continue; // 已传的跳过
+      byIndex.set(s.index, {
+        index: s.index,
+        filename: s.filename,
+        size: s.size,
+        localPath: s.localPath || '',
+        error: '未上传',
+      });
+    }
+    for (const f of t.failedSegments || []) {
+      byIndex.set(f.index, { ...(byIndex.get(f.index) || {}), ...f });
+    }
+
+    const list = [...byIndex.values()].sort((a, b) => a.index - b.index);
+    if (!list.length) throw new Error('没有待重试的段');
+
+    this._log(t, `开始重试 ${list.length} 个分段`);
     let ok = 0;
     const still = [];
 
     for (const item of list) {
-      // 本地文件可能已被清理
+      // 本地路径可能没记下来，按任务目录 + 文件名兜底
+      const local =
+        item.localPath || path.join(config.tmpDir, t.id, item.filename || '');
       const exists = await fsp
-        .stat(item.localPath)
+        .stat(local)
         .then((s) => s.size > 0)
         .catch(() => false);
       if (!exists) {
@@ -287,14 +311,13 @@ export class TaskManager extends EventEmitter {
         baseName: t.baseName,
       });
       try {
-        await ol.uploadFile(item.localPath, remote, { onLog: (m) => this._log(t, m) });
-        // 更新段记录
+        await ol.uploadFile(local, remote, { onLog: (m) => this._log(t, m) });
         const seg = (t.segments || []).find((s) => s.index === item.index);
         if (seg) seg.remotePath = remote;
         ok++;
         this._log(t, `第 ${item.index} 段重试成功 → ${remote}`);
         if (config.openlist.deleteAfterUpload) {
-          await fsp.rm(item.localPath, { force: true }).catch(() => {});
+          await fsp.rm(local, { force: true }).catch(() => {});
           if (seg) seg.deleted = true;
         }
       } catch (e) {
@@ -481,6 +504,8 @@ export class TaskManager extends EventEmitter {
           size: s.size,
           remotePath: s.remotePath || '',
           deleted: Boolean(s.deleted),
+          // 本地路径要留着：上传失败时「重传」按钮需要靠它找到文件
+          localPath: s.path || s.localPath || '',
         }));
         t.segmentCount = segs.length;
         // 已上传数直接按实际带 remotePath 的段数算，
