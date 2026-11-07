@@ -1,0 +1,98 @@
+name: Unikraft 验证镜像
+
+# 只在手动触发或改动 unikraft/ 目录时跑，不影响现有 Cloady 部署
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'unikraft/**'
+      - '.github/workflows/unikraft-probe.yml'
+
+env:
+  IMAGE_NAME: cloudfetch-probe
+  UKC_VERSION: 0.6.2
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # unikraft images build 需要 BuildKit；runner 自带的 docker 正好能提供。
+      # 本地实测过：没有 BuildKit 会直接报
+      #   "buildkit not found; please start a docker or buildkit daemon"
+      - name: 确认 BuildKit 可用
+        run: |
+          set -euo pipefail
+          docker version
+          docker buildx version
+
+      - name: 安装 unikraft CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o /tmp/ukc.tar.gz \
+            "https://github.com/unikraft-cloud/cli/releases/download/v${UKC_VERSION}/unikraft-cli_${UKC_VERSION}_linux_amd64.tar.gz"
+          sudo tar -xzf /tmp/ukc.tar.gz -C /usr/local/bin unikraft
+          unikraft version
+
+      - name: 登录 Unikraft
+        env:
+          UKC_TOKEN: ${{ secrets.UNIKRAFT_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${UKC_TOKEN:-}" ]; then
+            echo "::error::缺少 UNIKRAFT_TOKEN secret，请在仓库 Settings → Secrets 里添加"
+            exit 1
+          fi
+          printf '%s' "$UKC_TOKEN" > /tmp/ukc.token
+          unikraft login --token /tmp/ukc.token --no-browser
+          rm -f /tmp/ukc.token
+
+      - name: 确定组织名
+        id: org
+        env:
+          UKC_ORG: ${{ secrets.UNIKRAFT_ORG }}
+        run: |
+          set -euo pipefail
+          if [ -n "${UKC_ORG:-}" ]; then
+            echo "name=$UKC_ORG" >> "$GITHUB_OUTPUT"
+          else
+            # 没配 secret 时从登录信息里推断
+            name=$(unikraft profile get -o json 2>/dev/null | grep -o '"organization":"[^"]*"' | head -1 | cut -d'"' -f4)
+            echo "name=${name:-panpp123}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 构建验证镜像
+        run: |
+          set -euo pipefail
+          cd unikraft/probe
+          unikraft images build . \
+            --arch x86_64 \
+            --output "${{ steps.org.outputs.name }}/${{ env.IMAGE_NAME }}:latest" \
+            --no-cache 2>&1 | tee /tmp/build.log
+
+      - name: 构建日志
+        if: always()
+        run: |
+          echo "=== 构建日志末尾 ==="
+          tail -80 /tmp/build.log 2>/dev/null || echo "(无日志)"
+
+      # 把构建出的镜像信息记到 summary，方便核对
+      - name: 写入摘要
+        if: success()
+        run: |
+          {
+            echo "## 验证镜像构建成功"
+            echo ""
+            echo "- 镜像: \`${{ steps.org.outputs.name }}/${{ env.IMAGE_NAME }}:latest\`"
+            echo "- 架构: x86_64"
+            echo ""
+            echo "### 下一步"
+            echo ""
+            echo "在本地或任意有 unikraft CLI 的机器上跑："
+            echo '```bash'
+            echo "./unikraft/deploy-probe.sh fra"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

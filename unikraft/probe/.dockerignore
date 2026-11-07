@@ -1,0 +1,6 @@
+# 构建上下文只保留 probe.mjs，其余全部排除
+# 原因：unikraft image build 会把整个目录当上下文传给 BuildKit，
+# 项目根有 node_modules（几十 MB），白传一遍很浪费时间。
+*
+!probe.mjs
+!Dockerfile
