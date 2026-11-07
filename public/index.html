@@ -1,897 +1,248 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="dark light">
 <title>CloudFetch · 云端下载器</title>
+<meta name="description" content="粘贴链接即可云端下载，实时进度，自动上传 OpenList 并清理本地文件。">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☁️</text></svg>">
-<style>
-:root{
-  --bg:#0b0e14; --panel:#131822; --panel2:#1a2130; --border:#242c3d;
-  --text:#e6edf7; --muted:#8b97ad; --accent:#3b82f6; --accent2:#06b6d4;
-  --ok:#10b981; --warn:#f59e0b; --err:#ef4444; --radius:12px;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-body{
-  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
-  background:var(--bg);color:var(--text);min-height:100vh;line-height:1.6;
-  background-image:radial-gradient(ellipse 80% 50% at 50% -20%,rgba(59,130,246,.15),transparent);
-}
-.wrap{max-width:1180px;margin:0 auto;padding:28px 20px 60px}
-
-header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:26px;flex-wrap:wrap}
-.brand{display:flex;align-items:center;gap:12px}
-.logo{
-  width:42px;height:42px;border-radius:11px;display:grid;place-items:center;font-size:22px;
-  background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:0 4px 16px rgba(59,130,246,.35);
-}
-h1{font-size:19px;font-weight:650;letter-spacing:-.01em}
-.brand small{color:var(--muted);font-size:12px;display:block;font-weight:400}
-.status-chips{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.chip{
-  display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:20px;
-  background:var(--panel);border:1px solid var(--border);font-size:12px;color:var(--muted);
-}
-.chip .dot{width:7px;height:7px;border-radius:50%;background:var(--muted)}
-.chip.on .dot{background:var(--ok);box-shadow:0 0 8px var(--ok)}
-.chip.off .dot{background:var(--err)}
-.chip.warn .dot{background:var(--warn)}
-
-.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:18px}
-.card h2{font-size:14px;font-weight:600;margin-bottom:14px;color:var(--text);display:flex;align-items:center;gap:8px}
-.card h2 .badge{font-size:11px;font-weight:400;color:var(--muted);background:var(--panel2);padding:2px 8px;border-radius:10px}
-
-textarea,input[type=text],input[type=password]{
-  width:100%;background:var(--bg);border:1px solid var(--border);border-radius:9px;
-  padding:12px 14px;color:var(--text);font-size:13px;font-family:inherit;outline:none;
-  transition:border-color .15s,box-shadow .15s;
-}
-textarea{resize:vertical;min-height:96px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;line-height:1.65}
-textarea:focus,input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(59,130,246,.14)}
-textarea::placeholder,input::placeholder{color:#5a6577}
-
-.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}
-.btn{
-  display:inline-flex;align-items:center;gap:7px;padding:9px 18px;border-radius:9px;border:1px solid transparent;
-  font-size:13px;font-weight:550;cursor:pointer;transition:all .15s;font-family:inherit;white-space:nowrap;
-}
-.btn-primary{background:linear-gradient(135deg,var(--accent),#2563eb);color:#fff;box-shadow:0 3px 12px rgba(59,130,246,.3)}
-.btn-primary:hover{transform:translateY(-1px);box-shadow:0 5px 18px rgba(59,130,246,.42)}
-.btn-primary:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none}
-.btn-ghost{background:var(--panel2);color:var(--muted);border-color:var(--border)}
-.btn-ghost:hover{color:var(--text);border-color:#35405a}
-.btn-danger{background:rgba(239,68,68,.12);color:#fca5a5;border-color:rgba(239,68,68,.28)}
-.btn-danger:hover{background:rgba(239,68,68,.2)}
-.btn-sm{padding:5px 11px;font-size:12px;border-radius:7px}
-.hint{font-size:12px;color:var(--muted);margin-top:8px}
-.hint code{background:var(--panel2);padding:1px 6px;border-radius:4px;font-size:11.5px;color:#93c5fd}
-
-/* 任务列表 */
-.task{
-  background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
-  padding:15px 17px;margin-bottom:11px;transition:border-color .2s,transform .15s;
-}
-.task:hover{border-color:#2d3a52}
-.task.running{border-color:rgba(59,130,246,.4);background:linear-gradient(180deg,rgba(59,130,246,.055),transparent)}
-.task.done{border-color:rgba(16,185,129,.28)}
-.task.failed{border-color:rgba(239,68,68,.3)}
-.task-head{display:flex;align-items:flex-start;gap:12px;margin-bottom:11px}
-.task-icon{
-  width:34px;height:34px;border-radius:9px;display:grid;place-items:center;font-size:16px;
-  background:var(--panel2);flex-shrink:0;
-}
-.task.running .task-icon{background:rgba(59,130,246,.16)}
-.task.done .task-icon{background:rgba(16,185,129,.16)}
-.task.failed .task-icon{background:rgba(239,68,68,.16)}
-.task-main{flex:1;min-width:0}
-.task-name{font-size:13.5px;font-weight:560;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:3px}
-.task-url{font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:ui-monospace,monospace}
-.task-actions{display:flex;gap:6px;flex-shrink:0}
-
-/* 进度条：细线 + 渐变流动 + 端点脉冲，替代原来的大块 shimmer */
-.bar{
-  height:4px;background:rgba(255,255,255,.06);border-radius:99px;overflow:hidden;
-  position:relative;margin:11px 0 9px;
-}
-.bar-fill{
-  height:100%;border-radius:99px;transition:width .45s cubic-bezier(.4,0,.2,1);
-  background:linear-gradient(90deg,#3b82f6,#22d3ee,#3b82f6);
-  background-size:200% 100%;
-  animation:flow 2.4s linear infinite;
-  position:relative;
-}
-@keyframes flow{0%{background-position:0% 0}100%{background-position:200% 0}}
-/* 右端亮点，像水流的前锋 */
-.bar-fill::after{
-  content:'';position:absolute;right:0;top:50%;transform:translateY(-50%);
-  width:14px;height:14px;border-radius:50%;
-  background:radial-gradient(circle,#67e8f9 0%,rgba(34,211,238,.5) 45%,transparent 70%);
-  animation:pulse 1.4s ease-in-out infinite;
-}
-@keyframes pulse{0%,100%{opacity:.55;transform:translateY(-50%) scale(.85)}50%{opacity:1;transform:translateY(-50%) scale(1.15)}}
-
-.task.done .bar-fill{background:linear-gradient(90deg,#10b981,#34d399);animation:none}
-.task.done .bar-fill::after{display:none}
-.task.failed .bar-fill{background:linear-gradient(90deg,#ef4444,#f87171);animation:none}
-.task.failed .bar-fill::after{display:none}
-
-/* 不确定进度（直播等未知总大小）：来回扫光，不用 margin 动画 */
-.bar.indeterminate .bar-fill{
-  width:38%!important;
-  background:linear-gradient(90deg,transparent,#3b82f6,#22d3ee,transparent);
-  background-size:200% 100%;
-  animation:sweep 1.8s ease-in-out infinite;
-}
-@keyframes sweep{
-  0%{transform:translateX(-100%)}
-  100%{transform:translateX(365%)}
-}
-.bar.indeterminate .bar-fill::after{display:none}
-
-.meta{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums}
-.meta b{color:#b9c5d8;font-weight:550}
-.meta .err{color:#fca5a5}
-.meta .ok{color:#6ee7b7}
-
-.logs{
-  margin-top:10px;background:var(--bg);border-radius:8px;padding:9px 12px;
-  font-family:ui-monospace,monospace;font-size:11px;line-height:1.75;color:var(--muted);
-  max-height:132px;overflow-y:auto;display:none;
-  overscroll-behavior:contain;
-}
-.logs.show{display:block}
-.logs div{white-space:pre-wrap;word-break:break-all}
-
-/* ===== 标签切换 ===== */
-.tabs{display:flex;gap:4px;margin-bottom:16px;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:4px}
-.tab{
-  flex:1;padding:8px 14px;border-radius:7px;border:none;background:transparent;color:var(--muted);
-  font-size:13px;font-weight:550;cursor:pointer;font-family:inherit;transition:all .15s;
-  display:flex;align-items:center;justify-content:center;gap:6px;
-}
-.tab:hover{color:var(--text)}
-.tab.active{background:var(--panel2);color:var(--text);box-shadow:0 1px 4px rgba(0,0,0,.25)}
-.tab .cnt{
-  font-size:11px;background:rgba(59,130,246,.2);color:#93c5fd;
-  padding:1px 7px;border-radius:99px;font-weight:600;
-}
-
-/* ===== 历史记录 ===== */
-.hist-toolbar{display:flex;gap:9px;margin-bottom:14px;flex-wrap:wrap;align-items:center}
-.hist-toolbar input[type=text]{
-  flex:1;min-width:160px;background:var(--bg);border:1px solid var(--border);border-radius:8px;
-  padding:8px 12px;color:var(--text);font-size:13px;outline:none;font-family:inherit;
-}
-.hist-toolbar input[type=text]:focus{border-color:var(--accent)}
-.hist-toolbar select{
-  background:var(--bg);border:1px solid var(--border);border-radius:8px;
-  padding:8px 10px;color:var(--text);font-size:13px;outline:none;font-family:inherit;cursor:pointer;
-}
-
-.hist-item{
-  background:var(--panel);border:1px solid var(--border);border-radius:10px;
-  padding:13px 15px;margin-bottom:9px;transition:border-color .15s;
-}
-.hist-item:hover{border-color:#2d3a52}
-.hist-row{display:flex;align-items:flex-start;gap:11px}
-.hist-ico{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;font-size:15px;background:var(--panel2);flex-shrink:0}
-.hist-body{flex:1;min-width:0}
-.hist-title{font-size:13px;font-weight:550;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px}
-.hist-sub{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:ui-monospace,monospace}
-.hist-meta{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin-top:7px;font-variant-numeric:tabular-nums}
-.hist-meta b{color:#b9c5d8;font-weight:550}
-.hist-acts{display:flex;gap:6px;flex-shrink:0}
-.badge{
-  font-size:10.5px;padding:2px 8px;border-radius:99px;font-weight:600;
-  display:inline-flex;align-items:center;gap:4px;
-}
-.badge.done{background:rgba(16,185,129,.16);color:#6ee7b7}
-.badge.failed{background:rgba(239,68,68,.16);color:#fca5a5}
-.badge.canceled{background:rgba(148,163,184,.16);color:#cbd5e1}
-.badge.live{background:rgba(168,85,247,.16);color:#d8b4fe}
-
-.pager{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:16px;font-size:12.5px;color:var(--muted)}
-.pager button{
-  background:var(--panel2);border:1px solid var(--border);color:var(--muted);
-  padding:6px 13px;border-radius:7px;cursor:pointer;font-size:12.5px;font-family:inherit;
-}
-.pager button:hover:not(:disabled){color:var(--text);border-color:#35405a}
-.pager button:disabled{opacity:.35;cursor:not-allowed}
-
-.empty{text-align:center;padding:52px 20px;color:var(--muted)}
-.empty .big{font-size:42px;margin-bottom:12px;opacity:.45}
-.empty p{font-size:13px}
-
-.toast{
-  position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(90px);
-  background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:11px 20px;
-  font-size:13px;box-shadow:0 8px 30px rgba(0,0,0,.5);transition:transform .28s cubic-bezier(.2,.8,.3,1);
-  z-index:100;max-width:90vw;
-}
-.toast.show{transform:translateX(-50%) translateY(0)}
-.toast.err{border-color:rgba(239,68,68,.4);color:#fca5a5}
-.toast.ok{border-color:rgba(16,185,129,.4);color:#6ee7b7}
-
-/* 登录遮罩 */
-#loginMask{
-  position:fixed;inset:0;background:rgba(11,14,20,.94);display:none;place-items:center;z-index:200;
-  backdrop-filter:blur(6px);
-}
-#loginMask.show{display:grid}
-.login-box{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:32px;width:min(360px,90vw);text-align:center}
-.login-box h3{font-size:16px;margin-bottom:6px}
-.login-box p{font-size:12.5px;color:var(--muted);margin-bottom:18px}
-.login-box input{margin-bottom:12px;text-align:center}
-
-@media(max-width:640px){
-  .wrap{padding:18px 13px 50px}
-  .task-head{flex-wrap:wrap}
-  .task-actions{width:100%;justify-content:flex-end}
-  h1{font-size:17px}
-}
-</style>
+<script>
+  /* 在首帧前定好主题，避免闪白 */
+  try {
+    var saved = localStorage.getItem('cf-theme');
+    document.documentElement.dataset.theme = saved ||
+      (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+  } catch (e) { /* 隐私模式下忽略 */ }
+</script>
+<link rel="stylesheet" href="styles.css?v=2">
 </head>
 <body>
-<div class="wrap">
-  <header>
+
+<!-- ========== 图标 sprite ========== -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="i-cloud" viewBox="0 0 24 24"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6L6 18"/><path d="M6 6l12 12"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+  <symbol id="i-retry" viewBox="0 0 24 24"><path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></symbol>
+  <symbol id="i-terminal" viewBox="0 0 24 24"><path d="M4 17l6-6-6-6"/><path d="M12 19h8"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="M4.93 4.93l1.41 1.41"/><path d="M17.66 17.66l1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="M6.34 17.66l-1.41 1.41"/><path d="M19.07 4.93l-1.41 1.41"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></symbol>
+  <symbol id="i-disk" viewBox="0 0 24 24"><path d="M22 12H2"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><path d="M6 16h.01"/><path d="M10 16h.01"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></symbol>
+  <symbol id="i-radio" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2"/><path d="M4.93 19.07a10 10 0 0 1 0-14.14"/><path d="M7.76 16.24a6 6 0 0 1 0-8.48"/><path d="M16.24 7.76a6 6 0 0 1 0 8.48"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></symbol>
+  <symbol id="i-film" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="2.18"/><path d="M7 2v20"/><path d="M17 2v20"/><path d="M2 12h20"/><path d="M2 7h5"/><path d="M2 17h5"/><path d="M17 17h5"/><path d="M17 7h5"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-inbox" viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
+  <symbol id="i-chevron-left" viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></symbol>
+  <symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></symbol>
+  <symbol id="i-check-circle" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="M22 4L12 14.01l-3-3"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></symbol>
+</svg>
+
+<div class="shell">
+
+  <!-- ========== 顶栏 ========== -->
+  <header class="topbar">
     <div class="brand">
-      <div class="logo">☁️</div>
-      <div>
-        <h1>CloudFetch</h1>
-        <small>云端下载 · 自动上传 OpenList</small>
-      </div>
+      <span class="brand-mark"><svg class="ic" aria-hidden="true"><use href="#i-cloud"></use></svg></span>
+      <span class="brand-text">
+        <strong>CloudFetch</strong>
+        <small>云端下载 · 自动上云</small>
+      </span>
     </div>
-    <div class="status-chips">
-      <span class="chip" id="chipSse"><span class="dot"></span><span id="sseText">连接中</span></span>
-      <span class="chip" id="chipOpenlist"><span class="dot"></span><span id="olText">OpenList</span></span>
-      <span class="chip" id="chipDisk"><span class="dot"></span><span id="diskText">磁盘</span></span>
+
+    <div class="topbar-right">
+      <div class="status-group">
+        <span class="pill" id="chipSse" data-state="idle" title="实时推送连接状态">
+          <i class="dot"></i><span data-role="text">连接中</span>
+        </span>
+        <span class="pill" id="chipOpenlist" data-state="idle" title="OpenList 配置状态">
+          <i class="dot"></i><span data-role="text">OpenList</span>
+        </span>
+        <span class="pill" id="chipDisk" data-state="idle" title="临时目录磁盘空间">
+          <i class="dot"></i><span data-role="text">磁盘</span>
+        </span>
+      </div>
+      <button class="icon-btn" id="btnTheme" type="button" title="切换明暗主题" aria-label="切换明暗主题">
+        <svg class="ic" aria-hidden="true"><use href="#i-moon"></use></svg>
+      </button>
     </div>
   </header>
 
-  <!-- 标签切换 -->
-  <div class="tabs">
-    <button class="tab active" data-tab="active" id="tabActive">
-      进行中 <span class="cnt" id="cntActive">0</span>
-    </button>
-    <button class="tab" data-tab="history" id="tabHistory">
-      历史记录 <span class="cnt" id="cntHistory">0</span>
-    </button>
-  </div>
+  <!-- ========== 输入区 ========== -->
+  <section class="hero">
+    <div class="hero-copy">
+      <h1>把链接丢进来，剩下的交给云端</h1>
+      <p>支持 <b>HTTP 直链</b>、<b>HLS</b>、<b>FLV / RTMP 直播</b>；下完自动上传 OpenList 并清理本地，磁盘占用恒定在一两段文件。</p>
+    </div>
 
-  <!-- ===== 进行中面板 ===== -->
-  <div id="panelActive">
-    <!-- 新建任务 -->
-    <div class="card" id="newCard">
-      <h2>新建下载任务</h2>
-      <textarea id="urlInput" placeholder="粘贴下载链接，支持批量（每行一个）
-
-支持类型：
-  • HTTP 直链      https://example.com/video.mp4
-  • HLS 流         https://example.com/index.m3u8
-  • HTTP-FLV 直播   http://.../live/stream.flv
-  • RTMP 直播       rtmp://.../live/stream"></textarea>
-      <div class="row">
-        <button class="btn btn-primary" id="btnAdd">开始下载</button>
-        <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--muted);cursor:pointer">
-          <input type="checkbox" id="uploadToggle" checked style="width:15px;height:15px;cursor:pointer;accent-color:var(--accent)">
-          下载后上传 OpenList
-        </label>
-        <button class="btn btn-ghost btn-sm" id="btnClear" style="margin-left:auto">清空已结束</button>
+    <form class="composer" id="composer" autocomplete="off">
+      <div class="composer-head">
+        <label class="composer-label" for="urlInput">下载链接</label>
+        <span class="link-count" id="linkCount">0 个链接</span>
       </div>
-      <div class="hint">
-        直播流按<b>时间分段</b>录制（默认 10 分钟一段），每段独立上传 OpenList，<b>不合并</b>；上传成功后删除本地文件。
+
+      <textarea id="urlInput" spellcheck="false" placeholder="每行一个链接，例如：&#10;https://example.com/video.mp4&#10;https://example.com/live/index.m3u8"></textarea>
+
+      <div class="composer-foot">
+        <div class="type-chips" aria-label="支持的链接类型">
+          <span class="type-chip"><svg class="ic" aria-hidden="true"><use href="#i-file"></use></svg><b>直链</b></span>
+          <span class="type-chip"><svg class="ic" aria-hidden="true"><use href="#i-film"></use></svg><b>HLS</b></span>
+          <span class="type-chip"><svg class="ic" aria-hidden="true"><use href="#i-radio"></use></svg><b>FLV</b></span>
+          <span class="type-chip"><svg class="ic" aria-hidden="true"><use href="#i-radio"></use></svg><b>RTMP</b></span>
+        </div>
+
+        <div class="composer-actions">
+          <label class="switch" title="关闭后文件只留在服务器本地">
+            <input type="checkbox" id="uploadToggle" checked>
+            <span class="switch-track"><span class="switch-thumb"></span></span>
+            <span>上传 OpenList</span>
+          </label>
+          <button class="btn btn-primary" id="btnAdd" type="submit">
+            <svg class="ic" aria-hidden="true"><use href="#i-download"></use></svg>
+            开始下载
+          </button>
+        </div>
+      </div>
+
+      <p class="hint">
+        <span>直播流按<b>时间分段</b>录制，每段独立上传、<b>不合并</b>。</span>
+        <span class="nowrap">提交快捷键 <kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>Enter</kbd></span>
+      </p>
+    </form>
+  </section>
+
+  <!-- ========== 概览 ========== -->
+  <section class="stats" aria-label="运行概览">
+    <div class="stat">
+      <span class="stat-icon"><svg class="ic" aria-hidden="true"><use href="#i-activity"></use></svg></span>
+      <div class="stat-body">
+        <div class="stat-label">进行中</div>
+        <div class="stat-value" id="statRunning">0</div>
+        <div class="stat-sub" id="statRunningSub">并发上限 —</div>
       </div>
     </div>
 
-    <!-- 任务列表 -->
-    <div id="taskList"></div>
-  </div>
-
-  <!-- ===== 历史记录面板 ===== -->
-  <div id="panelHistory" style="display:none">
-    <div class="card">
-      <h2>历史记录 <span class="badge" style="background:rgba(59,130,246,.15);color:#93c5fd" id="histTotal">0 条</span></h2>
-      <div class="hist-toolbar">
-        <input type="text" id="histSearch" placeholder="搜索文件名 / 链接 / 远端路径…">
-        <select id="histStatus">
-          <option value="">全部状态</option>
-          <option value="done">已完成</option>
-          <option value="failed">失败</option>
-          <option value="canceled">已取消</option>
-        </select>
-        <button class="btn btn-ghost btn-sm" id="btnHistRefresh">刷新</button>
-        <button class="btn btn-danger btn-sm" id="btnHistClear">清空</button>
-      </div>
-      <div id="histList"></div>
-      <div class="pager" id="histPager" style="display:none">
-        <button id="histPrev">上一页</button>
-        <span id="histPageInfo">1 / 1</span>
-        <button id="histNext">下一页</button>
+    <div class="stat">
+      <span class="stat-icon"><svg class="ic" aria-hidden="true"><use href="#i-zap"></use></svg></span>
+      <div class="stat-body">
+        <div class="stat-label">当前总速度</div>
+        <div class="stat-value" id="statSpeed">—</div>
+        <div class="stat-sub" id="statSpeedSub">空闲</div>
       </div>
     </div>
+
+    <div class="stat">
+      <span class="stat-icon ok"><svg class="ic" aria-hidden="true"><use href="#i-check-circle"></use></svg></span>
+      <div class="stat-body">
+        <div class="stat-label">本次完成</div>
+        <div class="stat-value" id="statDone">0</div>
+        <div class="stat-sub" id="statDoneSub">单文件上限 —</div>
+      </div>
+    </div>
+
+    <div class="stat">
+      <span class="stat-icon warn"><svg class="ic" aria-hidden="true"><use href="#i-disk"></use></svg></span>
+      <div class="stat-body">
+        <div class="stat-label">磁盘可用</div>
+        <div class="stat-value" id="statDisk">—</div>
+        <div class="stat-sub" id="statDiskSub">临时目录</div>
+        <div class="disk-bar"><i id="diskBar"></i></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========== 标签页 ========== -->
+  <div class="tabs-row">
+    <div class="tabs" role="tablist" aria-label="视图切换">
+      <button class="tab" id="tabActive" role="tab" aria-selected="true" aria-controls="panelActive" type="button">
+        <svg class="ic" aria-hidden="true"><use href="#i-list"></use></svg>
+        进行中
+        <span class="tab-count" id="cntActive">0</span>
+      </button>
+      <button class="tab" id="tabHistory" role="tab" aria-selected="false" aria-controls="panelHistory" type="button">
+        <svg class="ic" aria-hidden="true"><use href="#i-layers"></use></svg>
+        历史记录
+        <span class="tab-count" id="cntHistory">0</span>
+      </button>
+    </div>
+    <button class="btn btn-ghost btn-xs" id="btnClear" type="button">
+      <svg class="ic" aria-hidden="true"><use href="#i-trash"></use></svg>
+      <span class="btn-label">清空已结束</span>
+    </button>
+  </div>
+
+  <!-- ========== 进行中 ========== -->
+  <section id="panelActive" role="tabpanel" aria-labelledby="tabActive">
+    <div class="task-list" id="taskList"></div>
+  </section>
+
+  <!-- ========== 历史记录 ========== -->
+  <section id="panelHistory" role="tabpanel" aria-labelledby="tabHistory" hidden>
+    <div class="toolbar">
+      <div class="search">
+        <svg class="ic" aria-hidden="true"><use href="#i-search"></use></svg>
+        <input type="text" id="histSearch" placeholder="搜索文件名 / 链接 / 远端路径…" aria-label="搜索历史记录">
+      </div>
+      <select class="select" id="histStatus" aria-label="按状态筛选">
+        <option value="">全部状态</option>
+        <option value="done">已完成</option>
+        <option value="failed">失败</option>
+        <option value="canceled">已取消</option>
+      </select>
+      <button class="icon-btn" id="btnHistRefresh" type="button" title="刷新" aria-label="刷新历史记录">
+        <svg class="ic" aria-hidden="true"><use href="#i-refresh"></use></svg>
+      </button>
+      <button class="btn btn-danger btn-xs" id="btnHistClear" type="button">
+        <svg class="ic" aria-hidden="true"><use href="#i-trash"></use></svg>
+        清空
+      </button>
+    </div>
+
+    <div id="histList"></div>
+
+    <div class="pager" id="histPager" hidden>
+      <button id="histPrev" type="button">
+        <svg class="ic ic-sm" aria-hidden="true"><use href="#i-chevron-left"></use></svg>
+        上一页
+      </button>
+      <span id="histPageInfo">1 / 1</span>
+      <button id="histNext" type="button">
+        下一页
+        <svg class="ic ic-sm" aria-hidden="true"><use href="#i-chevron-right"></use></svg>
+      </button>
+    </div>
+  </section>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<!-- ========== 登录 / 配置提示 ========== -->
+<div class="overlay" id="loginMask">
+  <div class="dialog" id="loginDialog">
+    <div class="dialog-icon"><svg class="ic" aria-hidden="true"><use href="#i-lock"></use></svg></div>
+    <h2>需要访问密码</h2>
+    <p>这个面板能把任意文件写进你的 OpenList，请先验证身份。</p>
+    <input type="password" id="pwdInput" placeholder="输入访问密码" autocomplete="current-password" aria-label="访问密码">
+    <button class="btn btn-primary btn-block" id="btnLogin" type="button">进入面板</button>
+    <p class="dialog-foot">密码来自环境变量 <code>PANEL_PASSWORD</code></p>
   </div>
 </div>
 
-<div class="toast" id="toast"></div>
-
-<div id="loginMask">
-  <div class="login-box">
-    <h3>🔒 需要登录</h3>
-    <p>请输入访问密码</p>
-    <input type="password" id="pwdInput" placeholder="密码">
-    <button class="btn btn-primary" id="btnLogin" style="width:100%">进入</button>
-  </div>
-</div>
-
-<script>
-const $ = (s) => document.querySelector(s);
-const state = { tasks: new Map(), es: null, authRequired: false };
-let toastTimer;
-
-function toast(msg, type = '') {
-  const el = $('#toast');
-  el.textContent = msg;
-  el.className = 'toast show ' + type;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (el.className = 'toast ' + type), 3200);
-}
-
-function fmtBytes(n) {
-  if (!n || n < 0) return '—';
-  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let i = 0;
-  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
-  return n.toFixed(i === 0 ? 0 : 2) + ' ' + u[i];
-}
-function fmtSpeed(bps) {
-  if (!bps || bps <= 0) return '—';
-  return fmtBytes(bps) + '/s';
-}
-function fmtEta(s) {
-  if (!s || s <= 0 || !isFinite(s)) return '—';
-  if (s < 60) return Math.round(s) + 's';
-  if (s < 3600) return Math.floor(s / 60) + 'm' + Math.round(s % 60) + 's';
-  return Math.floor(s / 3600) + 'h' + Math.round((s % 3600) / 60) + 'm';
-}
-function esc(s) {
-  return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
-
-const STATUS_LABEL = {
-  queued: '排队中', downloading: '下载中', uploading: '上传中',
-  done: '已完成', failed: '失败', canceled: '已取消',
-};
-const KIND_ICON = { http: '📄', hls: '🎬', rtmp: '📡', dash: '🎞', unknown: '❓' };
-
-function renderTask(t) {
-  const running = ['queued', 'downloading', 'uploading'].includes(t.status);
-  const cls = t.status === 'done' ? 'done' : t.status === 'failed' ? 'failed' : running ? 'running' : '';
-  const pct = t.percent || 0;
-  const indeterminate = t.status === 'downloading' && !t.total;
-
-  const sizeInfo = t.total
-    ? `${fmtBytes(t.downloaded)} / ${fmtBytes(t.total)}`
-    : t.downloaded ? fmtBytes(t.downloaded) : '—';
-
-  const phaseText = {
-    queued: '排队中', downloading: '下载中', uploading: '上传中',
-    done: '已完成', failed: '失败', canceled: '已取消',
-  }[t.status] || t.status;
-
-  let metaHtml = `<span>${esc(phaseText)}</span>`;
-  metaHtml += `<span>${sizeInfo}</span>`;
-  if (t.status === 'downloading' || t.status === 'uploading') {
-    metaHtml += `<span>速度 <b>${fmtSpeed(t.speed)}</b></span>`;
-    if (t.eta > 0) metaHtml += `<span>剩余 <b>${fmtEta(t.eta)}</b></span>`;
-  }
-  if (t.status === 'uploading' && t.uploaded) {
-    metaHtml += `<span>已上传 <b>${fmtBytes(t.uploaded)}</b></span>`;
-  }
-  // 直播分段信息
-  if (t.live) {
-    const done = t.segmentsDone || 0;
-    const up = t.segmentsUploaded || 0;
-    if (done > 0) {
-      metaHtml += `<span>已录 <b>${done}</b> 段${t.segmentSeconds ? `（每段 ${Math.round(t.segmentSeconds / 60)} 分钟）` : ''}</span>`;
-    }
-    if (t.upload && up > 0) metaHtml += `<span class="ok">☁ 已传 ${up} 段</span>`;
-    if (t.segmentCount && !running) metaHtml += `<span>共 <b>${t.segmentCount}</b> 段</span>`;
-  }
-  if (t.remotePath) metaHtml += `<span class="ok">☁ ${esc(t.remotePath)}</span>`;
-  if (t.error) metaHtml += `<span class="err">✕ ${esc(t.error)}</span>`;
-
-  const showLogs = t.logs && t.logs.length > 0;
-  const logsHtml = showLogs
-    ? `<div class="logs${running || t.status === 'failed' ? ' show' : ''}" id="logs-${t.id}">${t.logs.slice(-40).map((l) => `<div>${esc(l)}</div>`).join('')}</div>`
-    : '';
-
-  return `
-    <div class="task ${cls}" data-id="${t.id}">
-      <div class="task-head">
-        <div class="task-icon">${KIND_ICON[t.kind] || '❓'}</div>
-        <div class="task-main">
-          <div class="task-name" title="${esc(t.filename || t.url)}">${esc(t.filename || '解析中…')}</div>
-          <div class="task-url" title="${esc(t.url)}">${esc(t.url)}</div>
-        </div>
-        <div class="task-actions">
-          ${running ? `<button class="btn btn-danger btn-sm" data-act="cancel" data-id="${t.id}">取消</button>` : ''}
-          ${!running ? `<button class="btn btn-ghost btn-sm" data-act="remove" data-id="${t.id}">删除</button>` : ''}
-          <button class="btn btn-ghost btn-sm" data-act="toggleLogs" data-id="${t.id}">日志</button>
-        </div>
-      </div>
-      <div class="bar${indeterminate ? ' indeterminate' : ''}">
-        <div class="bar-fill" style="width:${indeterminate ? 38 : pct.toFixed(1)}%"></div>
-      </div>
-      <div class="meta">${metaHtml}</div>
-      ${logsHtml}
-    </div>`;
-}
-
-/**
- * 日志框滚动状态记录。
- *
- * 为什么需要：每次 upsertTask 都会 replaceWith 重建整张任务卡，
- * 新建的 .logs 元素 scrollTop 是 0，于是用户往下翻看日志后
- * 下一帧就被拽回顶部。
- *
- * 解法：重建前记下 scrollTop，重建后还原；
- * 并且只有「用户本来就贴在底部」时才自动跟随新日志。
- */
-const logScrollState = new Map(); // id -> { top, atBottom }
-
-function captureLogScroll() {
-  document.querySelectorAll('.logs').forEach((el) => {
-    const id = el.id.replace(/^logs-/, '');
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
-    logScrollState.set(id, { top: el.scrollTop, atBottom });
-  });
-}
-
-function restoreLogScroll() {
-  document.querySelectorAll('.logs').forEach((el) => {
-    const id = el.id.replace(/^logs-/, '');
-    const st = logScrollState.get(id);
-    if (!st) {
-      // 第一次出现：默认贴底
-      el.scrollTop = el.scrollHeight;
-      return;
-    }
-    if (st.atBottom) {
-      el.scrollTop = el.scrollHeight;   // 本来就在底部 → 继续跟随
-    } else {
-      el.scrollTop = st.top;            // 用户在上方看 → 保持原位
-    }
-  });
-}
-
-function renderAll() {
-  const list = [...state.tasks.values()].sort((a, b) => b.createdAt - a.createdAt);
-  const el = $('#taskList');
-  captureLogScroll();                    // 记下当前滚动位置
-  if (!list.length) {
-    el.innerHTML = `<div class="empty"><div class="big">☁️</div><p>还没有任务，在上面粘贴链接开始下载</p></div>`;
-    updateTabCounts();
-    return;
-  }
-  el.innerHTML = list.map(renderTask).join('');
-  restoreLogScroll();                    // 还原滚动位置
-  updateTabCounts();
-}
-
-function upsertTask(t) {
-  state.tasks.set(t.id, t);
-  const list = [...state.tasks.values()].sort((a, b) => b.createdAt - a.createdAt);
-  const el = $('#taskList');
-  const existing = el.querySelector(`[data-id="${t.id}"]`);
-
-  captureLogScroll();                    // 关键：重绘前记住每个日志框的位置
-
-  if (existing) {
-    const tmp = document.createElement('div');
-    tmp.innerHTML = renderTask(t);
-    existing.replaceWith(tmp.firstElementChild);
-  } else {
-    el.innerHTML = list.map(renderTask).join('');
-  }
-
-  restoreLogScroll();                    // 关键：重绘后还原
-  updateTabCounts();
-}
-
-/** 更新两个标签上的计数 */
-function updateTabCounts() {
-  const tasks = [...state.tasks.values()];
-  const running = tasks.filter((t) => ['queued', 'downloading', 'uploading'].includes(t.status));
-  const done = tasks.filter((t) => ['done', 'failed', 'canceled'].includes(t.status));
-  const a = $('#cntActive');
-  const h = $('#cntHistory');
-  if (a) a.textContent = running.length;
-  if (h) h.textContent = state.histTotal || done.length;
-}
-
-function connectSSE() {
-  if (state.es) state.es.close();
-  const es = new EventSource('/api/events');
-  state.es = es;
-
-  es.addEventListener('open', () => {
-    $('#chipSse').className = 'chip on';
-    $('#sseText').textContent = '已连接';
-  });
-
-  es.addEventListener('snapshot', (e) => {
-    const d = JSON.parse(e.data);
-    state.tasks.clear();
-    for (const t of d.tasks) state.tasks.set(t.id, t);
-    renderAll();
-  });
-
-  es.addEventListener('task', (e) => {
-    const t = JSON.parse(e.data);
-    const wasRunning = ['queued', 'downloading', 'uploading'].includes(t.status);
-    upsertTask(t);
-    // 任务刚结束 → 刷新历史计数（历史面板打开时顺带刷新列表）
-    if (!wasRunning && t.finishedAt) {
-      if ($('#panelHistory')?.style.display !== 'none') loadHistory();
-      else updateTabCounts();
-    }
-  });
-
-  es.addEventListener('removed', (e) => {
-    const d = JSON.parse(e.data);
-    state.tasks.delete(d.id);
-    const el = document.querySelector(`[data-id="${d.id}"]`);
-    if (el) el.remove();
-    if (!state.tasks.size) renderAll();
-  });
-
-  es.addEventListener('log', (e) => {
-    // 日志随 task 事件整体更新，这里只兜底
-  });
-
-  es.onerror = () => {
-    $('#chipSse').className = 'chip off';
-    $('#sseText').textContent = '重连中';
-    // EventSource 自带重连；若被鉴权拒绝则提示登录
-    if (es.readyState === EventSource.CLOSED) {
-      setTimeout(connectSSE, 3000);
-    }
-  };
-}
-
-async function addTasks() {
-  const text = $('#urlInput').value.trim();
-  if (!text) return toast('请先粘贴链接', 'err');
-  const upload = $('#uploadToggle').checked;
-  const btn = $('#btnAdd');
-  btn.disabled = true;
-  btn.textContent = '提交中…';
-  try {
-    const res = await fetch('/api/tasks', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, upload }),
-    });
-    if (res.status === 401) { showLogin(); return; }
-    const j = await res.json();
-    if (!res.ok) throw new Error(j.error || '创建失败');
-    $('#urlInput').value = '';
-    const n = j.created.length;
-    let msg = `已添加 ${n} 个任务`;
-    if (j.errors?.length) msg += `，${j.errors.length} 个失败`;
-    toast(msg, 'ok');
-    for (const t of j.created) upsertTask(t);
-  } catch (e) {
-    toast(e.message, 'err');
-  } finally {
-    btn.disabled = false;
-    btn.textContent = '开始下载';
-  }
-}
-
-async function act(kind, id) {
-  try {
-    if (kind === 'cancel') {
-      const r = await fetch(`/api/tasks/${id}/cancel`, { method: 'POST' });
-      if (!r.ok) throw new Error((await r.json()).error);
-      toast('已取消');
-    } else if (kind === 'remove') {
-      const r = await fetch(`/api/tasks/${id}`, { method: 'DELETE' });
-      if (!r.ok) throw new Error((await r.json()).error);
-      state.tasks.delete(id);
-      document.querySelector(`[data-id="${id}"]`)?.remove();
-      if (!state.tasks.size) renderAll();
-    }
-  } catch (e) {
-    toast(e.message, 'err');
-  }
-}
-
-async function refreshChips() {
-  try {
-    const h = await (await fetch('/api/health')).json();
-    state.authRequired = h.authRequired;
-    const ol = $('#chipOpenlist');
-    if (h.openlist) { ol.className = 'chip on'; $('#olText').textContent = 'OpenList 已配置'; }
-    else { ol.className = 'chip warn'; $('#olText').textContent = 'OpenList 未配置'; }
-
-    const d = await (await fetch('/api/disk')).json();
-    const c = $('#chipDisk');
-    if (d.total > 0) {
-      const pct = ((d.total - d.free) / d.total) * 100;
-      c.className = 'chip ' + (pct > 90 ? 'off' : 'on');
-      $('#diskText').textContent = `磁盘 ${d.freeText} 可用`;
-    }
-  } catch { /* ignore */ }
-}
-
-function showLogin() { $('#loginMask').classList.add('show'); $('#pwdInput').focus(); }
-
-async function doLogin() {
-  const password = $('#pwdInput').value;
-  const r = await fetch('/api/login', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ password }),
-  });
-  if (r.ok) {
-    $('#loginMask').classList.remove('show');
-    $('#pwdInput').value = '';
-    connectSSE();
-    toast('登录成功', 'ok');
-  } else {
-    toast('密码错误', 'err');
-  }
-}
-
-// ===== 历史记录 =====
-const hist = { page: 1, pageSize: 20, q: '', status: '', total: 0, pages: 1 };
-
-function fmtTime(ms) {
-  if (!ms) return '—';
-  const d = new Date(ms);
-  const p = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-}
-function fmtDuration(sec) {
-  if (!sec || sec <= 0) return '—';
-  if (sec < 60) return sec + ' 秒';
-  const m = Math.floor(sec / 60);
-  if (m < 60) return m + ' 分' + (sec % 60 ? (sec % 60) + ' 秒' : '');
-  return Math.floor(m / 60) + ' 时' + (m % 60) + ' 分';
-}
-
-function renderHistItem(h) {
-  const icon = h.live ? '📡' : (KIND_ICON[h.kind] || '📄');
-  const badge = {
-    done: '<span class="badge done">✓ 完成</span>',
-    failed: '<span class="badge failed">✕ 失败</span>',
-    canceled: '<span class="badge canceled">⊘ 取消</span>',
-  }[h.status] || '';
-
-  let meta = `<span>${fmtTime(h.createdAt)}</span>`;
-  if (h.size) meta += `<span>大小 <b>${fmtBytes(h.size)}</b></span>`;
-  if (h.duration) meta += `<span>耗时 <b>${fmtDuration(h.duration)}</b></span>`;
-  if (h.live) meta += `<span>分段 <b>${h.segmentCount || 0}</b> 段</span>`;
-  if (h.segmentsUploaded) meta += `<span class="ok">☁ 已传 ${h.segmentsUploaded}</span>`;
-  if (h.remotePath) meta += `<span class="ok" title="${esc(h.remotePath)}">☁ ${esc(h.remotePath)}</span>`;
-  if (h.error) meta += `<span class="err">✕ ${esc(h.error)}</span>`;
-
-  return `
-    <div class="hist-item" data-hid="${h.id}">
-      <div class="hist-row">
-        <div class="hist-ico">${icon}</div>
-        <div class="hist-body">
-          <div class="hist-title" title="${esc(h.filename || h.url)}">
-            ${esc(h.filename || '(未命名)')} ${badge}
-          </div>
-          <div class="hist-sub" title="${esc(h.url)}">${esc(h.url)}</div>
-          <div class="hist-meta">${meta}</div>
-        </div>
-        <div class="hist-acts">
-          <button class="btn btn-ghost btn-sm" data-hact="copy" data-hid="${h.id}">复制链接</button>
-          <button class="btn btn-ghost btn-sm" data-hact="retry" data-hid="${h.id}">重下</button>
-          <button class="btn btn-danger btn-sm" data-hact="del" data-hid="${h.id}">删除</button>
-        </div>
-      </div>
-    </div>`;
-}
-
-async function loadHistory() {
-  const el = $('#histList');
-  if (!el) return;
-  el.innerHTML = '<div class="empty"><p>加载中…</p></div>';
-  try {
-    const qs = new URLSearchParams({
-      page: hist.page, pageSize: hist.pageSize, q: hist.q, status: hist.status,
-    });
-    const r = await fetch(`/api/history?${qs}`);
-    if (r.status === 401) { showLogin(); return; }
-    if (!r.ok) throw new Error((await r.json()).error || '加载失败');
-    const d = await r.json();
-
-    hist.total = d.total;
-    hist.pages = d.pages;
-    state.histTotal = d.total;
-
-    const t = $('#histTotal');
-    if (t) t.textContent = `${d.total} 条`;
-
-    if (!d.items.length) {
-      el.innerHTML = `<div class="empty"><div class="big">🗂️</div><p>${hist.q || hist.status ? '没有匹配的记录' : '还没有历史记录'}</p></div>`;
-    } else {
-      el.innerHTML = d.items.map(renderHistItem).join('');
-    }
-
-    const pager = $('#histPager');
-    if (pager) {
-      pager.style.display = d.pages > 1 ? 'flex' : 'none';
-      $('#histPageInfo').textContent = `${d.page} / ${d.pages}`;
-      $('#histPrev').disabled = d.page <= 1;
-      $('#histNext').disabled = d.page >= d.pages;
-    }
-    updateTabCounts();
-  } catch (e) {
-    el.innerHTML = `<div class="empty"><p>加载失败：${esc(e.message)}</p></div>`;
-  }
-}
-
-function switchTab(name) {
-  const isHist = name === 'history';
-  $('#panelActive').style.display = isHist ? 'none' : '';
-  $('#panelHistory').style.display = isHist ? '' : 'none';
-  $('#tabActive').classList.toggle('active', !isHist);
-  $('#tabHistory').classList.toggle('active', isHist);
-  if (isHist) loadHistory();
-}
-
-// 事件绑定
-$('#btnAdd').addEventListener('click', addTasks);
-$('#urlInput').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) addTasks();
-});
-$('#btnClear').addEventListener('click', async () => {
-  const r = await fetch('/api/tasks/clear', { method: 'POST' });
-  const j = await r.json();
-  for (const [id, t] of state.tasks) {
-    if (['done', 'failed', 'canceled'].includes(t.status)) state.tasks.delete(id);
-  }
-  renderAll();
-  toast(`已清空 ${j.removed} 条`);
-});
-$('#btnLogin').addEventListener('click', doLogin);
-$('#pwdInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
-
-// 标签切换
-$('#tabActive').addEventListener('click', () => switchTab('active'));
-$('#tabHistory').addEventListener('click', () => switchTab('history'));
-
-// 历史：搜索（防抖）、筛选、翻页、刷新、清空
-let histTimer;
-$('#histSearch').addEventListener('input', (e) => {
-  clearTimeout(histTimer);
-  histTimer = setTimeout(() => {
-    hist.q = e.target.value.trim();
-    hist.page = 1;
-    loadHistory();
-  }, 320);
-});
-$('#histStatus').addEventListener('change', (e) => {
-  hist.status = e.target.value;
-  hist.page = 1;
-  loadHistory();
-});
-$('#histPrev').addEventListener('click', () => {
-  if (hist.page > 1) { hist.page--; loadHistory(); }
-});
-$('#histNext').addEventListener('click', () => {
-  if (hist.page < hist.pages) { hist.page++; loadHistory(); }
-});
-$('#btnHistRefresh').addEventListener('click', loadHistory);
-$('#btnHistClear').addEventListener('click', async () => {
-  if (!confirm('确定清空全部历史记录？此操作不可恢复。')) return;
-  const r = await fetch('/api/history', { method: 'DELETE' });
-  const j = await r.json();
-  toast(`已清空 ${j.removed} 条历史`);
-  hist.page = 1;
-  loadHistory();
-});
-
-// 历史条目操作
-document.addEventListener('click', async (e) => {
-  const btn = e.target.closest('[data-hact]');
-  if (!btn) return;
-  const { hact, hid } = btn.dataset;
-  const item = document.querySelector(`[data-hid="${hid}"]`);
-  const url = item?.querySelector('.hist-sub')?.textContent?.trim() || '';
-
-  if (hact === 'copy') {
-    try {
-      await navigator.clipboard.writeText(url);
-      toast('链接已复制', 'ok');
-    } catch {
-      toast('复制失败，请手动选择', 'err');
-    }
-  } else if (hact === 'retry') {
-    try {
-      const r = await fetch('/api/tasks', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, upload: true }),
-      });
-      const j = await r.json();
-      if (!r.ok) throw new Error(j.error);
-      for (const t of j.created) upsertTask(t);
-      toast('已重新加入下载队列', 'ok');
-      switchTab('active');
-    } catch (err) {
-      toast(err.message, 'err');
-    }
-  } else if (hact === 'del') {
-    const r = await fetch(`/api/history/${hid}`, { method: 'DELETE' });
-    if (r.ok) {
-      toast('已删除');
-      loadHistory();
-    } else {
-      toast('删除失败', 'err');
-    }
-  }
-});
-
-document.addEventListener('click', (e) => {
-  const btn = e.target.closest('[data-act]');
-  if (!btn) return;
-  const { act: kind, id } = btn.dataset;
-  if (kind === 'toggleLogs') {
-    const el = document.getElementById(`logs-${id}`);
-    if (!el) return;
-    el.classList.toggle('show');
-    // 展开时滚到底部看最新日志，并同步记录状态
-    if (el.classList.contains('show')) {
-      el.scrollTop = el.scrollHeight;
-      logScrollState.set(id, { top: el.scrollTop, atBottom: true });
-    }
-    return;
-  }
-  act(kind, id);
-});
-
-// 启动
-(async function init() {
-  await refreshChips();
-
-  // 先查健康状态：未配置密码时直接提示去配置，不给登录框
-  try {
-    const h = await (await fetch('/api/health')).json();
-    if (h.passwordConfigured === false) { showConfigMissing(); return; }
-  } catch { /* 忽略，继续常规流程 */ }
-
-  const r = await fetch('/api/tasks');
-  if (r.status === 401) { showLogin(); return; }
-  if (r.status === 503) { showConfigMissing(); return; }
-  connectSSE();
-  setInterval(refreshChips, 30000);
-})();
-
-function showConfigMissing() {
-  const mask = $('#loginMask');
-  mask.classList.add('show');
-  mask.innerHTML = `
-    <div class="login-box" style="border-color:rgba(245,158,11,.45);text-align:left">
-      <h3 style="text-align:center">⚠️ 未配置访问密码</h3>
-      <p style="line-height:1.9;margin-top:14px">
-        为安全起见，本服务必须设置 <code style="background:#1a2130;padding:2px 6px;border-radius:4px;font-size:11.5px">PANEL_PASSWORD</code> 才能使用。
-      </p>
-      <p style="line-height:1.9;margin-top:10px">
-        请前往 <b>GitHub 仓库 → Settings → Secrets and variables → Actions</b>，
-        添加 Secret <code style="background:#1a2130;padding:2px 6px;border-radius:4px;font-size:11.5px">PANEL_PASSWORD</code>，
-        然后重新运行 <b>Deploy to Cloady</b> 工作流。
-      </p>
-      <p style="font-size:12px;color:#8b97ad;margin-top:16px;text-align:center">
-        配置生效后刷新本页即可。
-      </p>
-    </div>`;
-}
-</script>
+<script src="app.js?v=2"></script>
 </body>
 </html>
