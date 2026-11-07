@@ -65,4 +65,7 @@ EXPOSE 8080
 
 # 不切 USER：Unikraft 实例以 root 运行，
 # 且持久卷挂载后属主可能不是 node，切用户会写不进去。
-CMD ["node", "src/server.js"]
+#
+# 必须用绝对路径：实测 Unikraft 不遵守 WORKDIR，
+# 写 ["node", "src/server.js"] 会被解析成 /src/server.js 然后 MODULE_NOT_FOUND。
+CMD ["node", "/app/src/server.js"]
