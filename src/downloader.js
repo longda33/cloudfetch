@@ -208,10 +208,14 @@ async function downloadSingleStream(url, dest, job, ctx, expectedTotal) {
 
       resetIdle();
       let written = startAt;
+      let stopped = false;
 
       try {
         for await (const chunk of res.body) {
-          if (signal?.aborted) throw new FatalError('已取消');
+          if (signal?.aborted) {
+            stopped = true;
+            break;
+          }
           resetIdle();
           if (!ws.write(chunk)) {
             await new Promise((r) => ws.once('drain', r));
@@ -223,9 +227,33 @@ async function downloadSingleStream(url, dest, job, ctx, expectedTotal) {
             throw new FatalError('超过文件大小上限');
           }
         }
+      } catch (e) {
+        /**
+         * 关键：abort 时 for-await 会直接抛 AbortError，根本走不到上面的 break。
+         *
+         * onAbort 监听器调用的是本函数内部的 ac.abort()，而 res.body 用的就是
+         * 这个 ac，所以信号一触发，流本身就报错了。之前没接这个异常，
+         * 于是「停止」被当成失败，已下载的部分被整个丢掉。
+         * 这里把「因为用户停止而抛的错」转成正常收尾。
+         */
+        if (signal?.aborted) {
+          stopped = true;
+        } else {
+          throw e;
+        }
       } finally {
         clearTimeout(idleTimer);
         await new Promise((r) => ws.end(r));
+      }
+
+      // 用户主动停止：把已下载的部分当作完成，不做长度校验
+      if (stopped) {
+        if (written > 0) {
+          await fsp.rename(partPath, dest);
+          onLog?.(`已停止，保留已下载的 ${humanSize(written)}`);
+          return;
+        }
+        throw new FatalError('已取消');
       }
 
       // 校验
@@ -520,23 +548,49 @@ async function downloadHls(job, ctx) {
 
   await Promise.all(Array.from({ length: Math.min(conc, segs.length) }, worker));
   if (failed) throw failed;
-  if (signal?.aborted) throw new FatalError('已取消');
 
-  onLog?.('拼接分片...');
+  /**
+   * 用户主动停止：把已下载的分片按顺序拼起来，能拼多少算多少。
+   *
+   * 之前这里直接 throw FatalError('已取消')，已下载的分片全被丢掉。
+   * 现在改成尽量拼接——缺的分片位置留空（后面校验会按实际大小处理），
+   * 至少让用户拿到已经下到的那部分内容。
+   */
+  const stopped = Boolean(signal?.aborted);
+
+  onLog?.(stopped ? '已停止，拼接已下载的分片...' : '拼接分片...');
   const tmpOut = dest + '.concat';
   const ws = fs.createWriteStream(tmpOut);
+  let concatBytes = 0;
   try {
     for (let i = 0; i < segs.length; i++) {
       const p = path.join(partDir, String(i).padStart(6, '0') + '.ts');
-      await new Promise((resolve, reject) => {
+      // 停止时跳过还没下完的分片，不要在这里抛错
+      const exists = await fsp
+        .stat(p)
+        .then((s) => s.size > 0)
+        .catch(() => false);
+      if (!exists) {
+        if (stopped) continue;
+        throw new FatalError(`分片 ${i + 1} 缺失`);
+      }
+      const sz = await new Promise((resolve, reject) => {
         const rs = fs.createReadStream(p);
         rs.on('error', reject);
         rs.on('end', resolve);
         rs.pipe(ws, { end: false });
       });
+      const st = await fsp.stat(p);
+      concatBytes += st.size;
     }
   } finally {
     await new Promise((r) => ws.end(r));
+  }
+
+  if (stopped && concatBytes === 0) {
+    await fsp.rm(tmpOut, { force: true });
+    await fsp.rm(partDir, { recursive: true, force: true });
+    throw new FatalError('已取消');
   }
 
   await fsp.rename(tmpOut, dest);

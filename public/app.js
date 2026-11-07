@@ -166,17 +166,38 @@ function metricsHtml(t) {
       const per = t.segmentSeconds ? ` · 每段 ${Math.round(t.segmentSeconds / 60)} 分钟` : '';
       push('已录', `${t.segmentsDone} 段${per}`);
     }
+    // 直播录制中也可能已经有段传完了，这里也显示已传
+    if (t.live && t.segmentsUploaded) {
+      push('已传', `${t.segmentsUploaded} 段`, 'ok');
+    }
   }
 
   if (t.status === 'uploading') {
     push('已上传', t.total ? `${fmtBytes(t.uploaded)} / ${fmtBytes(t.total)}` : fmtBytes(t.uploaded));
-    if (t.live && t.segmentsUploaded) push('已传', `${t.segmentsUploaded} 段`, 'ok');
   }
 
   if (t.status === 'done') {
     if (t.total || t.downloaded) push('大小', fmtBytes(t.total || t.downloaded));
-    if (t.live) push('分段', `${t.segmentCount || 0} 段`);
-    if (t.upload && t.segmentsUploaded) push('已传', `${t.segmentsUploaded} 段`, 'ok');
+  }
+
+  /**
+   * 直播的分段统计统一在这里输出，避免上面几处重复。
+   * 口径固定为「分段 N 段，已传 M 段」——历史记录页面用同一套，
+   * 两边数字不会再对不上。
+   */
+  if (t.live && (t.segmentCount || t.segmentsDone)) {
+    const total = t.segmentCount || t.segmentsDone || 0;
+    const up = t.segmentsUploaded || 0;
+    const bad = (t.failedSegments || []).length;
+    if (t.status === 'done') {
+      let s = `分段 ${total} 段`;
+      if (total) s += `，已传 ${up} 段`;
+      if (bad) s += `，${bad} 段失败`;
+      push('录制', s);
+    } else if (t.status === 'uploading' || t.status === 'downloading') {
+      // 进行中已在上面显示过「已传」，这里只补总数
+      push('分段', `${total} 段`);
+    }
   }
 
   if (t.remotePath) {
@@ -579,19 +600,42 @@ function renderHistItem(h) {
   const meta = [`<span>${fmtTime(h.createdAt)}</span>`];
   if (h.size) meta.push(`<span>大小 <b>${fmtBytes(h.size)}</b></span>`);
   if (h.duration) meta.push(`<span>耗时 <b>${fmtDuration(h.duration)}</b></span>`);
-  if (h.live && h.segment !== false) meta.push(`<span>分段 <b>${h.segmentCount || 0}</b> 段</span>`);
-  if (h.segmentsUploaded) meta.push(`<span class="ok">已传 ${h.segmentsUploaded} 段</span>`);
+  if (h.live && h.segment !== false) {
+    const total = h.segmentCount || 0;
+    const up = h.segmentsUploaded || 0;
+    const bad = (h.failedSegments || []).length;
+    // 分段统计一律显示「已传/总数」，和进行中页面口径一致
+    let seg = `<span>分段 <b>${total}</b> 段`;
+    if (total) {
+      seg += `，已传 <b class="${up === total ? 'ok' : ''}">${up}</b> 段`;
+      if (bad) seg += `，<b class="err">${bad}</b> 段失败`;
+    }
+    seg += '</span>';
+    meta.push(seg);
+  }
   if (h.remotePath) meta.push(`<span class="ok" title="${esc(h.remotePath)}">${icon('cloud', 'ic ic-xs')} ${esc(h.remotePath)}</span>`);
   if (h.error) meta.push(`<span class="err" title="${esc(h.error)}">${esc(h.error)}</span>`);
 
-  // 有远端路径才显示「打开文件夹」
-  const folderBtn = h.remotePath
+  // 目录：优先用后端算好的 remoteDir，其次从 remotePath / 首段路径推
+  const dir =
+    h.remoteDir ||
+    folderOf(h.remotePath) ||
+    folderOf((h.segments || []).find((s) => s.remotePath)?.remotePath || '');
+
+  const folderBtn = dir
     ? `<button class="btn btn-ghost btn-xs" data-hact="folder" data-hid="${h.id}"
-         title="在 OpenList 打开 ${esc(folderOf(h.remotePath))}">${icon('inbox', 'ic ic-xs')}文件夹</button>`
+         data-dir="${esc(dir)}"
+         title="在 OpenList 打开 ${esc(dir)}">${icon('inbox', 'ic ic-xs')}文件夹</button>`
+    : '';
+
+  // 有失败分段才显示「重传」
+  const retryUpBtn = (h.failedSegments || []).length
+    ? `<button class="btn btn-warn btn-xs" data-hact="retryup" data-hid="${h.id}"
+         title="${(h.failedSegments || []).length} 段上传失败，点击重试">${icon('refresh', 'ic ic-xs')}重传 ${(h.failedSegments || []).length}</button>`
     : '';
 
   return `
-  <div class="hist-item" data-hid="${h.id}" data-url="${esc(h.url)}" data-rpath="${esc(h.remotePath || '')}" data-segment="${h.segment === false ? '0' : '1'}">
+  <div class="hist-item" data-hid="${h.id}" data-url="${esc(h.url)}" data-rpath="${esc(h.remotePath || '')}" data-dir="${esc(dir)}" data-segment="${h.segment === false ? '0' : '1'}">
     <span class="hist-icon">${icon(km.icon)}</span>
     <div class="hist-body">
       <div class="hist-title">
@@ -602,7 +646,7 @@ function renderHistItem(h) {
       <div class="hist-meta">${meta.join('')}</div>
     </div>
     <div class="hist-acts">
-      ${folderBtn}
+      ${folderBtn}${retryUpBtn}
       <button class="btn btn-ghost btn-xs" data-hact="copy" data-hid="${h.id}">复制</button>
       <button class="btn btn-ghost btn-xs" data-hact="retry" data-hid="${h.id}">重下</button>
       <button class="btn btn-danger btn-xs" data-hact="del" data-hid="${h.id}">删除</button>
@@ -659,11 +703,24 @@ async function loadHistory() {
 
 function switchTab(name) {
   const isHist = name === 'history';
+
+  /**
+   * 切 tab 时保持滚动位置。
+   *
+   * 之前的问题：切换后整个页面跳到顶部。
+   * 原因是面板一隐一显导致文档高度突变，浏览器把 scrollY 钳到了 0。
+   * 这里在切换前记下位置，切换后立刻还原（用 instant 避免滚动动画）。
+   */
+  const keepY = window.scrollY;
+
   $('#panelActive').hidden = isHist;
   $('#panelHistory').hidden = !isHist;
   $('#tabActive').setAttribute('aria-selected', String(!isHist));
   $('#tabHistory').setAttribute('aria-selected', String(isHist));
   document.body.dataset.view = isHist ? 'history' : 'active';
+
+  window.scrollTo({ top: keepY, behavior: 'instant' });
+
   if (isHist) loadHistory();
 }
 
@@ -762,12 +819,30 @@ document.addEventListener('click', async (e) => {
       toast('复制失败，请手动选择', 'err');
     }
   } else if (hact === 'folder') {
-    // 打开 OpenList 里该文件所在的文件夹
-    const rpath = item?.dataset.rpath || '';
-    if (!rpath) return toast('这条记录没有远端路径', 'err');
-    const link = openlistFolderUrl(folderOf(rpath));
+    // 打开 OpenList 里该任务的上传文件夹
+    const dir =
+      item?.dataset.dir ||
+      (item?.dataset.rpath ? folderOf(item.dataset.rpath) : '');
+    if (!dir) return toast('这条记录没有远端目录（可能没上传）', 'err');
+    const link = openlistFolderUrl(dir);
     if (!link) return toast('未配置 OpenList 地址', 'err');
     window.open(link, '_blank', 'noopener');
+  } else if (hact === 'retryup') {
+    // 重试上传失败的分段
+    const hid = item?.dataset.hid;
+    if (!hid) return;
+    item.disabled = true;
+    try {
+      const r = await fetch(`/api/tasks/${hid}/retry-upload`, { method: 'POST' });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error);
+      toast(`重传完成：成功 ${j.ok} 段${j.failed ? `，仍失败 ${j.failed} 段` : ''}`, j.failed ? 'warn' : 'ok');
+      loadHistory();
+    } catch (e) {
+      toast(e.message, 'err');
+    } finally {
+      item.disabled = false;
+    }
   } else if (hact === 'retry') {
     try {
       // 沿用原任务的模式重下

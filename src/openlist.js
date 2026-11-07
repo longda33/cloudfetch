@@ -531,16 +531,39 @@ export function resetOpenList() {
   _client = null;
 }
 
-/** 生成远端目标路径：<uploadDir>/<日期>/<文件名> */
-export function buildRemotePath(filename) {
+/**
+ * 生成远端目标路径。
+ *
+ * 目录结构：<uploadDir>/<日期>/<任务名>_<短id>/<文件名>
+ *
+ * 为什么每个任务单独一个子目录：
+ *   之前所有任务的文件都堆在同一个日期目录里，直播分段
+ *   又是 0001_xxx.flv 这种名字，两个任务同时录就混在一起了，
+ *   分不清哪个文件属于哪一次录制。加一层任务目录彻底隔开。
+ *
+ * @param {string} filename 文件名
+ * @param {{ taskId?: string, baseName?: string }} [opts]
+ *        taskId  任务 id，取前 8 位做短标识
+ *        baseName 任务基础名（如 live_20261107120000），拼在短 id 前面便于人眼识别
+ */
+export function buildRemotePath(filename, opts = {}) {
   const o = config.openlist;
   let dir = o.uploadDir || '/cloudfetch';
   if (!dir.startsWith('/')) dir = '/' + dir;
   dir = dir.replace(/\/+$/, '');
+
   if (o.dateSubdir) {
     const d = new Date();
     const ymd = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
     dir += '/' + ymd;
   }
+
+  // 任务子目录：baseName_短id，例如 live_20261107120000_4ad6500c
+  const taskId = (opts.taskId || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 8);
+  if (taskId) {
+    const base = (opts.baseName || '').replace(/[\\/:*?"<>|]/g, '').slice(0, 60);
+    dir += '/' + (base ? `${base}_${taskId}` : taskId);
+  }
+
   return path.posix.join(dir, filename);
 }

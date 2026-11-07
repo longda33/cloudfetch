@@ -191,6 +191,16 @@ app.post('/api/tasks/:id/cancel', (req, res) => {
   res.json({ ok: true });
 });
 
+/** 重试上传失败的分段 */
+app.post('/api/tasks/:id/retry-upload', async (req, res) => {
+  try {
+    const r = await mgr.retryFailedSegments(req.params.id);
+    res.json({ ok: true, ...r });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
 /** 删除记录 */
 app.delete('/api/tasks/:id', (req, res) => {
   const ok = mgr.remove(req.params.id);
