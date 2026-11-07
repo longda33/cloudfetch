@@ -881,7 +881,7 @@ async function downloadLive(job, ctx) {
 
   const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
   const baseName = (ctx.filename || `live_${ts}`).replace(/\.[a-z0-9]+$/i, '');
-  job.filename = `${baseName}_%03d.flv`;
+  job.filename = `%04d_${baseName}.flv`;
   job.live = true;
   job.segmentSeconds = segSec;
   job.segments = [];
@@ -914,7 +914,8 @@ async function downloadLive(job, ctx) {
      * 但 segOffset 已经加了，于是同一个文件被当成新段重复上传。
      */
     const nextIdx = segOffset + 1;
-    const name = `${baseName}_${String(nextIdx).padStart(3, '0')}.flv`;
+    // 序号放前面：0001_20261107_120000.flv，这样在文件管理器/网盘里按名称排序就是播放顺序
+    const name = `${String(nextIdx).padStart(4, '0')}_${baseName}.flv`;
     const finalPath = path.join(ctx.dir, name);
 
     // 源文件已在目标位置 → 不要 rename，也不重复计数
@@ -1014,7 +1015,7 @@ async function downloadLive(job, ctx) {
     try {
       // 采样当前正在写的段，用于实时进度
       sampler = setInterval(() => {
-        const cur = path.join(ctx.dir, `${baseName}_${String(segOffset + 1).padStart(3, '0')}.flv`);
+        const cur = path.join(ctx.dir, `${String(segOffset + 1).padStart(4, '0')}_${baseName}.flv`);
         fs.stat(cur, (err, st) => {
           if (!err && st.size > 0) {
             job.downloaded = totalBytes + st.size;
@@ -1083,7 +1084,7 @@ async function downloadLive(job, ctx) {
   return {
     // 直播是多文件，这里返回最后一段作为占位，真正的多文件列表在 job.segments
     filePath: job.segments.length ? job.segments[job.segments.length - 1].path : '',
-    filename: `${baseName}_*.flv`,
+    filename: `*_${baseName}.flv`,
     size: totalBytes,
     segments: job.segments.slice(),
     multiFile: true,
@@ -1100,7 +1101,9 @@ function runFfmpegSegments(opts) {
   const { url, dir, baseName, startNumber, segmentSeconds, signal, onLog, onSegmentFile } = opts;
 
   return new Promise((resolve, reject) => {
-    const outPattern = path.join(dir, `${baseName}_%03d.flv`);
+    // 序号在前，与 handleSegment 的最终命名保持一致，
+    // 这样大多数情况下 ffmpeg 直接写对名字，不需要 rename
+    const outPattern = path.join(dir, `%04d_${baseName}.flv`);
     // segment_list 每个连接独立一份，避免重连时互相覆盖
     const listPath = path.join(dir, `.segments-${startNumber}.csv`);
 
@@ -1243,7 +1246,7 @@ function runFfmpegSegments(opts) {
       try {
         const files = await fsp.readdir(dir);
         const mine = files
-          .filter((f) => f.startsWith(`${baseName}_`) && f.endsWith('.flv'))
+          .filter((f) => f.endsWith(`_${baseName}.flv`) && /^\d{4}_/.test(f))
           .sort();
         for (const f of mine) {
           if (seen.has(f)) continue;
