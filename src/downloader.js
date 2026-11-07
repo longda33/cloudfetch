@@ -867,17 +867,13 @@ async function downloadLive(job, ctx) {
   const segSec = Math.max(10, config.download.liveSegmentSeconds || 300);
 
   /**
-   * 单段体积上限。
+   * 分段时长固定为用户设定值，不做体积自适应。
    *
-   * 为什么要限制：OpenList 走 Cloudflare，上传请求体超过约 140MB 会被
-   * Cloudflare 直接挡掉，返回 413 Payload Too Large（HTML 错误页），
-   * 请求根本没到 OpenList。实测 130MB 可传、202MB 必失败。
-   *
-   * 10 分钟 × 2.7MB/s ≈ 200MB，必然踩线。所以按码率动态缩短分段时长，
-   * 保证单段体积落在安全区（留 20% 余量）。
+   * 曾经为了绕开 Cloudflare 的单请求 130MB 上限而按码率缩短段长，
+   * 但上传现在已改走分片协议（10MB 一片），体积不再是约束。
+   * 自适应反而会把 10 分钟段误缩成几十秒，所以去掉。
    */
-  const SEG_MAX_BYTES = 120 * 1024 * 1024; // 120MB，安全上限
-  let effectiveSec = segSec;
+  const effectiveSec = segSec;
 
   const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
   const baseName = (ctx.filename || `live_${ts}`).replace(/\.[a-z0-9]+$/i, '');
@@ -954,31 +950,19 @@ async function downloadLive(job, ctx) {
     onLog?.(`第 ${idx} 段完成：${name}  ${humanSize(sz)}`);
 
     /**
-     * 用本段真实大小反推码率，若单段会超上传上限，就缩短后续分段时长。
+     * 分段时长保持用户设定的值，不再按体积自适应缩短。
      *
-     * 关键：必须用 ffmpeg 报的**真实段时长**，不能用墙钟时间。
-     * 墙钟会混入重连等待、上传阻塞等空档，把码率算虚高，
-     * 实测因此把 366s（48MB，完全安全）误判成需要缩到 30s。
-     *
-     * segDurSec 由 runFfmpegSegments 从 segment_list 的 CSV 里解析出来
-     * （格式：文件名,起始秒,结束秒），是这段媒体真正的时长。
+     * 之前加自适应是为了绕开 Cloudflare 的单请求 130MB 上限，
+     * 现在上传已改走分片协议（10MB 一片），体积不再是约束，
+     * 自适应反而会把 10 分钟段误缩成几十秒，所以去掉。
+     * 这里只记录码率用于日志。
      */
     const elapsedSec = segDurSec > 0 ? segDurSec : Math.max(1, (Date.now() - segStartAt) / 1000);
     const bytesPerSec = sz / elapsedSec;
-    if (bytesPerSec > 0) {
-      const safeSec = Math.floor(SEG_MAX_BYTES / bytesPerSec);
-      if (safeSec < effectiveSec) {
-        const newSec = Math.max(60, safeSec);
-        // 只有明显超出才调整，避免在安全线附近来回抖动
-        if (newSec < effectiveSec * 0.85) {
-          onLog?.(
-            `单段体积偏大（${humanSize(sz)} / ${Math.round(elapsedSec)}s ≈ ${fmtRate(bytesPerSec)}），` +
-              `分段时长由 ${effectiveSec}s 调整为 ${newSec}s 以适配上传限制`,
-          );
-          effectiveSec = newSec;
-          job.segmentSeconds = newSec;
-        }
-      }
+    if (bytesPerSec > 0 && idx === 1) {
+      onLog?.(
+        `实测码率约 ${fmtRate(bytesPerSec)}，按每段 ${effectiveSec}s 计，单段约 ${humanSize(bytesPerSec * effectiveSec)}`,
+      );
     }
 
     // 下一段重新计时

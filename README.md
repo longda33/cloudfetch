@@ -165,6 +165,37 @@ curl -X POST http://localhost:3000/api/tasks \
 
 HTTP 分片下载会把已完成分片记在 `<file>.parts/` 目录，重启后自动跳过已完成部分。单流下载用 `.part` 后缀文件记录进度。
 
+### 上传：分片协议（大文件不受 413 限制）
+
+OpenList 的 `PUT /api/fs/put` 是**单请求上传**，请求体受 Cloudflare 上限约束——
+实测超过约 130MB 会被直接挡回 `413 Payload Too Large`（返回 HTML 错误页，
+请求根本没到 OpenList）。
+
+因此上传优先走 **resumable multipart 协议**，把文件切成 10MB 一片逐片上传：
+
+```
+POST /api/fs/multipart/init
+  必需头：File-Path（URL 编码的完整路径）、X-File-Size、X-Chunk-Size、
+          Last-Modified、Content-Type、Overwrite
+  返回：{ upload_id, chunk_size, total_chunks, received }
+
+PUT  /api/fs/multipart/chunk
+  必需头：X-Upload-Id、X-Chunk-Index
+  请求体：该片的原始字节
+
+POST /api/fs/multipart/complete
+  必需头：X-Upload-Id
+```
+
+**踩坑记录**：少传任何一个头都会失败，而且错误信息有误导性——
+只给 `X-File-Size` 会返回 `storage not found; please add a storage first`，
+看起来像存储没挂载，实际是缺 `File-Path` 和 `X-Chunk-Size`。
+
+实测 150MB 文件切成 15 片，19 秒传完，complete 后远端大小与本地一致。
+
+服务端或存储驱动不支持分片时（`init` 返回 404/405 或 `data:null`），
+自动回退到单请求 `PUT`，但那条路径仍受 130MB 限制。
+
 ### 进度统计
 
 直播的总大小未知，进度条显示已下载字节数和已录段数（不确定态）；普通文件按 `已下载 / Content-Length` 计算百分比。
