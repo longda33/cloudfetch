@@ -34,12 +34,12 @@ fi
 # ---------- 2) 清掉旧实例 ----------
 if unikraft instances list --metro "$METRO" -o json 2>/dev/null | grep -q "\"name\": *\"${INSTANCE}\""; then
   warn "发现同名实例，先删除"
-  unikraft instances delete --metro "$METRO" --force "$INSTANCE" || true
+  unikraft instances delete --force "$INSTANCE" || true
   sleep 3
 fi
 
 # ---------- 3) 部署 ----------
-# 关键参数说明：
+# 关键参数说明（都是实测踩出来的）：
 #   -v cfdata:/data
 #       挂持久卷。rootfs 是只读的，所有可写内容必须落在 /data。
 #   --scale-to-zero=policy=off
@@ -47,7 +47,7 @@ fi
 #       直播录制这种长任务一旦被挂起，ffmpeg 进程就没了。
 #       CLI 的可选值是 on | idle | off，不是布尔开关。
 #   -m 1024MiB
-#       ffmpeg 转封装要占一些内存，512MiB 偏紧。
+#       ffmpeg 转封装要占内存，512MiB 偏紧。
 #   -p 443:8080/http+tls
 #       暴露 HTTPS，用于健康检查和读取探测结果。
 log "部署实例 ${INSTANCE}"
@@ -63,17 +63,20 @@ unikraft run \
   --restart=on-failure
 
 # ---------- 4) 取探测结果 ----------
+# 注意：instances logs / get / delete 都没有 --metro 参数，
+# 实例名在各 metro 内全局唯一，直接传名字即可。
 log "实例信息"
-unikraft instances get --metro "$METRO" "$INSTANCE"
+unikraft instances get "$INSTANCE"
 
-log "等待 running（最多 180s）"
-if ! unikraft instances wait --metro "$METRO" --until state=running --timeout 180s "$INSTANCE"; then
-  warn "实例未进入 running，拉日志看看："
-  unikraft instances logs --metro "$METRO" "$INSTANCE" || true
-  exit 1
+log "探测结果"
+# 给应用几秒把五项检查跑完
+sleep 12
+unikraft instances logs "$INSTANCE" || true
+
+FQDN=$(unikraft instances get "$INSTANCE" -o json 2>/dev/null \
+  | grep -o '"fqdn": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+
+if [ -n "${FQDN:-}" ]; then
+  log "公网地址: https://${FQDN}"
+  log "JSON 结果: https://${FQDN}/probe"
 fi
-
-log "实例日志（探测结果在这里）"
-unikraft instances logs --metro "$METRO" "$INSTANCE" || true
-
-log "完成。用上面的域名访问 /probe 可拿到 JSON 结果"
