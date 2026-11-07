@@ -12,7 +12,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { config } from './config.js';
-import { detectKind, resolveFilename, humanSize } from './util/links.js';
+import { detectKind, resolveFilename, humanSize, fmtRate } from './util/links.js';
 
 /** 自定义可重试错误 */
 class RetryableError extends Error {
@@ -686,6 +686,19 @@ async function downloadLive(job, ctx) {
   const { url, signal, onProgress, onLog, onSegment } = ctx;
   const segSec = Math.max(10, config.download.liveSegmentSeconds || 300);
 
+  /**
+   * 单段体积上限。
+   *
+   * 为什么要限制：OpenList 走 Cloudflare，上传请求体超过约 140MB 会被
+   * Cloudflare 直接挡掉，返回 413 Payload Too Large（HTML 错误页），
+   * 请求根本没到 OpenList。实测 130MB 可传、202MB 必失败。
+   *
+   * 10 分钟 × 2.7MB/s ≈ 200MB，必然踩线。所以按码率动态缩短分段时长，
+   * 保证单段体积落在安全区（留 20% 余量）。
+   */
+  const SEG_MAX_BYTES = 120 * 1024 * 1024; // 120MB，安全上限
+  let effectiveSec = segSec;
+
   const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
   const baseName = (ctx.filename || `live_${ts}`).replace(/\.[a-z0-9]+$/i, '');
   job.filename = `${baseName}_%03d.flv`;
@@ -700,6 +713,7 @@ async function downloadLive(job, ctx) {
   let emptyStreak = 0;
   let segOffset = 0; // 已产出的段数，用于续接编号
   let totalBytes = 0;
+  let segStartAt = Date.now(); // 当前段的起始时间，用于反推码率
 
   // 每段产出后立即回调（上传/删本地由上层负责）
   const handleSegment = async (filePath) => {
@@ -757,6 +771,32 @@ async function downloadLive(job, ctx) {
     onProgress?.(totalBytes, 0);
     onLog?.(`第 ${idx} 段完成：${name}  ${humanSize(sz)}`);
 
+    /**
+     * 用本段真实大小反推码率，若单段会超上传上限，就缩短后续分段时长。
+     *
+     * 这样无论源是 1Mbps 还是 8Mbps，单段体积都稳定落在 Cloudflare
+     * 能接受的范围（实测 130MB 可传、202MB 被 413 拒绝）。
+     */
+    const elapsedSec = Math.max(1, (Date.now() - segStartAt) / 1000);
+    const bytesPerSec = sz / elapsedSec;
+    if (bytesPerSec > 0) {
+      const safeSec = Math.floor(SEG_MAX_BYTES / bytesPerSec);
+      if (safeSec < effectiveSec) {
+        const newSec = Math.max(30, safeSec);
+        if (newSec < effectiveSec) {
+          onLog?.(
+            `单段体积偏大（${humanSize(sz)} / ${Math.round(elapsedSec)}s ≈ ${fmtRate(bytesPerSec)}），` +
+              `分段时长自动由 ${effectiveSec}s 调整为 ${newSec}s 以适配上传限制`,
+          );
+          effectiveSec = newSec;
+          job.segmentSeconds = newSec;
+        }
+      }
+    }
+
+    // 下一段重新计时
+    segStartAt = Date.now();
+
     const rec = { index: idx, filename: name, path: finalPath, size: sz };
     job.segments.push(rec);
 
@@ -809,7 +849,7 @@ async function downloadLive(job, ctx) {
         dir: ctx.dir,
         baseName,
         startNumber: segOffset,
-        segmentSeconds: segSec,
+        segmentSeconds: effectiveSec,
         signal,
         onLog,
         onSegmentFile: handleSegment,

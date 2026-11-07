@@ -220,7 +220,13 @@ export class OpenListClient {
         }
 
         if (!res.ok || (json && json.code !== undefined && json.code !== 200)) {
-          const msg = json?.message || text.slice(0, 200);
+          let msg = json?.message || text.slice(0, 200);
+          // 413 通常是 Cloudflare 的请求体大小限制，给出可操作的提示
+          if (res.status === 413) {
+            msg =
+              `文件 ${humanSize(total)} 超过上传通道上限（Cloudflare 请求体限制，实测约 130MB）。` +
+              '请调小 LIVE_SEGMENT_SECONDS，或改用直连 OpenList 域名绕过 CDN。';
+          }
           const err = new OpenListError(`上传失败：HTTP ${res.status} ${msg}`, res.status);
           // 5xx 或网络类错误可重试
           if (res.status >= 500 || res.status === 429) err.retryable = true;

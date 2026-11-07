@@ -144,3 +144,9 @@ export function humanSize(bytes) {
   }
   return `${n.toFixed(i === 0 ? 0 : 2)} ${units[i]}`;
 }
+
+/** 人类可读速率，如 2.71 MB/s */
+export function fmtRate(bytesPerSec) {
+  if (!Number.isFinite(bytesPerSec) || bytesPerSec <= 0) return '—';
+  return `${humanSize(bytesPerSec)}/s`;
+}
