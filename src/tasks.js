@@ -101,7 +101,16 @@ export class TaskManager extends EventEmitter {
   }
 
   // ---------------- 任务操作 ----------------
-  create({ url, filename, upload = true }) {
+  /**
+   * @param {object} opts
+   * @param {string} opts.url
+   * @param {string} [opts.filename]
+   * @param {boolean} [opts.upload=true] 完成后是否上传 OpenList
+   * @param {boolean} [opts.segment=true] 直播是否按时间分段。
+   *   false = 「全段下载」，整个直播录成一个大文件，不切段。
+   *   注意：不分段时单文件会持续增长，需自行承担磁盘与上传体积风险。
+   */
+  create({ url, filename, upload = true, segment = true }) {
     if (!url || typeof url !== 'string') throw new Error('缺少 url');
     let parsed;
     try {
@@ -122,6 +131,7 @@ export class TaskManager extends EventEmitter {
       kind: detectKind(url),
       status: STATUS.QUEUED,
       upload: Boolean(upload),
+      segment: segment !== false,
       createdAt: Date.now(),
       startedAt: null,
       finishedAt: null,
@@ -326,6 +336,7 @@ export class TaskManager extends EventEmitter {
         url: t.url,
         dir: jobDir,
         filename: t.filename,
+        segment: t.segment !== false,
         signal: ac.signal,
         onProgress,
         onLog,
@@ -475,6 +486,7 @@ export class TaskManager extends EventEmitter {
       kind: t.kind,
       live: Boolean(t.live),
       upload: Boolean(t.upload),
+      segment: t.segment !== false,
       status: t.status,
       size: t.size || 0,
       createdAt: t.createdAt,

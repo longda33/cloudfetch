@@ -883,6 +883,9 @@ body[data-view="history"] .hero { display: none; }
 .badge.done { background: var(--ok-soft); color: var(--ok); }
 .badge.failed { background: var(--err-soft); color: var(--err); }
 .badge.canceled { background: var(--surface-3); color: var(--muted); }
+
+/* 直播模式标记：分段 / 全段 */
+.badge.mode { background: rgba(168,85,247,.16); color: #d8b4fe; font-weight: 600; }
 .badge.live { background: rgba(168, 85, 247, .14); color: #c084fc; }
 
 .pager {

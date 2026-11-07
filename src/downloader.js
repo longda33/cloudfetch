@@ -682,8 +682,188 @@ async function fetchToFile(url, dest, signal, byteRange) {
  * 为什么用 ffmpeg 而不是自己按字节切：
  *  直播流是持续不断的 tag 序列，只有 ffmpeg 能准确在关键帧边界切分并保证每段可独立播放。
  */
+/**
+ * 全段下载：把整个直播录成一个大文件，不切段。
+ *
+ * 用 ffmpeg 直接输出 flv，断流靠 -reconnect 在进程内续传；
+ * 若 ffmpeg 真的退出，外层循环重启并用 -append 继续追加到同一文件。
+ */
+async function downloadLiveWhole(job, ctx) {
+  const { url, signal, onProgress, onLog } = ctx;
+
+  const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+  const baseName = (ctx.filename || `live_${ts}`).replace(/\.[a-z0-9]+$/i, '');
+  const outName = `${baseName}.flv`;
+  const outPath = path.join(ctx.dir, outName);
+
+  job.filename = outName;
+  job.live = true;
+  job.segmentSeconds = 0;
+  job.segments = [];
+  job.segmentsDone = 0;
+
+  onLog?.('全段下载模式：整场录成单个文件，不切段；点「取消」结束录制并上传');
+
+  let attempt = 0;
+  let emptyStreak = 0;
+  let lastSize = 0;
+
+  while (true) {
+    if (signal?.aborted) break;
+    attempt++;
+
+    // 已有内容 → 本次追加，不覆盖
+    const existing = await sizeOf(outPath).catch(() => 0);
+    const append = existing > 0;
+
+    onLog?.(
+      append
+        ? `连接 #${attempt}：追加录制（已有 ${humanSize(existing)}）`
+        : `连接 #${attempt}：开始录制`,
+    );
+
+    const before = existing;
+    let sampler = null;
+
+    try {
+      sampler = setInterval(() => {
+        fs.stat(outPath, (err, st) => {
+          if (!err && st.size > 0) {
+            job.downloaded = st.size;
+            onProgress?.(st.size, 0);
+          }
+        });
+      }, 1000);
+
+      await runFfmpegWhole({
+        url,
+        outPath,
+        append,
+        signal,
+        onLog,
+      });
+    } catch (e) {
+      if (signal?.aborted) break;
+      onLog?.(`连接中断：${e.message}`);
+    } finally {
+      if (sampler) clearInterval(sampler);
+    }
+
+    const now = await sizeOf(outPath).catch(() => 0);
+    job.downloaded = now;
+    lastSize = now;
+
+    if (now > before) {
+      emptyStreak = 0;
+    } else {
+      emptyStreak++;
+      onLog?.(`本次未录到新数据（连续 ${emptyStreak}/${config.retry.liveMaxEmptyRetries}）`);
+      if (emptyStreak >= config.retry.liveMaxEmptyRetries) {
+        if (now === 0) throw new FatalError('连续多次未收到任何数据，直播可能已结束或地址无效');
+        onLog?.('连续无数据，判定直播已结束');
+        break;
+      }
+    }
+
+    await sleep(config.retry.liveReconnectDelay);
+  }
+
+  if (lastSize <= 0) throw new FatalError('未录制到任何数据');
+
+  onLog?.(`录制结束：${outName}  ${humanSize(lastSize)}`);
+  return {
+    filePath: outPath,
+    filename: outName,
+    size: lastSize,
+    segments: [],
+    multiFile: false,
+  };
+}
+
+/**
+ * 单文件录制（不分段）。
+ * -append 1 让 ffmpeg 在文件末尾追加，而不是覆盖。
+ */
+function runFfmpegWhole(opts) {
+  const { url, outPath, append, signal, onLog } = opts;
+
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-hide_banner',
+      '-loglevel', 'warning',
+      '-probesize', '2M',
+      '-analyzeduration', '2M',
+      '-fflags', '+genpts',
+      '-reconnect', '1',
+      '-reconnect_streamed', '1',
+      '-reconnect_delay_max', '5',
+      '-reconnect_at_eof', '1',
+      '-i', url,
+      '-c', 'copy',
+      '-f', 'flv',
+    ];
+    if (append) args.push('-append', '1');
+    args.push('-y', outPath);
+
+    const child = spawn(config.ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+
+    let stderr = '';
+    child.stderr.on('data', (d) => {
+      stderr += d.toString();
+      if (stderr.length > 8000) stderr = stderr.slice(-8000);
+    });
+
+    const kill = () => {
+      try {
+        child.kill('SIGINT');
+      } catch {
+        /* ignore */
+      }
+      setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* ignore */
+        }
+      }, 3000).unref?.();
+    };
+    signal?.addEventListener('abort', kill, { once: true });
+
+    child.on('error', (e) => {
+      signal?.removeEventListener('abort', kill);
+      reject(new Error(`ffmpeg 启动失败：${e.message}`));
+    });
+
+    child.on('close', (code) => {
+      signal?.removeEventListener('abort', kill);
+      if (signal?.aborted) return resolve({ aborted: true });
+      if (code === 0) return resolve({ aborted: false });
+      if (/Connection|timed out|Server error|End of file|Invalid data|Broken pipe|error while decoding|prematurely/i.test(stderr)) {
+        return resolve({ aborted: false, interrupted: true });
+      }
+      reject(new Error(`ffmpeg 退出码 ${code}：${stderr.slice(-400)}`));
+    });
+  });
+}
+
 async function downloadLive(job, ctx) {
   const { url, signal, onProgress, onLog, onSegment } = ctx;
+
+  /**
+   * 全段下载（不分段）：把整个直播录成一个大文件。
+   *
+   * 与分段模式的区别：
+   *  - 不传 -f segment，直接让 ffmpeg 输出到单个文件
+   *  - 断流由 -reconnect 系列参数在进程内自动续传，文件持续追加
+   *  - 外层循环仍兜底：ffmpeg 真退出就重新起一个，用 -append 追加到同一文件
+   *
+   * 注意：文件会一直增长，直到用户手动停止。停止时才上传，
+   * 因此单个文件可能远超 Cloudflare 的上传上限，这是该模式固有的取舍。
+   */
+  if (ctx.segment === false) {
+    return await downloadLiveWhole(job, ctx);
+  }
+
   const segSec = Math.max(10, config.download.liveSegmentSeconds || 300);
 
   /**

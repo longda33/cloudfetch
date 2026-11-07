@@ -35,6 +35,7 @@ const state = {
   authRequired: false,
   limits: {},
   histTotal: 0,
+  health: null,
 };
 
 let toastTimer;
@@ -418,12 +419,12 @@ function updateLinkCount() {
   el.classList.toggle('show', n > 0);
 }
 
-async function addTasks() {
+async function addTasks(segment = true) {
   const text = $('#urlInput').value.trim();
   if (!text) return toast('请先粘贴链接', 'err');
 
   const upload = $('#uploadToggle').checked;
-  const btn = $('#btnAdd');
+  const btn = segment ? $('#btnAddSeg') : $('#btnAddWhole');
   const original = btn.innerHTML;
   btn.disabled = true;
   btn.textContent = '提交中…';
@@ -432,7 +433,7 @@ async function addTasks() {
     const res = await fetch('/api/tasks', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, upload }),
+      body: JSON.stringify({ text, upload, segment }),
     });
     if (res.status === 401) { showLogin(); return; }
 
@@ -442,7 +443,8 @@ async function addTasks() {
     $('#urlInput').value = '';
     updateLinkCount();
 
-    let msg = `已添加 ${j.created.length} 个任务`;
+    const modeName = segment ? '分段' : '全段';
+    let msg = `已添加 ${j.created.length} 个${modeName}任务`;
     if (j.errors?.length) msg += `，${j.errors.length} 个失败`;
     toast(msg, 'ok');
     for (const t of j.created) upsertTask(t);
@@ -489,6 +491,7 @@ async function act(kind, id) {
 async function refreshChips() {
   try {
     const h = await (await fetch('/api/health')).json();
+    state.health = h;
     state.authRequired = h.authRequired;
     state.limits = h.limits || {};
 
@@ -566,31 +569,52 @@ function renderHistItem(h) {
     canceled: `<span class="badge canceled">取消</span>`,
   }[h.status] || '';
 
+  // 直播的模式标记：分段 / 全段
+  const modeTag = h.live
+    ? h.segment === false
+      ? '<span class="badge mode">全段</span>'
+      : '<span class="badge mode">分段</span>'
+    : '';
+
   const meta = [`<span>${fmtTime(h.createdAt)}</span>`];
   if (h.size) meta.push(`<span>大小 <b>${fmtBytes(h.size)}</b></span>`);
   if (h.duration) meta.push(`<span>耗时 <b>${fmtDuration(h.duration)}</b></span>`);
-  if (h.live) meta.push(`<span>分段 <b>${h.segmentCount || 0}</b> 段</span>`);
+  if (h.live && h.segment !== false) meta.push(`<span>分段 <b>${h.segmentCount || 0}</b> 段</span>`);
   if (h.segmentsUploaded) meta.push(`<span class="ok">已传 ${h.segmentsUploaded} 段</span>`);
   if (h.remotePath) meta.push(`<span class="ok" title="${esc(h.remotePath)}">${icon('cloud', 'ic ic-xs')} ${esc(h.remotePath)}</span>`);
   if (h.error) meta.push(`<span class="err" title="${esc(h.error)}">${esc(h.error)}</span>`);
 
+  // 有远端路径才显示「打开文件夹」
+  const folderBtn = h.remotePath
+    ? `<button class="btn btn-ghost btn-xs" data-hact="folder" data-hid="${h.id}"
+         title="在 OpenList 打开 ${esc(folderOf(h.remotePath))}">${icon('inbox', 'ic ic-xs')}文件夹</button>`
+    : '';
+
   return `
-  <div class="hist-item" data-hid="${h.id}" data-url="${esc(h.url)}">
+  <div class="hist-item" data-hid="${h.id}" data-url="${esc(h.url)}" data-rpath="${esc(h.remotePath || '')}" data-segment="${h.segment === false ? '0' : '1'}">
     <span class="hist-icon">${icon(km.icon)}</span>
     <div class="hist-body">
       <div class="hist-title">
         <span title="${esc(h.filename || h.url)}">${esc(h.filename || '(未命名)')}</span>
-        ${badge}
+        ${badge}${modeTag}
       </div>
       <div class="hist-url" title="${esc(h.url)}">${esc(h.url)}</div>
       <div class="hist-meta">${meta.join('')}</div>
     </div>
     <div class="hist-acts">
+      ${folderBtn}
       <button class="btn btn-ghost btn-xs" data-hact="copy" data-hid="${h.id}">复制</button>
       <button class="btn btn-ghost btn-xs" data-hact="retry" data-hid="${h.id}">重下</button>
       <button class="btn btn-danger btn-xs" data-hact="del" data-hid="${h.id}">删除</button>
     </div>
   </div>`;
+}
+
+/** 从远端文件路径取出所在目录：/a/b/c.flv → /a/b */
+function folderOf(remotePath) {
+  if (!remotePath) return '';
+  const i = remotePath.lastIndexOf('/');
+  return i > 0 ? remotePath.slice(0, i) : '/';
 }
 
 async function loadHistory() {
@@ -673,6 +697,9 @@ $('#btnClear').addEventListener('click', async () => {
   toast(`已清空 ${j.removed} 条`);
 });
 
+// 全段下载：整场录成单个文件
+$('#btnAddWhole').addEventListener('click', () => addTasks(false));
+
 $('#btnLogin').addEventListener('click', doLogin);
 $('#pwdInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
 
@@ -734,12 +761,20 @@ document.addEventListener('click', async (e) => {
     } catch {
       toast('复制失败，请手动选择', 'err');
     }
+  } else if (hact === 'folder') {
+    // 打开 OpenList 里该文件所在的文件夹
+    const rpath = item?.dataset.rpath || '';
+    if (!rpath) return toast('这条记录没有远端路径', 'err');
+    const link = openlistFolderUrl(folderOf(rpath));
+    if (!link) return toast('未配置 OpenList 地址', 'err');
+    window.open(link, '_blank', 'noopener');
   } else if (hact === 'retry') {
     try {
+      // 沿用原任务的模式重下
       const r = await fetch('/api/tasks', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, upload: true }),
+        body: JSON.stringify({ url, upload: true, segment: item?.dataset.segment !== '0' }),
       });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error);
@@ -759,6 +794,18 @@ document.addEventListener('click', async (e) => {
     }
   }
 });
+
+/**
+ * 拼 OpenList 的文件夹浏览地址。
+ *
+ * OpenList 前端是 SPA，目录路径直接接在站点根后面即可，
+ * 例如 https://host/od-20200439/cloudfetch/2026-11-07
+ */
+function openlistFolderUrl(dir) {
+  const base = (state.health?.openlistUrl || '').replace(/\/+$/, '');
+  if (!base || !dir) return '';
+  return `${base}${dir.startsWith('/') ? '' : '/'}${dir}`;
+}
 
 // 任务操作
 document.addEventListener('click', (e) => {

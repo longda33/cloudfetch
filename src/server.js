@@ -91,6 +91,9 @@ app.get('/api/health', (req, res) => {
     uptime: Math.round(process.uptime()),
     node: process.version,
     openlist: openlistConfigured(),
+    // 前端拼「打开文件夹」链接要用（字段名是 baseUrl，不是 url）
+    openlistUrl: config.openlist.baseUrl || '',
+    openlistUploadDir: config.openlist.uploadDir || '',
     // 未配密码时前端要显示"配置缺失"而不是登录框
     authRequired: Boolean(config.auth.password),
     passwordConfigured: Boolean(config.auth.password),
@@ -146,6 +149,8 @@ app.get('/api/tasks/:id', (req, res) => {
 app.post('/api/tasks', (req, res) => {
   const body = req.body || {};
   const upload = body.upload !== false;
+  // segment=false 表示「全段下载」：直播整场录成单个文件，不切段
+  const segment = body.segment !== false;
 
   // 批量：{ urls: [...] } 或 { text: "多行链接" }
   let urls = [];
@@ -166,7 +171,7 @@ app.post('/api/tasks', (req, res) => {
   const errors = [];
   for (const u of urls) {
     try {
-      const t = mgr.create({ url: u, filename: body.filename, upload });
+      const t = mgr.create({ url: u, filename: body.filename, upload, segment });
       created.push(mgr.get(t.id));
     } catch (e) {
       errors.push({ url: u, error: e.message });

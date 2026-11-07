@@ -112,15 +112,20 @@
             <span class="switch-track"><span class="switch-thumb"></span></span>
             <span>上传 OpenList</span>
           </label>
-          <button class="btn btn-primary" id="btnAdd" type="submit">
+          <button class="btn btn-primary" id="btnAddSeg" type="submit" title="直播按时间切段，每段独立上传">
+            <svg class="ic" aria-hidden="true"><use href="#i-layers"></use></svg>
+            分段下载
+          </button>
+          <button class="btn btn-ghost" id="btnAddWhole" type="button" title="整场录成单个文件，停止后才上传">
             <svg class="ic" aria-hidden="true"><use href="#i-download"></use></svg>
-            开始下载
+            全段下载
           </button>
         </div>
       </div>
 
       <p class="hint">
-        <span>直播流按<b>时间分段</b>录制，每段独立上传、<b>不合并</b>。</span>
+        <span><b>分段下载</b>：按时间切段，每段独立上传，断流不丢已录内容。</span>
+        <span><b>全段下载</b>：整场一个文件，需手动停止才上传。</span>
         <span class="nowrap">提交快捷键 <kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>Enter</kbd></span>
       </p>
     </form>
