@@ -15,8 +15,27 @@ const bool = (v, d) => {
   return /^(1|true|yes|on)$/i.test(String(v));
 };
 
-/** 临时下载目录。Cloady 免费额度存储只有 5GB，默认放 /tmp 不占持久卷 */
-const DATA_DIR = env.DATA_DIR || '/tmp/cloudfetch';
+/**
+ * 临时下载目录。
+ *
+ * 默认值按环境自动选：
+ *   - 存在 /data 且可写（Unikraft 挂了持久卷）→ 用 /data/cloudfetch
+ *   - 否则用 /tmp/cloudfetch（Cloady 等无持久卷环境）
+ *
+ * 为什么 Unikraft 必须落到 /data：rootfs 是只读的，/tmp 根本写不进去。
+ * 而且容器重建后 /tmp 会清空，放持久卷才能留住任务状态和历史。
+ */
+function pickDataDir() {
+  if (env.DATA_DIR) return env.DATA_DIR;
+  try {
+    fs.accessSync('/data', fs.constants.W_OK);
+    return '/data/cloudfetch';
+  } catch {
+    return '/tmp/cloudfetch';
+  }
+}
+
+const DATA_DIR = pickDataDir();
 const TMP_DIR = env.TMP_DIR || path.join(DATA_DIR, 'tmp');
 
 // 确保目录存在
@@ -57,9 +76,13 @@ export const config = {
     progressInterval: num(env.PROGRESS_INTERVAL, 500),
     /**
      * 直播分段时长（秒）。每段独立成文件、独立上传，**不合并**。
-     * 600 = 10 分钟一段
+     * 1800 = 30 分钟一段。
+     *
+     * 之所以敢用 30 分钟这么长：上传已改走分片协议（10MB 一片），
+     * 单段体积不再受 Cloudflare 的 130MB 单请求上限约束，
+     * 30 分钟 × 2.7MB/s ≈ 4.8GB 也能正常传上去。
      */
-    liveSegmentSeconds: num(env.LIVE_SEGMENT_SECONDS, 600),
+    liveSegmentSeconds: num(env.LIVE_SEGMENT_SECONDS, 1800),
   },
 
   // ---------- 重试 ----------

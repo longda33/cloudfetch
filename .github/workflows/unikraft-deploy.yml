@@ -1,0 +1,89 @@
+name: Unikraft 部署
+
+# 手动触发，或 push 到 main 且改动了业务代码时自动构建
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'public/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'unikraft/app/**'
+      - '.github/workflows/unikraft-deploy.yml'
+
+env:
+  IMAGE_NAME: cloudfetch
+  UKC_VERSION: 0.6.2
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # unikraft images build 依赖本地 BuildKit，runner 自带的 docker 正好能提供。
+      # 本地实测：没有 BuildKit 会直接报
+      #   "buildkit not found; please start a docker or buildkit daemon"
+      - name: 确认 BuildKit 可用
+        run: |
+          set -euo pipefail
+          docker version
+          docker buildx version
+
+      - name: 安装 unikraft CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o /tmp/ukc.tar.gz \
+            "https://github.com/unikraft-cloud/cli/releases/download/v${UKC_VERSION}/unikraft-cli_${UKC_VERSION}_linux_amd64.tar.gz"
+          sudo tar -xzf /tmp/ukc.tar.gz -C /usr/local/bin unikraft
+          unikraft version
+
+      - name: 登录 Unikraft
+        env:
+          UKC_TOKEN: ${{ secrets.UNIKRAFT_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${UKC_TOKEN:-}" ]; then
+            echo "::error::缺少 UNIKRAFT_TOKEN secret"
+            exit 1
+          fi
+          printf '%s' "$UKC_TOKEN" > /tmp/ukc.token
+          unikraft login --token /tmp/ukc.token --no-browser
+          rm -f /tmp/ukc.token
+
+      - name: 构建镜像
+        env:
+          UKC_ORG: ${{ secrets.UNIKRAFT_ORG }}
+        run: |
+          set -euo pipefail
+          ORG="${UKC_ORG:-panpp123}"
+          echo "ORG=$ORG" >> "$GITHUB_ENV"
+          # Dockerfile 在仓库根目录，构建上下文就是根目录，
+          # 这样 COPY src/ 和 COPY public/ 才能找到文件。
+          unikraft images build . \
+            --arch x86_64 \
+            --output "${ORG}/${IMAGE_NAME}:latest" \
+            --no-cache 2>&1 | tee /tmp/build.log
+
+      - name: 构建日志
+        if: always()
+        run: tail -60 /tmp/build.log 2>/dev/null || echo "(无日志)"
+
+      - name: 写入摘要
+        if: success()
+        run: |
+          {
+            echo "## 镜像构建成功"
+            echo ""
+            echo "- \`${{ env.ORG }}/${{ env.IMAGE_NAME }}:latest\`"
+            echo ""
+            echo "### 部署"
+            echo ""
+            echo '```bash'
+            echo "./unikraft/deploy-app.sh fra"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,14 @@
+# 构建上下文是仓库根目录，排除无关文件
+# 项目源码只有 ~180KB，但 node_modules 有几十 MB，必须排除
+node_modules
+.git
+.github
+.workbuddy-ai
+unikraft
+*.md
+.env
+.env.*
+deploy.sh
+_t
+_tmp
+*.log
