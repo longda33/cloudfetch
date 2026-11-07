@@ -653,15 +653,16 @@ function renderHistItem(h) {
   if (h.duration) meta.push(`<span>耗时 <b>${fmtDuration(h.duration)}</b></span>`);
 
   /**
-   * 分段统计。
+   * 待补传数量。
    *
-   * 关键：缺的段 = 总数 - 已传数。
-   * 不能只看 failedSegments —— 那个数组只记「上传抛异常」的段，
-   * 而实际有几种情况都不会进数组：
+   * 直播：缺的段 = 总数 - 已传数。不能只看 failedSegments —— 那个数组
+   * 只记「上传抛异常」的段，而实际有几种情况都不会进数组：
    *   - 上传任务还在后台排队（异步上传，任务结束时可能没跑完）
    *   - 用户中途停止，后面的段压根没触发上传
    *   - 容器重启打断
-   * 这些段同样需要「重传」，所以这里用差值兜底。
+   * 这些段同样需要「重传」，所以用差值兜底。
+   *
+   * 单文件：开了上传却没拿到 remotePath，就是没传成功。
    */
   let missing = 0;
   if (h.live && h.segment !== false) {
@@ -675,6 +676,9 @@ function renderHistItem(h) {
     }
     seg += '</span>';
     meta.push(seg);
+  } else if (h.upload && !h.remotePath && (h.size || 0) > 0) {
+    missing = 1;
+    meta.push('<span class="err">上传未完成</span>');
   }
   if (h.remotePath) meta.push(`<span class="ok" title="${esc(h.remotePath)}">${icon('cloud', 'ic ic-xs')} ${esc(h.remotePath)}</span>`);
   if (h.error) meta.push(`<span class="err" title="${esc(h.error)}">${esc(h.error)}</span>`);

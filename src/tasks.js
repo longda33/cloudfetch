@@ -362,6 +362,32 @@ export class TaskManager extends EventEmitter {
       byIndex.set(f.index, { ...(byIndex.get(f.index) || {}), ...f });
     }
 
+    /**
+     * 单文件任务的兜底：没有 segments，但开了上传又没拿到 remotePath，
+     * 说明它从没传成功。补一条 index=0，让它也能走重传。
+     *
+     * 正常流程下单文件上传失败已经会写 failedSegments，
+     * 这里是为了兼容修复前留下的旧记录（那时还没登记）。
+     */
+    if (!(t.segments || []).length && t.upload && !t.remotePath && !byIndex.has(0)) {
+      const local = t.localPath || '';
+      const exists = local
+        ? await fsp
+            .stat(local)
+            .then((s) => s.size > 0)
+            .catch(() => false)
+        : false;
+      if (exists) {
+        byIndex.set(0, {
+          index: 0,
+          filename: t.filename || '',
+          size: t.size || 0,
+          localPath: local,
+          error: '未上传',
+        });
+      }
+    }
+
     const list = [...byIndex.values()].sort((a, b) => a.index - b.index);
     if (!list.length) throw new Error('没有待重试的段');
 
@@ -394,11 +420,22 @@ export class TaskManager extends EventEmitter {
         await ol.uploadFile(local, remote, { onLog: (m) => this._log(t, m) });
         const seg = (t.segments || []).find((s) => s.index === item.index);
         if (seg) seg.remotePath = remote;
+
+        /**
+         * 单文件任务没有 segments 数组，index=0 就是那个唯一的文件。
+         * 补传成功后要把 remotePath 写到任务上，否则前端和
+         * _historyRecord 都以为它还没传。
+         */
+        if (!t.segments?.length) {
+          t.remotePath = remote;
+        }
+
         ok++;
         this._log(t, `第 ${item.index} 段重试成功 → ${remote}`);
         if (config.openlist.deleteAfterUpload) {
           await fsp.rm(local, { force: true }).catch(() => {});
           if (seg) seg.deleted = true;
+          if (!t.segments?.length) t.localPath = '';
         }
       } catch (e) {
         still.push({ ...item, error: e.message });
@@ -408,6 +445,17 @@ export class TaskManager extends EventEmitter {
 
     t.failedSegments = still;
     t.segmentsUploaded = (t.segments || []).filter((s) => s.remotePath).length;
+
+    /**
+     * 单文件补传成功后要把任务状态从 failed 翻回 done，
+     * 否则历史记录里明明传上去了还显示「失败」。
+     */
+    if (!still.length && t.status === STATUS.FAILED && t.remotePath) {
+      t.status = STATUS.DONE;
+      t.phase = '已完成';
+      t.error = '';
+    }
+
     this._emit(t);
     this._saveState();
 
@@ -701,18 +749,44 @@ export class TaskManager extends EventEmitter {
         });
         onLog(`开始上传 → ${remote}`);
 
-        await ol.uploadFile(dl.filePath, remote, {
-          signal: ac.signal,
-          onProgress: (total, uploaded) => {
-            t.uploaded = uploaded;
-            t.percent = total ? Math.min(99.9, (uploaded / total) * 100) : 0;
-            this._emit(t);
-          },
-          onLog,
-        });
+        try {
+          await ol.uploadFile(dl.filePath, remote, {
+            signal: ac.signal,
+            onProgress: (total, uploaded) => {
+              t.uploaded = uploaded;
+              t.percent = total ? Math.min(99.9, (uploaded / total) * 100) : 0;
+              this._emit(t);
+            },
+            onLog,
+          });
+        } catch (e) {
+          /**
+           * 单文件上传失败也要登记，否则文件会被下面的清理逻辑删掉。
+           *
+           * 之前这里没有 try，异常直接冒到外层 catch，而外层清理条件是
+           * `!t.failedSegments?.length` —— failedSegments 只有直播分段
+           * 上传失败才会填，单文件永远是空数组，于是 jobDir 被整个删除，
+           * 下载好的文件白下，还没法重传。
+           *
+           * 用 index=0 作为单文件的段号，复用同一套重传机制。
+           */
+          t.failedSegments = [
+            {
+              index: 0,
+              filename: dl.filename,
+              size: dl.size,
+              localPath: dl.filePath,
+              error: e.message,
+            },
+          ];
+          this._emit(t);
+          throw e;
+        }
 
         t.remotePath = remote;
         t.percent = 100;
+        // 传成功了就把可能残留的失败记录清掉（重传成功的场景）
+        t.failedSegments = [];
         onLog(`上传完成：${remote}`);
         this._emit(t);
         this._saveState();
@@ -777,8 +851,24 @@ export class TaskManager extends EventEmitter {
       this._emit(t);
       this._saveState();
 
-      // 清理残留临时文件（保留 jobDir 里还没上传的文件，别删）
-      if (!t._stopRequested && !t.failedSegments?.length) {
+      /**
+       * 清理残留临时文件。
+       *
+       * 判据从「有没有失败记录」改成「有没有可能还没传出去的内容」，
+       * 因为前者只覆盖直播分段，单文件上传失败时 failedSegments 是空的，
+       * 会把已经下好的文件一起删掉。
+       *
+       * 只要满足任一条件就保留整个 jobDir：
+       *   - 用户主动停止（文件可能是他想要的成果）
+       *   - 有登记的上传失败记录
+       *   - 开了上传但没拿到 remotePath，且确实有内容 —— 说明没传成功
+       */
+      const mayHaveUnuploaded =
+        Boolean(t._stopRequested) ||
+        (t.failedSegments?.length || 0) > 0 ||
+        (t.upload && !t.remotePath && ((t.size || 0) > 0 || (t.segments || []).length > 0));
+
+      if (!mayHaveUnuploaded) {
         try {
           await fsp.rm(jobDir, { recursive: true, force: true });
         } catch {
