@@ -35,11 +35,39 @@ jobs:
           docker buildx version
 
       - name: 安装 unikraft CLI
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          curl -fsSL --retry 3 -o /tmp/ukc.tar.gz \
-            "https://github.com/unikraft-cloud/cli/releases/download/v${UKC_VERSION}/unikraft-cli_${UKC_VERSION}_linux_amd64.tar.gz"
-          sudo tar -xzf /tmp/ukc.tar.gz -C /usr/local/bin unikraft
+          FILE="unikraft-cli_${UKC_VERSION}_linux_amd64.tar.gz"
+
+          # 用 gh release download 而不是 curl 直链。
+          #
+          # 原因：GitHub 的 release 直链（objects.githubusercontent.com）
+          # 会返回 504，而同一台机器上 gh 走 API 拿到的下载地址是好的。
+          # 实测 curl 对 tar.gz / deb / rpm / checksums 全部 504，
+          # 但 `gh release download` 一次成功 14MB。
+          #
+          # gh 会自动跟随重定向并处理鉴权，runner 上预装了 gh。
+          for i in 1 2 3 4 5; do
+            if gh release download "v${UKC_VERSION}" \
+                 --repo unikraft-cloud/cli \
+                 --pattern "$FILE" \
+                 --dir /tmp \
+                 --clobber; then
+              echo "下载成功（第 $i 次尝试）"
+              break
+            fi
+            delay=$(( i * 5 ))
+            echo "第 $i 次下载失败，${delay}s 后重试…"
+            sleep "$delay"
+            if [ "$i" -eq 5 ]; then
+              echo "::error::无法下载 unikraft CLI v${UKC_VERSION}"
+              exit 1
+            fi
+          done
+
+          sudo tar -xzf "/tmp/$FILE" -C /usr/local/bin unikraft
           unikraft version
 
       - name: 登录 Unikraft
