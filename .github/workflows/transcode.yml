@@ -1,16 +1,28 @@
-name: 转码 FLV → MP4
+name: 合并转码 FLV → MP4
 
 # 由 Unikraft 实例通过 workflow_dispatch 触发。
-# 也支持手动运行：填好参数即可。
+#
+# 职责变了：不再「一段转一次」，而是整场直播录完后一次性处理：
+#   1. 从 R2 拉下所有分段（每个 5 分钟）
+#   2. ffmpeg concat 合并成一个文件再转 H.264 + AAC
+#   3. 分片上传到 OpenList
+#   4. 清理 R2 上的所有分段
+#
+# 为什么合并后统一转：
+#   - 每段单独转码再拼接，接缝处会有时间戳跳变，播放器拖动会卡
+#   - 一次转码能重新分配码率，整场体积更小
+#   - Actions 分钟数只花一次，而不是 N 次
 on:
   workflow_dispatch:
     inputs:
-      source_url:
-        description: '源文件下载地址（R2 预签名 URL）'
+      # 多个 R2 对象键，逗号分隔，按顺序合并
+      r2_keys:
+        description: 'R2 对象键列表（逗号分隔，按录制顺序）'
         required: true
         type: string
-      r2_key:
-        description: 'R2 对象键，转完用来清理'
+      # 兼容旧调用：单个预签名 URL
+      source_url:
+        description: '（可选）单个源文件 URL，给非直播任务用'
         required: false
         type: string
         default: ''
@@ -39,31 +51,37 @@ on:
         required: false
         type: string
         default: ''
-      seg_index:
-        description: '段序号（仅用于标记）'
-        required: false
-        type: string
-        default: '0'
 
-# 同一个任务的多段转码互不干扰，但同一段不要并发跑两遍
+# 同一个任务只允许一次合并转码，避免重复跑
 concurrency:
-  group: transcode-${{ inputs.task_id }}-${{ inputs.seg_index }}
+  group: transcode-${{ inputs.task_id }}
   cancel-in-progress: false
 
 jobs:
   transcode:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    # 这个 job 只需要读代码，不需要写仓库；显式收敛 GITHUB_TOKEN 权限
+    # 固定到 24.04 而不是 ubuntu-latest。
+    #
+    # ubuntu-latest 在 2026-10 会迁移到 26.04，届时 apt 源、ffmpeg 版本、
+    # 预装工具都可能变，构建会突然失败。固定大版本可以自己控制升级时机。
+    # 出现这条警告就是提醒：
+    #   "The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    # 只需要读代码，不需要写仓库
     permissions:
       contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      # checkout@v5 / setup-node@v5 已经跑在 Node 24 上。
+      # v4 系列仍声明 Node 20，GitHub 会强制降级到 Node 24 并打警告：
+      #   "Node.js 20 is deprecated. The following actions target Node.js 20
+      #    but are being forced to run on Node.js 24"
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '22'
 
       # 输入来自服务端，但 workflow 也能被有仓库权限的人手动触发，
       # 所以对目标目录做一次格式校验：必须是绝对路径且不含 ..
@@ -85,7 +103,7 @@ jobs:
           esac
           echo "参数校验通过：$OPENLIST_DIR / $OUT_NAME"
 
-      # ubuntu-latest 默认不带 ffmpeg，必须自己装。
+      # ubuntu-24.04 默认不带 ffmpeg，必须自己装。
       # apt 源里的 ffmpeg 已编译进 libx264 和 aac，够用。
       - name: 安装 ffmpeg
         run: |
@@ -98,16 +116,15 @@ jobs:
             exit 1
           }
 
-      - name: 转码并上传
+      - name: 合并转码并上传
         env:
+          R2_KEYS: ${{ inputs.r2_keys }}
           SOURCE_URL: ${{ inputs.source_url }}
-          R2_KEY: ${{ inputs.r2_key }}
           OUT_NAME: ${{ inputs.out_name }}
           OPENLIST_DIR: ${{ inputs.openlist_dir }}
           CRF: ${{ inputs.crf }}
           PRESET: ${{ inputs.preset }}
           TASK_ID: ${{ inputs.task_id }}
-          SEG_INDEX: ${{ inputs.seg_index }}
           OPENLIST_URL: ${{ vars.OPENLIST_URL }}
           OPENLIST_TOKEN: ${{ secrets.OPENLIST_TOKEN }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
@@ -122,13 +139,14 @@ jobs:
         if: always()
         run: |
           {
-            echo "## 转码结果"
+            echo "## 合并转码结果"
             echo ""
             echo "| 项 | 值 |"
             echo "|---|---|"
             echo "| 输出文件 | \`${{ inputs.out_name }}\` |"
             echo "| 目标目录 | \`${{ inputs.openlist_dir }}\` |"
+            echo "| 分段数 | $(echo "${{ inputs.r2_keys }}" | tr ',' '\n' | grep -c . || echo 0) |"
             echo "| CRF | ${{ inputs.crf }} |"
-            echo "| 任务 | \`${{ inputs.task_id }}\` 第 ${{ inputs.seg_index }} 段 |"
+            echo "| 任务 | \`${{ inputs.task_id }}\` |"
             echo "| 状态 | ${{ job.status }} |"
           } >> "$GITHUB_STEP_SUMMARY"

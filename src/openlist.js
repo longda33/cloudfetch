@@ -599,7 +599,15 @@ export function buildRemotePath(filename, opts = {}) {
 
   if (o.dateSubdir) {
     const d = new Date(opts.date || Date.now());
-    const ymd = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    // 用中国时区算日期，和容器 TZ 保持一致。
+    // getFullYear() 之类按本地时区算，容器如果是 UTC，
+    // 晚上 8 点之后录的东西会落到"前一天"的目录里。
+    const ymd = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Shanghai',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(d);
     dir += '/' + ymd;
   }
 

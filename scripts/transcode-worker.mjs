@@ -15,22 +15,23 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 
 const {
   SOURCE_URL = '',
   R2_KEY = '',
+  R2_KEYS = '',
   OUT_NAME = 'output.mp4',
   OPENLIST_DIR = '',
   CRF = '23',
   PRESET = 'veryfast',
   TASK_ID = '',
-  SEG_INDEX = '0',
   // OpenList 凭据
   OPENLIST_URL = '',
   OPENLIST_TOKEN = '',
   // 可选：转完删掉 R2 里的源文件
   R2_DELETE_AFTER = 'true',
-  // R2 凭据（用于删除，可选）
+  // R2 凭据（合并模式必需，单文件模式只用于清理）
   R2_ACCOUNT_ID = '',
   R2_ACCESS_KEY_ID = '',
   R2_SECRET_ACCESS_KEY = '',
@@ -128,6 +129,83 @@ async function download(url, dest) {
   return written;
 }
 
+/**
+ * 从 R2 拉一个对象到本地。
+ *
+ * 用预签名 URL 走普通 HTTPS GET，不实现 S3 的 GET 签名 ——
+ * 预签名只需要在 URL 上算一次，比在 headers 里签简单，也不会因为
+ * 多了几个头（content-length 之类）而签名不匹配。
+ *
+ * 有效期给足 30 分钟：一场 3 小时直播有 36 个 5 分钟分段，
+ * 逐个下载可能要十几分钟，太短会在中途过期。
+ */
+async function downloadFromR2(key, dest) {
+  const url = presignR2Get(key, 30 * 60);
+  return download(url, dest);
+}
+
+/**
+ * 生成 R2 的预签名 GET URL。
+ *
+ * 和 src/r2.js 里的 presignGet 是同一套 SigV4 逻辑，但那个文件依赖
+ * 项目的 config.js（需要 DATA_DIR 等环境变量），Actions 里不想为了
+ * 一个签名把整个 config 拖进来，所以这里独立实现一份。
+ */
+function presignR2Get(key, expiresSec) {
+  const endpoint = (R2_ENDPOINT || `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`).replace(
+    /\/+$/,
+    '',
+  );
+  const host = new URL(endpoint).host;
+  const region = 'auto';
+
+  const enc = (s) =>
+    [...String(s)]
+      .map((ch) =>
+        /[A-Za-z0-9_.~-]/.test(ch)
+          ? ch
+          : [...Buffer.from(ch, 'utf8')]
+              .map((b) => '%' + b.toString(16).toUpperCase().padStart(2, '0'))
+              .join(''),
+      )
+      .join('');
+  const sha = (d) => crypto.createHash('sha256').update(d).digest('hex');
+  const hmac = (k, d) => crypto.createHmac('sha256', k).update(d).digest();
+
+  const now = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+  const dateStamp = now.slice(0, 8);
+  const scope = `${dateStamp}/${region}/s3/aws4_request`;
+
+  const canonicalUri = '/' + enc(R2_BUCKET) + '/' + enc(key).replace(/%2F/g, '/');
+  // 查询参数必须按字典序排列，否则签名对不上
+  const query =
+    `X-Amz-Algorithm=AWS4-HMAC-SHA256` +
+    `&X-Amz-Credential=${enc(`${R2_ACCESS_KEY_ID}/${scope}`)}` +
+    `&X-Amz-Date=${now}` +
+    `&X-Amz-Expires=${expiresSec}` +
+    `&X-Amz-SignedHeaders=host`;
+
+  const canonicalHeaders = `host:${host}\n`;
+  const payloadHash = 'UNSIGNED-PAYLOAD';
+  const canonicalRequest = [
+    'GET',
+    canonicalUri,
+    query,
+    canonicalHeaders,
+    'host',
+    payloadHash,
+  ].join('\n');
+
+  const stringToSign = ['AWS4-HMAC-SHA256', now, scope, sha(canonicalRequest)].join('\n');
+  const kSigning = hmac(
+    hmac(hmac(hmac(`AWS4${R2_SECRET_ACCESS_KEY}`, dateStamp), region), 's3'),
+    'aws4_request',
+  );
+  const signature = crypto.createHmac('sha256', kSigning).update(stringToSign).digest('hex');
+
+  return `${endpoint}${canonicalUri}?${query}&X-Amz-Signature=${signature}`;
+}
+
 // ---------------- 2. 转码 ----------------
 async function transcode(input, output) {
   log(`转码：H.264 + AAC，CRF ${CRF}，preset ${PRESET}`);
@@ -161,6 +239,68 @@ async function transcode(input, output) {
   if (sz === 0) fail('转码输出是 0 字节');
   log(`转码完成：${humanSize(sz)}`);
   return sz;
+}
+
+// ---------------- 2b. 合并多段 + 转码 ----------------
+/**
+ * 把 N 个分段合并成一个 MP4 并转码。
+ *
+ * 两步走：
+ *   1) ffmpeg concat demuxer 把分段拼成一个 FLV（-c copy，不解码，很快）
+ *   2) 再对这个 FLV 做 H.264 + AAC 转码
+ *
+ * 为什么不一步到位（concat + 转码同时做）：
+ *   concat demuxer 配合 -c copy 只是重新封装，几乎不耗 CPU；
+ *   分成两步后，如果转码失败，合并好的中间文件还在，方便排查。
+ *   而且两步的日志更清晰，能看出是"拼接"还是"转码"出的问题。
+ */
+async function mergeAndTranscode(parts, workDir, output) {
+  if (parts.length === 1) {
+    // 只有一段，不用合并
+    return transcode(parts[0], output);
+  }
+
+  log(`合并 ${parts.length} 个分段…`);
+
+  /**
+   * concat demuxer 需要一个列表文件，每行 `file '路径'`。
+   *
+   * 路径里可能有单引号，ffmpeg 的写法是把 ' 转义成 '\''。
+   * 这里的分段名是我们自己生成的（part_0001.flv），不会有特殊字符，
+   * 但加上转义更稳妥 —— 万一以后文件名规则变了也不会出问题。
+   */
+  const listPath = path.join(workDir, 'concat.txt');
+  const listBody = parts
+    .map((p) => `file '${p.replace(/'/g, "'\\''")}'`)
+    .join('\n');
+  await fsp.writeFile(listPath, listBody + '\n', 'utf8');
+
+  const merged = path.join(workDir, 'merged.flv');
+  await run('ffmpeg', [
+    '-hide_banner',
+    '-loglevel', 'warning',
+    '-stats',
+    '-f', 'concat',
+    '-safe', '0',
+    '-i', listPath,
+    // 不解码，只重新封装
+    '-c', 'copy',
+    '-y',
+    merged,
+  ]);
+
+  const mergedSize = await sizeOf(merged);
+  if (mergedSize === 0) fail('合并输出是 0 字节');
+  log(`合并完成：${humanSize(mergedSize)}`);
+
+  // 合并完就把分段删掉，给转码腾出磁盘空间
+  // （runner 有 14GB，但一场 3 小时直播的分段加起来能到 1-2GB，
+  //   加上转码输出的中间文件，早点清更安全）
+  for (const p of parts) {
+    await fsp.rm(p, { force: true }).catch(() => {});
+  }
+
+  return transcode(merged, output);
 }
 
 // ---------------- 3. 上传 OpenList ----------------
@@ -362,37 +502,95 @@ function safeOutName(name) {
 
 // ---------------- 主流程 ----------------
 async function main() {
-  if (!SOURCE_URL) fail('缺少 SOURCE_URL');
   if (!OPENLIST_DIR) fail('缺少 OPENLIST_DIR');
+
+  /**
+   * 两种输入模式：
+   *   1) R2_KEYS —— 多个对象键，按顺序合并（直播分段走这条）
+   *   2) SOURCE_URL —— 单个预签名 URL（普通下载任务走这条）
+   *
+   * 直播改成「录完再合并」之后，一次调用要处理 N 个 5 分钟分段，
+   * 所以 keys 优先，source_url 作为单文件兜底。
+   */
+  const keys = String(R2_KEYS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (!keys.length && !SOURCE_URL) fail('缺少 R2_KEYS 或 SOURCE_URL');
+  if (keys.length && !R2_ACCOUNT_ID) fail('多段合并需要 R2 凭据（R2_ACCOUNT_ID 为空）');
 
   log('参数：', {
     out: OUT_NAME,
     crf: CRF,
     preset: PRESET,
     task: TASK_ID,
-    seg: SEG_INDEX,
+    mode: keys.length ? `合并 ${keys.length} 段` : '单文件',
     openlistDir: OPENLIST_DIR,
   });
 
   const workDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'cf-transcode-'));
-  // 输入后缀跟着 R2 键走：HLS 的 .ts、DASH 的 .mp4 也走这条链路
-  const inExt = path.extname(R2_KEY || '').toLowerCase() || '.flv';
-  const input = path.join(workDir, `input${inExt}`);
   const output = path.join(workDir, safeOutName(OUT_NAME));
+  const parts = [];
 
   try {
-    const srcSize = await download(SOURCE_URL, input);
-    const outSize = await transcode(input, output);
+    // ---------- 1. 把源文件都拉到本地 ----------
+    let srcSize = 0;
+    if (keys.length) {
+      for (let i = 0; i < keys.length; i++) {
+        const key = keys[i];
+        const ext = path.extname(key).toLowerCase() || '.flv';
+        const dest = path.join(workDir, `part_${String(i + 1).padStart(4, '0')}${ext}`);
+        log(`[${i + 1}/${keys.length}] 从 R2 拉取：${key}`);
+        const sz = await downloadFromR2(key, dest);
+        srcSize += sz;
+        parts.push(dest);
+      }
+      log(`全部拉取完成：${keys.length} 段，合计 ${humanSize(srcSize)}`);
+    } else {
+      const ext = path.extname(R2_KEY || '').toLowerCase() || '.flv';
+      const input = path.join(workDir, `input${ext}`);
+      srcSize = await download(SOURCE_URL, input);
+      parts.push(input);
+    }
+
+    // ---------- 2. 合并 + 转码 ----------
+    /**
+     * 为什么用 concat demuxer 而不是 filter_complex：
+     *
+     * concat demuxer 直接把多个 FLV 当同一路流拼接，不需要解码再编码，
+     * 内存占用恒定（不随总时长增长）。filter_complex 会把所有输入
+     * 同时打开，一场 3 小时直播有 36 个分段，很容易把 runner 的内存吃满。
+     *
+     * 前提是所有分段的编码参数一致 —— 这是成立的，因为都是同一个
+     * ffmpeg 进程用 -c copy 切出来的。
+     */
+    const outSize = await mergeAndTranscode(parts, workDir, output);
 
     const ratio = srcSize ? ((outSize / srcSize) * 100).toFixed(1) : '?';
     log(`体积：${humanSize(srcSize)} → ${humanSize(outSize)}（${ratio}%）`);
 
+    // ---------- 3. 上传 OpenList ----------
     const remote = await uploadToOpenList(output, OPENLIST_DIR);
-    await deleteFromR2(R2_KEY);
+
+    // ---------- 4. 清理 R2 ----------
+    // 逐段删，某段失败不影响其它段
+    for (const key of keys) {
+      await deleteFromR2(key);
+    }
 
     // 输出一段汇总，Actions 的 step summary 会抓这个
     console.log('\n=== TRANSCODE_RESULT ===');
-    console.log(JSON.stringify({ ok: true, remote, srcSize, outSize, task: TASK_ID, seg: SEG_INDEX }));
+    console.log(
+      JSON.stringify({
+        ok: true,
+        remote,
+        srcSize,
+        outSize,
+        task: TASK_ID,
+        segments: keys.length || 1,
+      }),
+    );
     console.log('=== END ===');
   } finally {
     await fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});

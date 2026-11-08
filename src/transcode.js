@@ -32,20 +32,22 @@ export class TranscodeError extends Error {
 export function buildTranscodeInputs({
   sourceUrl,
   r2Key,
+  r2Keys,
   outName,
   openlistDir,
   taskId,
   segIndex = 0,
 }) {
   return {
-    source_url: String(sourceUrl),
+    // 单文件模式用 source_url，多段合并模式用 r2_keys（逗号分隔）
+    source_url: String(sourceUrl || ''),
     r2_key: String(r2Key || ''),
+    r2_keys: Array.isArray(r2Keys) ? r2Keys.join(',') : String(r2Keys || ''),
     out_name: String(outName),
     openlist_dir: String(openlistDir),
     crf: String(config.transcode.crf),
     preset: String(config.transcode.preset),
     task_id: String(taskId),
-    seg_index: String(segIndex),
   };
 }
 

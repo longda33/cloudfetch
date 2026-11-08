@@ -252,26 +252,55 @@ app.post('/api/tasks/:id/cancel', (req, res) => {
 });
 
 /** 重试上传失败的分段 */
+/**
+ * 重传失败的分段。
+ *
+ * 立刻返回 202，不在这里等上传完成。
+ *
+ * 原因：一段 300MB 的直播分段传到 R2 要 1-3 分钟，而 Unikraft 的
+ * 网关有 60 秒硬超时 —— 之前同步等待，用户看到的是 504 Gateway
+ * Time-out，但后台其实传成功了，界面和事实完全对不上。
+ *
+ * 现在改成 fire-and-forget：接口秒回，进度靠 SSE 推（_log 和
+ * _emit 会推送每次分段的结果）。前端只要监听任务更新就行。
+ */
 app.post('/api/tasks/:id/retry-upload', async (req, res) => {
   try {
-    const r = await mgr.retryFailedSegments(req.params.id);
-    res.json({ ok: true, ...r });
+    // 先做同步校验：任务不存在 / 正在跑 / 没有失败分段，这些能立刻判断
+    const check = mgr.canRetryUpload(req.params.id);
+    if (!check.ok) return res.status(400).json({ error: check.error });
+
+    // 后台跑，不 await
+    mgr.retryFailedSegments(req.params.id).catch((e) => {
+      // 这里只记日志：任务对象可能已经被用户删了，没有地方回写状态
+      console.error(`[retry-upload] ${req.params.id} 失败：${e.message}`);
+    });
+
+    res.status(202).json({ ok: true, accepted: true, segments: check.count });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
 });
 
-/** 删除记录 */
-app.delete('/api/tasks/:id', (req, res) => {
-  const ok = mgr.remove(req.params.id);
-  if (!ok) return res.status(400).json({ error: '无法删除（任务进行中）' });
-  res.json({ ok: true });
+/** 删除记录（同时清掉磁盘目录） */
+app.delete('/api/tasks/:id', async (req, res) => {
+  try {
+    const ok = await mgr.remove(req.params.id);
+    if (!ok) return res.status(400).json({ error: '无法删除（任务进行中）' });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-/** 清空已结束 */
-app.post('/api/tasks/clear', (req, res) => {
-  const n = mgr.clearFinished();
-  res.json({ ok: true, removed: n });
+/** 清空已结束（同时清掉磁盘目录） */
+app.post('/api/tasks/clear', async (req, res) => {
+  try {
+    const n = await mgr.clearFinished();
+    res.json({ ok: true, removed: n });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 /** 探测链接类型（不下载） */

@@ -75,9 +75,26 @@ function fmtEta(s) {
 
 function fmtTime(ms) {
   if (!ms) return '—';
-  const d = new Date(ms);
-  const p = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  /**
+   * 固定按中国时区显示。
+   *
+   * 不能用 getFullYear()/getHours()：那些按**浏览器本地时区**算，
+   * 用户在 UTC 环境（云主机、远程桌面、系统时区没设）看到的
+   * 时间会差 8 小时，和后端日志对不上。
+   *
+   * Intl 的 timeZone 参数能强制指定时区，不受运行环境影响。
+   */
+  return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  })
+    .format(new Date(ms))
+    .replace(/\//g, '-');
 }
 
 function fmtDuration(sec) {
@@ -530,21 +547,26 @@ function updateLinkCount() {
   el.classList.toggle('show', n > 0);
 }
 
-async function addTasks(segment = true) {
+async function addTasks() {
   const text = $('#urlInput').value.trim();
   if (!text) return toast('请先粘贴链接', 'err');
 
   const upload = $('#uploadToggle').checked;
-  const btn = segment ? $('#btnAddSeg') : $('#btnAddWhole');
+  const btn = $('#btnAdd');
   const original = btn.innerHTML;
   btn.disabled = true;
   btn.textContent = '提交中…';
 
   try {
+    /**
+     * 只有一种下载模式了：直播按 5 分钟切段存 R2，结束后由 Actions
+     * 合并转码。segment 恒为 true —— 普通直链/HLS 本来就不走分段
+     * 逻辑（downloader 会自己判断），传 true 不影响它们。
+     */
     const res = await fetch('/api/tasks', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, upload, segment }),
+      body: JSON.stringify({ text, upload, segment: true }),
     });
     if (res.status === 401) { showLogin(); return; }
 
@@ -554,8 +576,7 @@ async function addTasks(segment = true) {
     $('#urlInput').value = '';
     updateLinkCount();
 
-    const modeName = segment ? '分段' : '全段';
-    let msg = `已添加 ${j.created.length} 个${modeName}任务`;
+    let msg = `已添加 ${j.created.length} 个任务`;
     if (j.errors?.length) msg += `，${j.errors.length} 个失败`;
     toast(msg, 'ok');
     for (const t of j.created) upsertTask(t);
@@ -891,9 +912,6 @@ $('#btnClear').addEventListener('click', async () => {
   renderAll();
   toast(`已清空 ${j.removed} 条`);
 });
-
-// 全段下载：整场录成单个文件
-$('#btnAddWhole').addEventListener('click', () => addTasks(false));
 
 $('#btnLogin').addEventListener('click', doLogin);
 $('#pwdInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });

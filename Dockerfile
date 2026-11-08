@@ -22,8 +22,23 @@ RUN apt-get update \
       curl \
       xz-utils \
       ffmpeg \
+      tzdata \
  && rm -rf /var/lib/apt/lists/* \
  && rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/locale/*
+
+# 时区固定为中国标准时间。
+#
+# 容器默认是 UTC，日志时间、OpenList 的日期目录（2026-11-08/）、
+# 前端显示的任务创建时间全都差 8 小时 —— 晚上 11 点录的东西会落到
+# 前一天的目录里，排查问题时也对不上时间。
+#
+# 同时设 TZ 环境变量和 /etc/localtime，双保险：
+#   - /etc/localtime 影响 libc 的 localtime()，也影响 ffmpeg 的日志
+#   - TZ 影响 Node 的 Intl / toLocaleString
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+ && echo $TZ > /etc/timezone \
+ && date
 
 # Node 20（官方二进制，比 nodesource 源体积可控）
 RUN set -eux; \
@@ -57,9 +72,20 @@ COPY public/ ./public/
 ENV PORT=8080
 ENV NODE_ENV=production
 
-# 分段时间 30 分钟（1800 秒）。
-# 敢用这么长是因为上传走分片协议，单段体积不受 CDN 单请求上限约束。
-ENV LIVE_SEGMENT_SECONDS=1800
+# 分段时间 5 分钟（300 秒）。
+#
+# 之前用 1800 秒，遇到过一次切段失效：直播源长时间不推关键帧，
+# ffmpeg 的 segment muxer 一直等不到切点，单段录了 94 分钟、
+# 933MB，直接把 1GiB 的持久卷撑满。
+#
+# 5 分钟一段后：
+#   - 正常情况单段约 50MB
+#   - 就算切段失效 3 倍，也只到 150MB，卷装得下
+#   - 每段上传完立刻删本地，峰值占用只有 1-2 段
+#
+# 分段不再逐段转码：录完后由 GitHub Actions 合并成一个 MP4 再传
+# OpenList，所以分段多也不会多消耗 Actions 分钟数。
+ENV LIVE_SEGMENT_SECONDS=300
 
 EXPOSE 8080
 
