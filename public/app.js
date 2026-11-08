@@ -168,9 +168,9 @@ function metricsHtml(t) {
       const per = t.segmentSeconds ? ` · 每段 ${Math.round(t.segmentSeconds / 60)} 分钟` : '';
       push('已录', `${t.segmentsDone} 段${per}`);
     }
-    // 直播录制中也可能已经有段传完了，这里也显示已传
-    if (t.live && t.segmentsUploaded) {
-      push('已传', `${t.segmentsUploaded} 段`, 'ok');
+    // 录制中段已经在往 R2 送，这里显示"已提交"
+    if (t.live && t.segmentsSubmitted) {
+      push('已提交', `${t.segmentsSubmitted} 段`, 'ok');
     }
   }
 
@@ -184,26 +184,34 @@ function metricsHtml(t) {
 
   /**
    * 直播的分段统计统一在这里输出，避免上面几处重复。
-   * 口径固定为「分段 N 段，已传 M 段」——历史记录页面用同一套，
-   * 两边数字不会再对不上。
+   *
+   * 口径必须区分三种状态，否则用户会以为"已完成"就是文件已经在网盘里：
+   *   已落地 —— MP4 确认出现在 OpenList（segmentsUploaded）
+   *   转码中 —— 已提交 Actions，等 MP4 落地
+   *   失败   —— 提交失败或转码超时，可重试
    */
   if (t.live && (t.segmentCount || t.segmentsDone)) {
     const total = t.segmentCount || t.segmentsDone || 0;
     const up = t.segmentsUploaded || 0;
-    const bad = (t.failedSegments || []).length;
+    const pending = (t.segments || []).filter((s) => s.mp4State === 'pending').length;
+    const bad = (t.failedSegments || []).length +
+      (t.segments || []).filter((s) => s.mp4State === 'failed').length;
     if (t.status === 'done') {
       let s = `分段 ${total} 段`;
-      if (total) s += `，已传 ${up} 段`;
+      if (total) s += `，已落地 ${up} 段`;
+      if (pending) s += `，转码中 ${pending} 段`;
       if (bad) s += `，${bad} 段失败`;
-      push('录制', s);
+      push('录制', s, pending ? 'ok' : '');
     } else if (t.status === 'uploading' || t.status === 'downloading') {
-      // 进行中已在上面显示过「已传」，这里只补总数
+      // 进行中已在上面显示过「已提交」，这里只补总数
       push('分段', `${total} 段`);
     }
   }
 
   if (t.remotePath) {
     out.push(`<span class="metric remote" title="${esc(t.remotePath)}">${icon('cloud', 'ic ic-sm')}<b>${esc(t.remotePath)}</b></span>`);
+  } else if (t.mp4State === 'pending' && t.expectedPath) {
+    out.push(`<span class="metric" title="${esc(t.expectedPath)}">${icon('cloud', 'ic ic-sm')}<b>MP4 生成中…</b></span>`);
   }
   if (t.error) {
     out.push(`<span class="metric err">${icon('alert', 'ic ic-sm')}<b>${esc(t.error)}</b></span>`);
@@ -600,7 +608,7 @@ async function refreshChips() {
     state.limits = h.limits || {};
 
     setPill('#chipR2',
-      h.openlist ? 'on' : 'warn',
+      h.transcode?.enabled ? 'on' : 'warn',
       h.transcode?.enabled ? 'R2 转码已启用' : 'R2 转码未配置');
 
     if (state.limits.maxConcurrent != null) {
@@ -669,11 +677,29 @@ const hist = { page: 1, pageSize: 20, q: '', status: '', pages: 1 };
 
 function renderHistItem(h) {
   const km = h.live ? { icon: 'radio' } : kindMeta(h);
+
+  // 转码状态先算出来：徽章、meta、重试按钮都要用
+  const segs = h.segments || [];
+  const pendingMp4 =
+    h.transcodePending ?? segs.filter((s) => s.mp4State === 'pending').length;
+  const failedMp4 = h.transcodeFailed ?? segs.filter((s) => s.mp4State === 'failed').length;
+
   const badge = {
     done: `<span class="badge done">${icon('check', 'ic ic-xs')}完成</span>`,
     failed: `<span class="badge failed">${icon('x', 'ic ic-xs')}失败</span>`,
     canceled: `<span class="badge canceled">取消</span>`,
   }[h.status] || '';
+
+  /**
+   * 转码徽章。
+   * 没有它的话「完成」会被理解成"文件已经在网盘里"，
+   * 而实际上 MP4 可能还在 Actions 里跑。
+   */
+  const tcBadge = pendingMp4
+    ? '<span class="badge processing">转码中</span>'
+    : failedMp4
+      ? '<span class="badge failed">转码失败</span>'
+      : '';
 
   // 直播的模式标记：分段 / 全段
   const modeTag = h.live
@@ -687,29 +713,30 @@ function renderHistItem(h) {
   if (h.duration) meta.push(`<span>耗时 <b>${fmtDuration(h.duration)}</b></span>`);
 
   /**
-   * 待补传数量。
+   * 待处理数量。
    *
-   * 直播：缺的段 = 总数 - 已传数。不能只看 failedSegments —— 那个数组
-   * 只记「上传抛异常」的段，而实际有几种情况都不会进数组：
-   *   - 上传任务还在后台排队（异步上传，任务结束时可能没跑完）
-   *   - 用户中途停止，后面的段压根没触发上传
-   *   - 容器重启打断
-   * 这些段同样需要「重传」，所以用差值兜底。
+   * 直播：真正"没着落"的段 = 总数 - 已落地 - 转码中。
+   *   - 已落地：MP4 确认出现在 OpenList
+   *   - 转码中：已提交 Actions，正在等 MP4 落地（不算失败，不能催重试）
+   *   - 其余：提交失败 / 从没提交 / 容器重启打断 → 需要「重传」
    *
-   * 单文件：开了上传却没拿到 remotePath，就是没传成功。
+   * 单文件：转码中的单独提示，没提交成功的算未完成。
    */
   let missing = 0;
   if (h.live && h.segment !== false) {
     const total = h.segmentCount || 0;
     const up = h.segmentsUploaded || 0;
-    missing = Math.max(0, total - up);
+    missing = Math.max(0, total - up - pendingMp4);
     let seg = `<span>分段 <b>${total}</b> 段`;
     if (total) {
-      seg += `，已传 <b class="${up === total ? 'ok' : ''}">${up}</b> 段`;
-      if (missing) seg += `，<b class="err">${missing}</b> 段未传`;
+      seg += `，已落地 <b class="${up === total ? 'ok' : ''}">${up}</b> 段`;
+      if (pendingMp4) seg += `，<b class="ok">${pendingMp4}</b> 段转码中`;
+      if (missing) seg += `，<b class="err">${missing}</b> 段未完成`;
     }
     seg += '</span>';
     meta.push(seg);
+  } else if (h.mp4State === 'pending') {
+    meta.push('<span class="ok">MP4 生成中，稍后自动出现在 OpenList</span>');
   } else if (h.upload && !h.remotePath && (h.size || 0) > 0) {
     missing = 1;
     meta.push('<span class="err">上传未完成</span>');
@@ -729,10 +756,17 @@ function renderHistItem(h) {
          title="在 OpenList 打开 ${esc(dir)}">${icon('inbox', 'ic ic-xs')}文件夹</button>`
     : '';
 
-  // 有缺段就显示「重传」，用差值而不是只看 failedSegments
-  const retryUpBtn = missing
+  /**
+   * 有"没着落"的段就显示「重传」。
+   *
+   * 注意不能用 missing + failedMp4：failed 的段本来就落在 missing 里
+   * （它既没有 remotePath 也不在 pending），再减一次会得到 2 倍的数字，
+   * 曾经显示成「重传 4」而实际只有 2 段。failedMp4 只用于徽章。
+   */
+  const needRetry = missing;
+  const retryUpBtn = needRetry
     ? `<button class="btn btn-warn btn-xs" data-hact="retryup" data-hid="${h.id}"
-         title="${missing} 段未上传，点击重试">${icon('refresh', 'ic ic-xs')}重传 ${missing}</button>`
+         title="${needRetry} 段未完成，点击重试">${icon('refresh', 'ic ic-xs')}重传 ${needRetry}</button>`
     : '';
 
   return `
@@ -741,7 +775,7 @@ function renderHistItem(h) {
     <div class="hist-body">
       <div class="hist-title">
         <span title="${esc(h.filename || h.url)}">${esc(h.filename || '(未命名)')}</span>
-        ${badge}${modeTag}
+        ${badge}${modeTag}${tcBadge}
       </div>
       <div class="hist-url" title="${esc(h.url)}">${esc(h.url)}</div>
       <div class="hist-meta">${meta.join('')}</div>
@@ -940,7 +974,7 @@ document.addEventListener('click', async (e) => {
       const r = await fetch(`/api/tasks/${hid}/retry-upload`, { method: 'POST' });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error);
-      toast(`重传完成：成功 ${j.ok} 段${j.failed ? `，仍失败 ${j.failed} 段` : ''}`, j.failed ? 'warn' : 'ok');
+      toast(`已提交 ${j.submitted} 段${j.failed ? `，仍失败 ${j.failed} 段` : ''}`, j.failed ? 'warn' : 'ok');
       loadHistory();
     } catch (e) {
       toast(e.message, 'err');

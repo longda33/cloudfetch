@@ -17,6 +17,8 @@ import { config } from './config.js';
 
 const EMPTY_SHA256 = crypto.createHash('sha256').update('').digest('hex');
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 /** RFC3986 编码：S3 要求除 unreserved 字符外全部百分号编码 */
 function uriEncode(str, encodeSlash = true) {
   let out = '';
@@ -69,10 +71,6 @@ export class R2Client {
     this.region = 'auto'; // R2 固定用 auto
   }
 
-  get configured() {
-    return Boolean(this.accessKeyId && this.secretAccessKey && this.bucket && this.endpoint);
-  }
-
   /** 计算 SigV4 签名，返回可直接用于 fetch 的 headers */
   _sign({ method, key, query = '', payloadHash, headers = {} }) {
     const { amzDate, dateStamp } = amzDates();
@@ -89,19 +87,26 @@ export class R2Client {
     const canonicalUri = '/' + uriEncode(this.bucket, false) + '/' + uriEncode(key, false);
     const canonicalQuery = query;
 
-    // 参与签名的最小头集合
-    const signedHeaderMap = {
+    /**
+     * 参与签名的最小头集合。
+     *
+     * 统一转小写：SigV4 的 canonicalHeaders 用小写键，之前只在取 key 时
+     * 转小写、却用原大小写建对象，调用方一旦传 `Content-Type`（大写 C）
+     * 就会取到 undefined → 空值参与签名 → SignatureDoesNotMatch，
+     * 而且报错完全指不出是头名大小写的问题。
+     */
+    const signedHeaderMap = {};
+    const rawHeaders = {
       host: this.host,
       'x-amz-content-sha256': payloadHash,
       'x-amz-date': amzDate,
       ...headers,
     };
-    const sortedKeys = Object.keys(signedHeaderMap)
-      .map((k) => k.toLowerCase())
-      .sort();
-    const canonicalHeaders = sortedKeys
-      .map((k) => `${k}:${String(signedHeaderMap[k] ?? '').trim()}\n`)
-      .join('');
+    for (const [k, v] of Object.entries(rawHeaders)) {
+      signedHeaderMap[k.toLowerCase()] = String(v ?? '').trim();
+    }
+    const sortedKeys = Object.keys(signedHeaderMap).sort();
+    const canonicalHeaders = sortedKeys.map((k) => `${k}:${signedHeaderMap[k]}\n`).join('');
     const signedHeaders = sortedKeys.join(';');
 
     const canonicalRequest = [
@@ -137,11 +142,38 @@ export class R2Client {
     return `${this.endpoint}/${this.bucket}/${uriEncode(key, false)}${query ? '?' + query : ''}`;
   }
 
-  /** 上传本地文件。大文件走单请求（R2 单次 PUT 上限 5GB） */
+  /**
+   * 上传本地文件（R2 单次 PUT 上限 5GB）。
+   *
+   * 带超时和重试：R2 这条链路没有 OpenList 那套 uploadRetries，
+   * 一次网络抖动就会让整段进 failedSegments、本地文件被迫留着。
+   * 5xx / 429 / 网络错误重试，4xx（签名错、桶不存在）重试没意义，直接抛。
+   */
   async putFile(localPath, key, { contentType, onProgress, signal } = {}) {
     const st = await fsp.stat(localPath);
     const size = st.size;
+    const attempts = Math.max(1, config.r2.uploadRetries);
 
+    let lastErr;
+    for (let i = 1; i <= attempts; i++) {
+      if (signal?.aborted) throw new R2Error('已取消', 0);
+      try {
+        await this._putOnce(localPath, key, size, contentType, signal);
+        onProgress?.(size, size);
+        return { size, key };
+      } catch (e) {
+        lastErr = e;
+        if (signal?.aborted) throw e;
+        const retryable = !e.status || e.status === 429 || e.status >= 500;
+        if (!retryable || i >= attempts) break;
+        await sleep(1000 * Math.pow(2, i - 1));
+      }
+    }
+    throw lastErr;
+  }
+
+  /** 单次上传尝试 */
+  async _putOnce(localPath, key, size, contentType, signal) {
     /**
      * 大文件不整块读进内存。
      *
@@ -161,45 +193,34 @@ export class R2Client {
       },
     });
 
-    const res = await fetch(this._url(key), {
-      method: 'PUT',
-      headers,
-      body: Readable.toWeb(fs.createReadStream(localPath)),
-      duplex: 'half',
-      signal,
-    });
+    // 单次尝试也要有超时：R2 半死不活时 fetch 会一直挂着
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), config.r2.timeoutMs);
+    const onAbort = () => ac.abort();
+    signal?.addEventListener('abort', onAbort, { once: true });
 
-    if (!res.ok) {
-      const txt = await res.text().catch(() => '');
-      throw new R2Error(`R2 PUT 失败：HTTP ${res.status} ${txt.slice(0, 300)}`, res.status);
-    }
-
-    onProgress?.(size, size);
-    return { size, key };
-  }
-
-  /** 下载到本地文件。返回 { size } */
-  async getFile(key, destPath, { onProgress, signal } = {}) {
-    const headers = this._sign({ method: 'GET', key, payloadHash: EMPTY_SHA256 });
-    const res = await fetch(this._url(key), { method: 'GET', headers, signal });
-    if (!res.ok) {
-      const txt = await res.text().catch(() => '');
-      throw new R2Error(`R2 GET 失败：HTTP ${res.status} ${txt.slice(0, 300)}`, res.status);
-    }
-
-    const total = Number(res.headers.get('content-length')) || 0;
-    let written = 0;
-    const ws = fs.createWriteStream(destPath);
+    const stream = fs.createReadStream(localPath);
     try {
-      for await (const chunk of res.body) {
-        if (!ws.write(chunk)) await new Promise((r) => ws.once('drain', r));
-        written += chunk.length;
-        onProgress?.(written, total);
+      const res = await fetch(this._url(key), {
+        method: 'PUT',
+        headers,
+        body: Readable.toWeb(stream),
+        duplex: 'half',
+        signal: ac.signal,
+      });
+
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        throw new R2Error(`R2 PUT 失败：HTTP ${res.status} ${txt.slice(0, 300)}`, res.status);
       }
+      // 读完响应体，避免连接被复用池丢弃
+      await res.arrayBuffer().catch(() => {});
     } finally {
-      await new Promise((r) => ws.end(r));
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      // 失败/超时时必须销毁读流，否则 fd 泄漏
+      stream.destroy();
     }
-    return { size: written };
   }
 
   async deleteObject(key) {

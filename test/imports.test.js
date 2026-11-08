@@ -45,20 +45,31 @@ test('所有核心模块能被加载，导出符合预期', async (t) => {
   const r2 = await import('../src/r2.js');
   assert.equal(typeof r2.getR2, 'function');
   const client = r2.getR2();
-  for (const m of ['putFile', 'getFile', 'deleteObject', 'headObject', 'presignGet']) {
+  for (const m of ['putFile', 'deleteObject', 'headObject', 'presignGet']) {
     assert.equal(typeof client[m], 'function', `R2Client 缺少 ${m}`);
   }
 
-  // transcode：导出两个提交函数
+  // transcode：组装 inputs + 触发
   const tc = await import('../src/transcode.js');
-  assert.equal(typeof tc.submitForTranscode, 'function');
-  assert.equal(typeof tc.submitTaskArtifacts, 'function');
+  assert.equal(typeof tc.buildTranscodeInputs, 'function');
   assert.equal(typeof tc.dispatchTranscode, 'function');
+  // inputs 的所有值都必须是字符串，否则 GitHub 直接 422
+  const inputs = tc.buildTranscodeInputs({
+    sourceUrl: 'https://example.com/x',
+    r2Key: 'k',
+    outName: 'a.mp4',
+    openlistDir: '/dir',
+    taskId: 't1',
+    segIndex: 3,
+  });
+  for (const [k, v] of Object.entries(inputs)) {
+    assert.equal(typeof v, 'string', `input ${k} 必须是字符串`);
+  }
 
-  // tasks：TaskManager 上有转码提交方法
+  // tasks：转码确认轮询器存在（提交后靠它把任务推进到已完成）
   const tasks = await import('../src/tasks.js');
   const mgr = tasks.getTaskManager();
-  assert.equal(typeof mgr._submitTranscodes, 'function', 'TaskManager 缺少 _submitTranscodes');
+  assert.equal(typeof mgr._confirmTranscodes, 'function', 'TaskManager 缺少 _confirmTranscodes');
   assert.equal(typeof mgr._remoteDirOf, 'function', 'TaskManager 缺少 _remoteDirOf');
 
   // openlist：上传相关方法

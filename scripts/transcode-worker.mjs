@@ -88,7 +88,14 @@ const humanSize = (n) => {
 // ---------------- 1. 下载 ----------------
 async function download(url, dest) {
   log(`下载源文件 → ${dest}`);
-  const res = await fetch(url, { redirect: 'follow' });
+  /**
+   * 必须带超时：预签名 URL 过期、R2 半死不活时，fetch 会一直挂着，
+   * 直到 job 的 timeout-minutes(120) 才结束，白烧两小时 runner。
+   */
+  const res = await fetch(url, {
+    redirect: 'follow',
+    signal: AbortSignal.timeout(30 * 60 * 1000),
+  });
   if (!res.ok) fail(`下载失败：HTTP ${res.status} ${res.statusText}`);
 
   const total = Number(res.headers.get('content-length')) || 0;
@@ -113,6 +120,10 @@ async function download(url, dest) {
   }
 
   if (written === 0) fail('下载到 0 字节，源文件可能是空的');
+  // 截断的文件会让 ffmpeg 转出半截视频，宁可直接失败
+  if (total && written !== total) {
+    fail(`下载不完整：${humanSize(written)} / ${humanSize(total)}`);
+  }
   log(`下载完成：${humanSize(written)}`);
   return written;
 }
@@ -218,8 +229,18 @@ async function uploadToOpenList(localPath, remoteDir) {
     for (let i = 0; i < totalChunks; i++) {
       const start = i * chunkSize;
       const len = Math.min(chunkSize, total - start);
+      /**
+       * 必须循环读满：fh.read 允许短读，之前只调一次，
+       * 短读时 Buffer 尾部是零填充，会把坏数据传到 OpenList，
+       * 而且分片长度和 Content-Length 对不上。
+       */
       const buf = Buffer.alloc(len);
-      await fh.read(buf, 0, len, start);
+      let filled = 0;
+      while (filled < len) {
+        const { bytesRead } = await fh.read(buf, filled, len - filled, start + filled);
+        if (bytesRead === 0) fail(`读取本地文件不完整：第 ${i + 1} 片 ${filled}/${len} 字节`);
+        filled += bytesRead;
+      }
 
       // 分片可能因为网络抖动失败，重试 3 次
       let ok = false;
@@ -323,6 +344,22 @@ async function deleteFromR2(key) {
   else log(`清理 R2 失败：HTTP ${res.status}（不影响转码结果）`);
 }
 
+/**
+ * 输出文件名消毒。
+ *
+ * 不能只允许 \w：那样中文名会被打成「____.mp4」，而主程序的
+ * sanitizeFilename 是保留中文的，两边对不上，网盘里全是下划线。
+ * 这里先取 basename 防路径穿越，再只去掉各系统真正非法的字符。
+ */
+function safeOutName(name) {
+  const base = path.basename(String(name || 'output.mp4'));
+  const cleaned = base
+    .replace(/[\\/:*?"<>|\x00-\x1f]/g, '_')
+    .replace(/^\.+/, '')
+    .trim();
+  return cleaned || 'output.mp4';
+}
+
 // ---------------- 主流程 ----------------
 async function main() {
   if (!SOURCE_URL) fail('缺少 SOURCE_URL');
@@ -338,9 +375,10 @@ async function main() {
   });
 
   const workDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'cf-transcode-'));
-  // 输入保持 .flv 后缀，ffmpeg 靠后缀和探测双重判断
-  const input = path.join(workDir, 'input.flv');
-  const output = path.join(workDir, OUT_NAME.replace(/[^\w.\-]/g, '_') || 'output.mp4');
+  // 输入后缀跟着 R2 键走：HLS 的 .ts、DASH 的 .mp4 也走这条链路
+  const inExt = path.extname(R2_KEY || '').toLowerCase() || '.flv';
+  const input = path.join(workDir, `input${inExt}`);
+  const output = path.join(workDir, safeOutName(OUT_NAME));
 
   try {
     const srcSize = await download(SOURCE_URL, input);

@@ -173,6 +173,10 @@ export const config = {
     prefix: (env.R2_PREFIX || 'cloudfetch').replace(/^\/+|\/+$/g, ''),
     /** 预签名 URL 有效期（秒）。Actions 拿到后立刻下载，1 小时够用 */
     presignExpires: num(env.R2_PRESIGN_EXPIRES, 3600),
+    /** 单次上传的重试次数。R2 侧没有 OpenList 那套重试，必须自己有 */
+    uploadRetries: num(env.R2_UPLOAD_RETRIES, 3),
+    /** 单次上传的超时（毫秒）。500MB 段在 1Mbps 上要 1 小时，给足余量 */
+    timeoutMs: num(env.R2_TIMEOUT, 60 * 60 * 1000),
   },
 
   // ---------- GitHub Actions 转码 ----------
@@ -197,6 +201,18 @@ export const config = {
     crf: num(env.TRANSCODE_CRF, 23),
     /** 编码预设。veryfast 在 4 核上速度/体积比最合适 */
     preset: env.TRANSCODE_PRESET || 'veryfast',
+    /**
+     * 转码确认轮询间隔（毫秒）。
+     *
+     * 提交转码只是"排上队"，MP4 真正出现在 OpenList 才算完成。
+     * 服务端定期去 OpenList 查一下，查到就把任务从"转码中"推进到"已完成"。
+     */
+    pollIntervalMs: num(env.TRANSCODE_POLL_INTERVAL, 45000),
+    /**
+     * 转码超时（毫秒）。超过这个时间还没在 OpenList 看到 MP4，
+     * 判定为失败，前端给出「重试」入口（从 R2 源文件重新触发，不用重录）。
+     */
+    timeoutMs: num(env.TRANSCODE_TIMEOUT, 90 * 60 * 1000),
   },
 
   // ---------- 其他 ----------
@@ -208,16 +224,21 @@ export const config = {
   taskRetention: num(env.TASK_RETENTION, 24 * 60 * 60 * 1000),
 };
 
-/** 转码链路是否完整可用（R2 + GitHub 都配好才启用） */
+/**
+ * 转码链路是否完整可用（R2 + GitHub 都配好才启用）。
+ *
+ * accountId 只在「没给自定义 endpoint」时才是必需的：
+ * MinIO / B2 这类服务只需要 endpoint，没有 R2 的 accountId 概念。
+ */
 export function transcodeConfigured() {
   const r = config.r2;
   const t = config.transcode;
   return Boolean(
     t.enabled &&
-      r.accountId &&
       r.accessKeyId &&
       r.secretAccessKey &&
       r.bucket &&
+      (r.endpoint || r.accountId) &&
       t.repo &&
       t.token,
   );
@@ -248,5 +269,17 @@ export function printConfig() {
     `  面板密码     : ${config.auth.password ? '已设置' : '(未设置 → 拒绝所有访问，请配置 PANEL_PASSWORD)'}`,
   );
   console.log(`  会话密钥     : ${env.SESSION_SECRET ? '来自 SESSION_SECRET' : '随机生成（重启后需重新登录）'}`);
+  const r2 = config.r2;
+  const tc = config.transcode;
+  console.log(
+    `  R2 中转      : ${r2.bucket ? `${r2.bucket} @ ${r2.endpoint || r2.accountId}` : '(未配置)'}`,
+  );
+  console.log(
+    `  转码链路     : ${
+      transcodeConfigured()
+        ? `已启用（${tc.repo} / ${tc.workflow}，CRF ${tc.crf}，${tc.preset}）`
+        : '(未启用，FLV 将直接传 OpenList)'
+    }`,
+  );
   console.log('─'.repeat(58));
 }

@@ -22,14 +22,20 @@
 
 ```
 Unikraft 录制 FLV
-   ↓ 上传 OpenList（原有逻辑，保证有原始文件可看）
-   ↓ 同时 PUT 到 Cloudflare R2
+   ↓ PUT 到 Cloudflare R2（转码开启时不再往 OpenList 传原始 FLV）
    ↓ workflow_dispatch 触发 GitHub Actions（只传预签名 URL，不传文件）
 GitHub Actions（ubuntu-latest，4 核）
    ↓ 从 R2 下载 → ffmpeg 转 H.264 + AAC CRF23 → faststart
    ↓ 分片上传 MP4 到 OpenList
-   ↓ 删掉 R2 里的源文件
+   ↓ 成功后才删掉 R2 里的源文件（失败保留，供重试）
+Unikraft 定期轮询 OpenList
+   ↓ 真的看到 MP4 才把任务标成「已完成」
 ```
+
+**为什么要轮询确认**：`workflow_dispatch` 返回 204 只代表"已排队"。如果直接当成完成，
+Actions 失败时就会出现「任务显示已完成、本地已删、网盘里没有文件」的假成功。
+现在只有确认 MP4 落地才写 `remotePath`，超时（默认 90 分钟）则标记「转码失败」，
+历史记录里可以直接点「重传」——重试复用 R2 里的源文件，不需要重新录制。
 
 **为什么不在 Unikraft 上转**：实例只有 1 vCPU，转 30 分钟 1080p 要跑半小时以上，
 而且转码期间录制会被拖慢。GitHub Actions 免费给 4 核，公开仓库分钟数无限。

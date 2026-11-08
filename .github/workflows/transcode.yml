@@ -54,6 +54,9 @@ jobs:
   transcode:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # 这个 job 只需要读代码，不需要写仓库；显式收敛 GITHUB_TOKEN 权限
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
@@ -61,6 +64,26 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
+
+      # 输入来自服务端，但 workflow 也能被有仓库权限的人手动触发，
+      # 所以对目标目录做一次格式校验：必须是绝对路径且不含 ..
+      - name: 校验参数
+        env:
+          OPENLIST_DIR: ${{ inputs.openlist_dir }}
+          OUT_NAME: ${{ inputs.out_name }}
+        run: |
+          set -euo pipefail
+          case "$OPENLIST_DIR" in
+            /*) ;;
+            *) echo "::error::openlist_dir 必须是绝对路径，收到：$OPENLIST_DIR"; exit 1 ;;
+          esac
+          case "$OPENLIST_DIR" in
+            *..*) echo "::error::openlist_dir 不能包含 .."; exit 1 ;;
+          esac
+          case "$OUT_NAME" in
+            */*|*..*) echo "::error::out_name 不能包含路径分隔符"; exit 1 ;;
+          esac
+          echo "参数校验通过：$OPENLIST_DIR / $OUT_NAME"
 
       # ubuntu-latest 默认不带 ffmpeg，必须自己装。
       # apt 源里的 ffmpeg 已编译进 libx264 和 aac，够用。

@@ -903,6 +903,15 @@ body[data-view="history"] .hero { display: none; }
 .badge.mode { background: rgba(168,85,247,.16); color: #d8b4fe; font-weight: 600; }
 .badge.live { background: rgba(168, 85, 247, .14); color: #c084fc; }
 
+/**
+ * 转码中：用强调色（蓝），和「分段」的紫色区分开。
+ * 之前复用了 .badge.mode，两个徽章相邻时都是紫色，扫一眼分不清
+ * "这是分段模式"还是"还在转码"。
+ */
+.badge.processing { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+/* 浅色主题下 --accent 偏亮，压深一档保证 ≥4.5:1 */
+html[data-theme="light"] .badge.processing { color: #1d4ed8; }
+
 .pager {
   display: flex;
   align-items: center;

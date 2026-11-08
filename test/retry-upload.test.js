@@ -132,7 +132,7 @@ test('重传：本地文件不存在时明确报错', async () => {
   mgr.tasks.set(task.id, task);
 
   const r = await mgr.retryFailedSegments(task.id);
-  assert.equal(r.ok, 0, '文件不在时不应该有成功数');
+  assert.equal(r.submitted, 0, '文件不在时不应该有成功数');
   assert.equal(r.failed, 1, '应该报一条失败');
   assert.match(task.failedSegments[0].error, /本地文件已不存在/);
 });
