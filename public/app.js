@@ -37,6 +37,14 @@ const state = {
   authRequired: false,
   limits: {},
   histTotal: 0,
+  /**
+   * 最近一次加载的历史记录条目。
+   *
+   * 「今日完成」需要跨会话统计：服务重启后内存里的任务没了，
+   * 但历史记录还在 OpenList 上。这里缓存一份供 updateStats 用。
+   * 只保留最近加载的那一页 —— 统计今日完成够用了。
+   */
+  histItems: [],
   health: null,
 };
 
@@ -422,16 +430,63 @@ function upsertTask(t) {
   updateTabCounts();
 }
 
+/**
+ * 判断某个时间戳是不是「今天」（按中国时区）。
+ *
+ * 不能用 `new Date().toDateString()` 比较：那按浏览器本地时区算，
+ * 用户在 UTC 环境（云主机/远程桌面）时，"今天"会差 8 小时。
+ * 统一转成 YYYY-MM-DD 字符串比较，且两边都用 Asia/Shanghai。
+ */
+function ymdCN(ms) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date(ms));
+}
+
+function isTodayCN(ms) {
+  if (!ms) return false;
+  return ymdCN(ms) === ymdCN(Date.now());
+}
+
 function updateStats() {
   const tasks = [...state.tasks.values()];
   const running = tasks.filter((t) => RUNNING.includes(t.status));
-  const done = tasks.filter((t) => t.status === 'done');
   const speed = running.reduce((a, t) => a + (t.speed || 0), 0);
 
   $('#statRunning').textContent = running.length;
   $('#statSpeed').textContent = speed > 0 ? fmtSpeed(speed) : '—';
   $('#statSpeedSub').textContent = running.length ? `${running.length} 个任务在跑` : '空闲';
-  $('#statDone').textContent = done.length;
+
+  /**
+   * 「今日完成」统计今天真正结束的任务数。
+   *
+   * 数据来源有两个，必须合并去重：
+   *   1) 内存里的任务（state.tasks）—— 本次会话的
+   *   2) 历史记录（state.histItems）—— 重启后从 OpenList 恢复的
+   *
+   * 之前只数内存里的，重启一次就归零了。
+   * 用 id 去重：同一个任务可能既在内存又在历史里。
+   */
+  const doneIds = new Set();
+  for (const t of tasks) {
+    if (t.status === 'done' && isTodayCN(t.finishedAt || t.createdAt)) {
+      doneIds.add(t.id);
+    }
+  }
+  for (const h of state.histItems || []) {
+    if (h.status === 'done' && isTodayCN(h.finishedAt || h.createdAt)) {
+      doneIds.add(h.id);
+    }
+  }
+
+  const todayDone = doneIds.size;
+  $('#statDone').textContent = todayDone;
+  $('#statDoneSub').textContent = todayDone
+    ? `今天 ${todayDone} 个任务`
+    : '今天还没有完成任务';
 }
 
 function updateTabCounts() {
@@ -635,9 +690,10 @@ async function refreshChips() {
     if (state.limits.maxConcurrent != null) {
       $('#statRunningSub').textContent = `并发上限 ${state.limits.maxConcurrent}`;
     }
-    if (state.limits.maxFileSizeText) {
-      $('#statDoneSub').textContent = `单文件上限 ${state.limits.maxFileSizeText}`;
-    }
+    // 注意：不要再写 statDoneSub。
+    // 那个位置现在显示「今日完成」的文案，由 updateStats() 维护。
+    // 之前这里会把「单文件上限 20.00 GB」覆盖上去，
+    // 刷新 health 之后就看不到今日统计了。
   } catch { /* 静默 */ }
 
   try {
@@ -833,6 +889,9 @@ async function loadHistory() {
     const d = await r.json();
     hist.pages = d.pages;
     state.histTotal = d.total;
+    // 缓存下来供「今日完成」统计用
+    state.histItems = d.items || [];
+    updateStats();
 
     if (!d.items.length) {
       el.innerHTML = `
