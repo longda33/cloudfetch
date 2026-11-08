@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { config, openlistConfigured, printConfig, transcodeConfigured } from './config.js';
 import { getTaskManager } from './tasks.js';
 import { getOpenList } from './openlist.js';
+import { getR2 } from './r2.js';
 import { getHistoryStore } from './history.js';
 import { detectKind, humanSize } from './util/links.js';
 import {
@@ -341,6 +342,45 @@ app.post('/api/probe', (req, res) => {
   const { url } = req.body || {};
   if (!url) return res.status(400).json({ error: '缺少 url' });
   res.json({ url, kind: detectKind(url) });
+});
+
+/**
+ * 后端服务连通性（给右上角的状态灯用）。
+ *
+ * 和 /api/health 的区别：
+ *   health 说的是「配置了没有」（读环境变量，不发网络请求，秒回）
+ *   这个说的是「**现在能不能用**」（真发请求，慢，可能失败）
+ *
+ * 两者都要，因为「配置了但服务挂了」和「没配置」是完全不同的问题，
+ * 前端要能区分。之前只有一个 enabled 字段，服务挂掉照样显示绿色。
+ *
+ * R2 和 OpenList 并发探测，任何一个慢不拖累另一个。
+ * 结果不缓存 —— 状态灯本来就是要反映当下的真实状态，
+ * 缓存 30 秒意味着故障期间还会显示 30 秒绿色。
+ */
+app.get('/api/status', async (req, res) => {
+  const [r2, openlist] = await Promise.all([
+    (async () => {
+      try {
+        return await getR2().ping({ prefix: config.r2.prefix });
+      } catch (e) {
+        return { ok: false, reason: e.message };
+      }
+    })(),
+    (async () => {
+      try {
+        return await getOpenList().check();
+      } catch (e) {
+        return { ok: false, reason: e.message };
+      }
+    })(),
+  ]);
+
+  res.json({
+    r2: { ok: Boolean(r2.ok), reason: r2.reason || '', ms: r2.ms || 0, bucket: r2.bucket || '' },
+    openlist: { ok: Boolean(openlist.ok), reason: openlist.reason || '', user: openlist.user || '' },
+    checkedAt: Date.now(),
+  });
 });
 
 // ---------------- 历史记录 ----------------

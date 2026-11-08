@@ -724,10 +724,6 @@ async function refreshChips() {
     state.authRequired = h.authRequired;
     state.limits = h.limits || {};
 
-    setPill('#chipR2',
-      h.transcode?.enabled ? 'on' : 'warn',
-      h.transcode?.enabled ? 'R2 转码已启用' : 'R2 转码未配置');
-
     if (state.limits.maxConcurrent != null) {
       $('#statRunningSub').textContent = `并发上限 ${state.limits.maxConcurrent}`;
     }
@@ -736,6 +732,49 @@ async function refreshChips() {
     // 之前这里会把「单文件上限 20.00 GB」覆盖上去，
     // 刷新 health 之后就看不到今日统计了。
   } catch { /* 静默 */ }
+
+  /**
+   * 服务连通性探测。
+   *
+   * 和上面 /api/health 的分工：
+   *   health  = 配置了没有（读环境变量，秒回）
+   *   status  = 现在能不能用（真发请求到 R2 / OpenList）
+   *
+   * 之前右上角只显示 health 里的 transcode.enabled，
+   * 那只说明环境变量填了 —— R2 密钥过期、OpenList 挂了，
+   * 状态灯照样是绿的，等于没在监控。
+   *
+   * 这个请求会真的打网络，可能慢到几秒，所以：
+   *   - 放在 health 之后，不阻塞上面的界面更新
+   *   - 失败就显示红色 + 原因，不弹 toast（状态灯自己就是提示）
+   */
+  try {
+    const s = await (await fetch('/api/status')).json();
+
+    // R2
+    if (s.r2?.ok) {
+      setPill('#chipR2', 'on', `R2 正常${s.r2.ms ? ` ${s.r2.ms}ms` : ''}`);
+      $('#chipR2').title = `Cloudflare R2 连通正常（桶 ${s.r2.bucket || '-'}，${s.r2.ms || 0}ms）`;
+    } else {
+      setPill('#chipR2', 'off', 'R2 异常');
+      $('#chipR2').title = `Cloudflare R2 不可用：${s.r2?.reason || '未知原因'}`;
+    }
+
+    // OpenList
+    if (s.openlist?.ok) {
+      setPill('#chipOpenlist', 'on', 'OpenList 正常');
+      $('#chipOpenlist').title = `OpenList 连通正常（用户 ${s.openlist.user || '-'}）`;
+    } else {
+      setPill('#chipOpenlist', 'off', 'OpenList 异常');
+      $('#chipOpenlist').title = `OpenList 不可用：${s.openlist?.reason || '未知原因'}`;
+    }
+  } catch (e) {
+    // 连自己后端都请求不通，两个都标红
+    setPill('#chipR2', 'off', 'R2 未知');
+    setPill('#chipOpenlist', 'off', 'OpenList 未知');
+    $('#chipR2').title = `状态探测失败：${e.message}`;
+    $('#chipOpenlist').title = `状态探测失败：${e.message}`;
+  }
 
   try {
     const d = await (await fetch('/api/disk')).json();

@@ -63,8 +63,17 @@
         <span class="pill" id="chipSse" data-state="idle" title="实时推送连接状态">
           <i class="dot"></i><span data-role="text">连接中</span>
         </span>
-        <span class="pill" id="chipR2" data-state="idle" title="R2 转码链路状态">
-          <i class="dot"></i><span data-role="text">R2</span>
+        <!--
+          后端服务状态：探测的是**真实连通性**，不是「配置了没有」。
+          R2 走一次 HEAD 请求，OpenList 走 /api/me。
+          之前这里显示「R2 转码已启用」，只是说环境变量填了，
+          服务挂掉也照样显示绿色，等于没意义。
+        -->
+        <span class="pill" id="chipR2" data-state="idle" title="Cloudflare R2 连通性">
+          <i class="dot"></i><span data-role="text">R2 检测中</span>
+        </span>
+        <span class="pill" id="chipOpenlist" data-state="idle" title="OpenList 连通性">
+          <i class="dot"></i><span data-role="text">OpenList 检测中</span>
         </span>
         <span class="pill" id="chipDisk" data-state="idle" title="临时目录磁盘空间">
           <i class="dot"></i><span data-role="text">磁盘</span>

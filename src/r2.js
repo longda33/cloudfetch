@@ -244,6 +244,51 @@ export class R2Client {
   }
 
   /**
+   * 探测 R2 是否可用（给前端的「服务状态」用）。
+   *
+   * 用 HEAD 一个肯定不存在的键：
+   *   - 返回 404  → 连通且鉴权通过（对象不存在是正常结果）
+   *   - 返回 403  → 密钥错或没权限
+   *   - 网络错误  → 连不上
+   *
+   * 为什么不用 PUT/DELETE 探测：那会产生真实的写入和删除，
+   * 一个健康检查接口不应该有副作用。
+   *
+   * 为什么不列桶：ListBucket 需要额外权限，而用户按最小权限原则
+   * 只给了 Object Read & Write，列桶会 403，误判成"异常"。
+   */
+  async ping({ prefix = 'cloudfetch' } = {}) {
+    if (!this.configured) {
+      return { ok: false, reason: '未配置 R2（缺 accountId / 密钥 / bucket）' };
+    }
+    const started = Date.now();
+    try {
+      const probeKey = `${String(prefix).replace(/\/+$/, '')}/.healthcheck`;
+      const headers = this._sign({ method: 'HEAD', key: probeKey, payloadHash: EMPTY_SHA256 });
+      const res = await fetch(this._url(probeKey), {
+        method: 'HEAD',
+        headers,
+        signal: AbortSignal.timeout(8000),
+      });
+      const ms = Date.now() - started;
+
+      // 404 是**期望结果**：说明签名通过、桶可达，只是这个对象不存在
+      if (res.status === 404) return { ok: true, ms, bucket: this.bucket };
+      if (res.status === 403) {
+        return { ok: false, reason: 'R2 鉴权失败（密钥错误或权限不足）', ms };
+      }
+      if (!res.ok) return { ok: false, reason: `R2 HTTP ${res.status}`, ms };
+      return { ok: true, ms, bucket: this.bucket };
+    } catch (e) {
+      const reason =
+        e?.name === 'TimeoutError' || e?.name === 'AbortError'
+          ? 'R2 连接超时'
+          : `R2 连接失败：${e.message}`;
+      return { ok: false, reason };
+    }
+  }
+
+  /**
    * 生成预签名 GET URL。
    *
    * 给 GitHub Actions 用：Actions 里不存 R2 密钥，

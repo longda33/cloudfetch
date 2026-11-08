@@ -76,7 +76,7 @@ jobs:
     runs-on: ubuntu-24.04
     # 3 小时直播的合并转码在 4 核 runner 上接近实时，留足余量。
     # 服务端的 TRANSCODE_TIMEOUT（330 分钟）必须比这个更长。
-    timeout-minutes: 300
+    timeout-minutes: 350
 
     # 只需要读代码，不需要写仓库
     permissions:
