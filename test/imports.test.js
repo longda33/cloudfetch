@@ -60,7 +60,6 @@ test('所有核心模块能被加载，导出符合预期', async (t) => {
     outName: 'a.mp4',
     openlistDir: '/dir',
     taskId: 't1',
-    segIndex: 3,
   });
   for (const [k, v] of Object.entries(inputs)) {
     assert.equal(typeof v, 'string', `input ${k} 必须是字符串`);

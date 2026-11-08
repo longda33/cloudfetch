@@ -98,14 +98,15 @@ export const config = {
     /** 分片下载并发数 */
     chunkConcurrency: num(env.CHUNK_CONCURRENCY, 4),
     /**
-     * 直播分段时长（秒）。每段独立成文件、独立上传，**不合并**。
-     * 1800 = 30 分钟一段。
+     * 直播分段时长（秒）。每段独立成文件、先存 R2，整场录完后由
+     * GitHub Actions 合并成一个 MP4。
      *
-     * 之所以敢用 30 分钟这么长：上传已改走分片协议（10MB 一片），
-     * 单段体积不再受 Cloudflare 的 130MB 单请求上限约束，
-     * 30 分钟 × 2.7MB/s ≈ 4.8GB 也能正常传上去。
+     * 300 = 5 分钟一段。不能更长：直播源长时间不推关键帧时，
+     * ffmpeg 的 segment muxer 会一直等切点，单段可能涨到接近 1GB，
+     * 把持久卷撑满（实测 30 分钟配置下出现过 933MB 单段）。
+     * 5 分钟一段时正常约 50MB，就算切段失效 3 倍也装得下。
      */
-    liveSegmentSeconds: num(env.LIVE_SEGMENT_SECONDS, 1800),
+    liveSegmentSeconds: num(env.LIVE_SEGMENT_SECONDS, 300),
     /**
      * 队列长度上限（排队中 + 运行中）。
      * 没有这个上限时，一次请求塞几千条链接就能把进程拖死。
@@ -211,8 +212,14 @@ export const config = {
     /**
      * 转码超时（毫秒）。超过这个时间还没在 OpenList 看到 MP4，
      * 判定为失败，前端给出「重试」入口（从 R2 源文件重新触发，不用重录）。
+     *
+     * 必须比 transcode.yml 的 timeout-minutes 更长，否则 Actions 还在跑
+     * 就被判失败，用户一点重试就会排队跑第二遍。
+     * 现在 yml 是 300 分钟，这里给 330 分钟。
      */
-    timeoutMs: num(env.TRANSCODE_TIMEOUT, 90 * 60 * 1000),
+    timeoutMs: num(env.TRANSCODE_TIMEOUT, 330 * 60 * 1000),
+    /** 单次 workflow_dispatch 的超时（毫秒）。不能等太久，它在录制收尾路径上 */
+    dispatchTimeoutMs: num(env.TRANSCODE_DISPATCH_TIMEOUT, 30 * 1000),
   },
 
   // ---------- 其他 ----------

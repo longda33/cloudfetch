@@ -19,7 +19,8 @@ const { buildRemotePath } = await import('../src/openlist.js');
 test('空字符串环境变量回退到默认值（Number("") === 0 的坑）', () => {
   assert.equal(config.download.maxConcurrent, 2);
   assert.equal(config.download.maxFileSize, 20 * 1024 * 1024 * 1024);
-  assert.equal(config.download.liveSegmentSeconds, 1800);
+  // 5 分钟：太长时切段失效会把持久卷撑满（曾出现单段 933MB）
+  assert.equal(config.download.liveSegmentSeconds, 300);
 });
 
 test('未配置 SESSION_SECRET 时随机生成，绝不能是硬编码默认值', () => {

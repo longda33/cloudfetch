@@ -75,7 +75,7 @@ unikraft run \
   -e "OPENLIST_UPLOAD_DIR=${OPENLIST_UPLOAD_DIR:-/od-20200439/cloudfetch}" \
   -e "PANEL_PASSWORD=${PANEL_PASSWORD}" \
   -e "DELETE_AFTER_UPLOAD=${DELETE_AFTER_UPLOAD:-true}" \
-  -e "LIVE_SEGMENT_SECONDS=${LIVE_SEGMENT_SECONDS:-1800}"
+  -e "LIVE_SEGMENT_SECONDS=${LIVE_SEGMENT_SECONDS:-300}"
 
 # ---------- 4) 等就绪 ----------
 log "等待 running"

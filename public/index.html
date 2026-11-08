@@ -226,9 +226,9 @@
 
 <!-- ========== 登录 / 配置提示 ========== -->
 <div class="overlay" id="loginMask">
-  <div class="dialog" id="loginDialog">
+  <div class="dialog" id="loginDialog" role="dialog" aria-modal="true" aria-labelledby="loginTitle">
     <div class="dialog-icon"><svg class="ic" aria-hidden="true"><use href="#i-lock"></use></svg></div>
-    <h2>需要访问密码</h2>
+    <h2 id="loginTitle">需要访问密码</h2>
     <p>这个面板能把任意文件转码后写进你的 OpenList，请先验证身份。</p>
     <input type="password" id="pwdInput" placeholder="输入访问密码" autocomplete="current-password" aria-label="访问密码">
     <button class="btn btn-primary btn-block" id="btnLogin" type="button">进入面板</button>

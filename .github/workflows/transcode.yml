@@ -18,11 +18,19 @@ on:
       # 多个 R2 对象键，逗号分隔，按顺序合并
       r2_keys:
         description: 'R2 对象键列表（逗号分隔，按录制顺序）'
-        required: true
+        required: false
         type: string
+        default: ''
       # 兼容旧调用：单个预签名 URL
       source_url:
         description: '（可选）单个源文件 URL，给非直播任务用'
+        required: false
+        type: string
+        default: ''
+      # 单文件模式的对象键，用来在转码成功后删掉 R2 源文件。
+      # 必须在这里声明：dispatch 接口对未声明的 input 直接返回 422。
+      r2_key:
+        description: '（可选）单个 R2 对象键，转完用来清理'
         required: false
         type: string
         default: ''
@@ -66,7 +74,9 @@ jobs:
     # 出现这条警告就是提醒：
     #   "The ubuntu-latest label will migrate to Ubuntu 26 beginning October 19, 2026"
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    # 3 小时直播的合并转码在 4 核 runner 上接近实时，留足余量。
+    # 服务端的 TRANSCODE_TIMEOUT（330 分钟）必须比这个更长。
+    timeout-minutes: 300
 
     # 只需要读代码，不需要写仓库
     permissions:
@@ -119,6 +129,7 @@ jobs:
       - name: 合并转码并上传
         env:
           R2_KEYS: ${{ inputs.r2_keys }}
+          R2_KEY: ${{ inputs.r2_key }}
           SOURCE_URL: ${{ inputs.source_url }}
           OUT_NAME: ${{ inputs.out_name }}
           OPENLIST_DIR: ${{ inputs.openlist_dir }}

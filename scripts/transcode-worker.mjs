@@ -432,7 +432,13 @@ async function uploadToOpenList(localPath, remoteDir) {
 // ---------------- 4. 清理 R2 ----------------
 async function deleteFromR2(key) {
   if (R2_DELETE_AFTER !== 'true' || !key) return;
-  if (!R2_ACCOUNT_ID || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET) {
+  /**
+   * 只需要 endpoint + 凭据，不强制 accountId。
+   * R2 可以按 accountId 拼 endpoint，MinIO / B2 只能给 endpoint，
+   * 之前这里要求 accountId，导致自建对象存储的源文件永远清不掉。
+   */
+  const hasEndpoint = Boolean(R2_ENDPOINT || R2_ACCOUNT_ID);
+  if (!hasEndpoint || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET) {
     log('未配置 R2 凭据，跳过清理（源文件保留在 R2）');
     return;
   }
@@ -518,7 +524,15 @@ async function main() {
     .filter(Boolean);
 
   if (!keys.length && !SOURCE_URL) fail('缺少 R2_KEYS 或 SOURCE_URL');
-  if (keys.length && !R2_ACCOUNT_ID) fail('多段合并需要 R2 凭据（R2_ACCOUNT_ID 为空）');
+  if (keys.length) {
+    // 合并模式要用预签名 URL 逐段下载，缺任何一项都签不出有效地址
+    if (!R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET) {
+      fail('多段合并需要 R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_BUCKET');
+    }
+    if (!R2_ENDPOINT && !R2_ACCOUNT_ID) {
+      fail('多段合并需要 R2 凭据（R2_ENDPOINT 与 R2_ACCOUNT_ID 都为空）');
+    }
+  }
 
   log('参数：', {
     out: OUT_NAME,
@@ -574,9 +588,19 @@ async function main() {
     const remote = await uploadToOpenList(output, OPENLIST_DIR);
 
     // ---------- 4. 清理 R2 ----------
-    // 逐段删，某段失败不影响其它段
-    for (const key of keys) {
-      await deleteFromR2(key);
+    /**
+     * 合并模式逐段删；单文件模式删 R2_KEY。
+     *
+     * 之前只遍历 keys，而单文件走的是 SOURCE_URL、keys 为空，
+     * 于是每个单文件任务的源文件都留在 R2 里再也没人清 ——
+     * 免费额度 10GB 用满后所有上传都报 403，且完全看不出是空间问题。
+     */
+    if (keys.length) {
+      for (const key of keys) {
+        await deleteFromR2(key);
+      }
+    } else {
+      await deleteFromR2(R2_KEY);
     }
 
     // 输出一段汇总，Actions 的 step summary 会抓这个

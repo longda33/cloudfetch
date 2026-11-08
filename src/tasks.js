@@ -45,6 +45,29 @@ function stemOf(filename) {
   return path.basename(name, path.extname(name)) || 'output';
 }
 
+/**
+ * 生成 YYYYMMDDHHmmss 形式的时间戳，**按中国时区**。
+ *
+ * 不能用 toISOString()：那是 UTC，容器里晚上 8 点之后录的东西
+ * 会得到「前一天」的名字，而 OpenList 的日期目录是用
+ * Intl + Asia/Shanghai 算的，两边对不上 —— 目录是 11-09，
+ * 里面的文件叫 live_20261108_170000。
+ */
+function stampCN(ms = Date.now()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(new Date(ms));
+  const get = (type) => parts.find((p) => p.type === type)?.value || '00';
+  return `${get('year')}${get('month')}${get('day')}${get('hour')}${get('minute')}${get('second')}`;
+}
+
 /** 任务状态机 */
 export const STATUS = {
   QUEUED: 'queued',       // 排队中
@@ -64,6 +87,16 @@ export class TaskManager extends EventEmitter {
     this.tasks = new Map();
     this.queue = [];
     this.running = new Set();
+    /**
+     * 正在补传/重新合并的任务 id。
+     *
+     * 重传接口是 202 fire-and-forget，HTTP 层立刻就返回了，
+     * 而 _retryMerged 要先 stat / 上传才把 mp4State 改成 pending。
+     * 这段窗口里再点一次「重新合并」，canRetryUpload 看到的还是旧状态，
+     * 于是会真的派出第二次 workflow_dispatch。
+     * 用一个同步加锁的集合挡住它，不依赖前端的按钮禁用。
+     */
+    this.retrying = new Set();
     this._saveTimer = null;
     this._shuttingDown = false;
     this._loadState();
@@ -146,6 +179,7 @@ export class TaskManager extends EventEmitter {
         ) {
           this.tasks.delete(id);
           this._disposeTask(t);
+          this._removeJobDir(id).catch(() => {});
           changed = true;
         }
       }
@@ -158,6 +192,7 @@ export class TaskManager extends EventEmitter {
           const t = finished.shift();
           this.tasks.delete(t.id);
           this._disposeTask(t);
+          this._removeJobDir(t.id).catch(() => {});
           changed = true;
         }
       }
@@ -166,21 +201,24 @@ export class TaskManager extends EventEmitter {
   }
 
   /**
-   * 删除任务时清理它留下的所有东西：本地目录 + R2 中转对象。
+   * 删除任务时清理它留下的 R2 中转对象。
+   *
+   * 磁盘目录由 _removeJobDir 负责 —— 两件事分开，避免这里 fire-and-forget
+   * 的 rm 和调用方 await 的 rm 重复执行。
    *
    * R2 里还留着源文件只有两种情况：转码失败（特意留着以便重试）、
    * 或者从未提交成功。用户主动删任务时这些都没用了，必须清掉 ——
    * R2 免费额度只有 10GB，历史垃圾不清会直接把额度占满，
    * 之后所有上传都失败，而且报错是 R2 PUT 403，很难联想到是空间问题。
    *
-   * 正在转码（pending）的不能删：Actions 还在下载它。
+   * 正在转码的不能删：Actions 还在下载它。
    */
   _disposeTask(t) {
-    const dir = path.join(config.tmpDir, t.id);
-    fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
-
     const r = config.r2;
     if (!r.accessKeyId || !r.secretAccessKey || !r.bucket) return;
+
+    // 合并转码进行中：Actions 正在逐段拉取，删了它就会失败
+    if (t.mergedSubmitted && t.mp4State === 'pending') return;
 
     const keys = new Set();
     if (t.r2Key && t.mp4State !== 'pending') keys.add(t.r2Key);
@@ -254,10 +292,15 @@ export class TaskManager extends EventEmitter {
           p.item.mp4State = 'done';
           p.item.remotePath = p.path;
           p.item.confirmedAt = now;
+          // 合并任务：MP4 是一个整体，落地后把所有段一起标成 merged
+          if (p.item === t && t.mergedSubmitted) this._markMergedLanded(t, p.path);
           changed = true;
           this._log(t, `转码完成：${p.path}`);
         } else if (now - (p.at || 0) > config.transcode.timeoutMs) {
           p.item.mp4State = 'failed';
+          if (p.item === t && t.mergedSubmitted) {
+            t.mergeError = '转码超时：超过等待上限仍未在 OpenList 看到 MP4';
+          }
           changed = true;
           this._log(
             t,
@@ -267,11 +310,21 @@ export class TaskManager extends EventEmitter {
       }
       if (!changed) continue;
 
-      t.segmentsUploaded = (t.segments || []).filter((s) => s.remotePath).length;
-      const stillPending = (t.segments || []).some((s) => s.mp4State === 'pending') ||
-        (t.mp4State === 'pending' && !(t.segments || []).length);
+      if (!(t.mergedSubmitted && t.mp4State === 'done')) {
+        t.segmentsUploaded = (t.segments || []).filter((s) => s.remotePath).length;
+      }
+      /**
+       * 合并任务的 pending 挂在任务上（t.mp4State），段本身是 staged。
+       * 只判断段的话，合并转码中会被误判成"没有待办"，phase 提前变成已完成。
+       */
+      const stillPending =
+        (t.segments || []).some((s) => s.mp4State === 'pending') || t.mp4State === 'pending';
       if (!stillPending) {
-        t.phase = t._stopRequested ? '已停止' : '已完成';
+        t.phase = t._stopRequested
+          ? '已停止'
+          : t.mp4State === 'failed'
+            ? '转码失败'
+            : '已完成';
       }
       this._emit(t);
       this._saveState();
@@ -314,7 +367,7 @@ export class TaskManager extends EventEmitter {
     const id = crypto.randomUUID();
     // 任务基础名：用于远端子目录，便于人眼识别是哪一次录制
     // 直播用时间戳（此时还不知道最终文件名），普通下载用原文件名
-    const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+    const ts = stampCN();
     const baseName =
       (filename ? path.basename(filename).replace(/\.[a-z0-9]+$/i, '') : '') ||
       `${detectKind(url) === 'http' ? 'dl' : 'live'}_${ts}`;
@@ -529,10 +582,30 @@ export class TaskManager extends EventEmitter {
     if (this.running.has(id) || [STATUS.QUEUED, STATUS.DOWNLOADING, STATUS.UPLOADING].includes(t.status)) {
       return { ok: false, error: '任务仍在进行中，请等它结束后再重试上传' };
     }
+    if (this.retrying.has(id)) {
+      return { ok: false, error: '正在重试中，请稍候' };
+    }
 
     const useTranscode = transcodeConfigured();
     if (!useTranscode && !getOpenList().configured) {
       return { ok: false, error: 'OpenList 未配置，无法上传' };
+    }
+
+    /**
+     * 合并模式：产物是整场一个 MP4，重试的语义是「重新提交一次合并」，
+     * 不是逐段重传。不能走下面的逐段统计，否则：
+     *   - 已经合并成功的任务也会显示「重传 N」
+     *   - 点一下会把 36 段拆成 36 个 MP4
+     */
+    if (this._isMerged(t)) {
+      if (t.mp4State === 'pending') {
+        return { ok: false, error: '合并转码正在进行中，请等它结束' };
+      }
+      if (t.mp4State === 'done' && t.remotePath) {
+        return { ok: false, error: '合并后的 MP4 已在网盘里，无需重试' };
+      }
+      const missing = (t.segments || []).filter((s) => !s.r2Key).length;
+      return { ok: true, count: 1, merged: true, missing };
     }
 
     /**
@@ -555,7 +628,40 @@ export class TaskManager extends EventEmitter {
     return { ok: true, count: pending.size };
   }
 
+  /** 这个任务是不是走「整场合并成一个 MP4」的流程 */
+  _isMerged(t) {
+    if (t.mergedSubmitted || (t.mergeKeys || []).length) return true;
+    /**
+     * 兼容旧记录：01a6dea 之后、本次修复之前创建的任务没有 mergeKeys，
+     * 提交失败时只留下 mergeError。特征很明确：
+     *   - 有 mergeError（说明尝试过合并）
+     *   - 所有段都在 R2 里，且没有任何一段落地到 OpenList
+     *
+     * 不能只看「段都在 R2 且没落地」—— 逐段转码的任务也长这样，
+     * 那样会把本该逐段重试的任务误判成合并任务。
+     */
+    if (!t.mergeError) return false;
+    const segs = t.segments || [];
+    return segs.length > 0 && segs.every((s) => s.r2Key) && segs.every((s) => !s.remotePath);
+  }
+
+  /**
+   * 补传 / 重新合并的统一入口。
+   *
+   * 用 retrying 集合做同步互斥：接口是 202 fire-and-forget，调用方拿不到
+   * "真正结束"的信号。不锁的话连点两次就会派出两次合并转码。
+   */
   async retryFailedSegments(id) {
+    if (this.retrying.has(id)) throw new Error('正在重试中，请稍候');
+    this.retrying.add(id);
+    try {
+      return await this._retryFailedSegments(id);
+    } finally {
+      this.retrying.delete(id);
+    }
+  }
+
+  async _retryFailedSegments(id) {
     const t = this.tasks.get(id);
     if (!t) throw new Error('任务不存在');
 
@@ -572,6 +678,9 @@ export class TaskManager extends EventEmitter {
     const useTranscode = transcodeConfigured();
     const ol = getOpenList();
     if (!useTranscode && !ol.configured) throw new Error('OpenList 未配置，无法上传');
+
+    // 合并任务：补齐缺失段后重新提交一次合并，不逐段转码
+    if (this._isMerged(t)) return this._retryMerged(t);
 
     /**
      * 合并三种来源，按 index 去重：
@@ -722,6 +831,91 @@ export class TaskManager extends EventEmitter {
     return { retried: list.length, submitted, failed: still.length };
   }
 
+  /**
+   * 重试「整场合并」任务。
+   *
+   * 和逐段重试的区别：
+   *   1) 先把没进 R2 的段补传上去（本地还在才行）
+   *   2) 所有段齐了以后，重新提交**一次**合并转码
+   *
+   * 绝不能退回逐段转码 —— 那会产出 N 个 5 分钟的 MP4，
+   * 和用户预期的一个完整视频完全不同。
+   */
+  async _retryMerged(t) {
+    if (t.mp4State === 'pending') throw new Error('合并转码正在进行中，请等它结束');
+
+    const segs = (t.segments || []).slice().sort((a, b) => a.index - b.index);
+    if (!segs.length) throw new Error('没有可合并的分段');
+
+    this._log(t, `重试合并转码：共 ${segs.length} 段，其中 ${segs.filter((s) => !s.r2Key).length} 段需要补传`);
+
+    let uploaded = 0;
+    for (const s of segs) {
+      if (s.r2Key) continue;
+      const local = s.localPath || path.join(config.tmpDir, t.id, s.filename || '');
+      const exists = await fsp
+        .stat(local)
+        .then((st) => st.size > 0)
+        .catch(() => false);
+      if (!exists) {
+        throw new Error(
+          `第 ${s.index} 段既不在 R2 也没有本地文件，无法合并（只能重新录制）`,
+        );
+      }
+      s.r2Key = await this._uploadToR2(t, s.index, s.filename, local);
+      s.mp4State = 'staged';
+      uploaded++;
+      if (config.openlist.deleteAfterUpload) {
+        await fsp.rm(local, { force: true }).catch(() => {});
+        s.deleted = true;
+      }
+    }
+
+    const keys = segs.filter((s) => s.r2Key).map((s) => s.r2Key);
+    if (keys.length !== segs.length) {
+      throw new Error(`仍有 ${segs.length - keys.length} 段没有进 R2，无法合并`);
+    }
+
+    const outName = `${t.baseName || 'live'}.mp4`;
+    const openlistDir = this._remoteDirOf(t);
+    t.mergeKeys = keys;
+    t.expectedPath = `${openlistDir}/${outName}`;
+
+    await dispatchTranscode(
+      buildTranscodeInputs({ r2Keys: keys, outName, openlistDir, taskId: t.id }),
+    );
+
+    t.mergedSubmitted = true;
+    t.mp4State = 'pending';
+    t.mp4SubmittedAt = Date.now();
+    t.mergeError = '';
+    t.segmentsUploaded = 0;
+    t.segmentsSubmitted = segs.length;
+    t.failedSegments = [];
+    t.error = '';
+    if (t.status === STATUS.FAILED) {
+      t.status = STATUS.DONE;
+      t.phase = '合并转码中';
+    } else {
+      t.phase = t._stopRequested ? '已停止（转码中）' : '合并转码中';
+    }
+
+    this._log(
+      t,
+      `已重新提交合并转码：${keys.length} 段${uploaded ? `（补传 ${uploaded} 段）` : ''} → ${outName}`,
+    );
+    this._emit(t);
+    this._saveState();
+
+    try {
+      await getHistoryStore().upsert(this._historyRecord(t));
+    } catch {
+      /* ignore */
+    }
+
+    return { retried: 1, submitted: 1, failed: 0, uploaded, merged: true };
+  }
+
   /** 把本地文件传到 R2，返回对象键 */
   async _uploadToR2(t, index, filename, localPath) {
     const r2 = getR2();
@@ -733,8 +927,8 @@ export class TaskManager extends EventEmitter {
     return key;
   }
 
-  /** 触发一次转码 */
-  async _dispatchOne(t, { key, outName, openlistDir, index }) {
+  /** 触发一次转码（单文件 / 逐段重试用） */
+  async _dispatchOne(t, { key, outName, openlistDir }) {
     const r2 = getR2();
     await dispatchTranscode(
       buildTranscodeInputs({
@@ -743,7 +937,6 @@ export class TaskManager extends EventEmitter {
         outName,
         openlistDir,
         taskId: t.id,
-        segIndex: index,
       }),
     );
   }
@@ -792,6 +985,21 @@ export class TaskManager extends EventEmitter {
     }
 
     t.failedSegments = (t.failedSegments || []).filter((x) => x.index !== item.index);
+  }
+
+  /**
+   * 合并转码落地：MP4 是整场一个文件，所有段一起算「已落地」。
+   *
+   * 不给段写 remotePath —— 段本身并不在 OpenList 里（合并后就被删了），
+   * 写了会让「文件夹」按钮和历史统计指向一个不存在的路径。
+   */
+  _markMergedLanded(t, remotePath) {
+    t.remotePath = remotePath;
+    t.mergeError = '';
+    t.segmentsUploaded = t.segmentCount || (t.segments || []).length;
+    for (const s of t.segments || []) {
+      if (s.mp4State === 'staged' || s.mp4State === 'pending') s.mp4State = 'merged';
+    }
   }
 
   _emit(t) {
@@ -1101,15 +1309,19 @@ export class TaskManager extends EventEmitter {
           localPath: s.path || s.localPath || '',
         }));
         t.segmentCount = segs.length;
-        // 已存 R2 的段数（用于展示进度）
-        t.segmentsUploaded = t.segments.filter((s) => s.r2Key).length;
-        t.segmentsSubmitted = t.segments.filter((s) => s.mp4State === 'staged').length;
+        /**
+         * 口径统一：segmentsUploaded 只算「确认落地到 OpenList」的段。
+         * 合并模式下这个值在 MP4 确认前恒为 0 —— 段只是在 R2 里排队，
+         * 不能算已落地。已经存进 R2 的段数看 segmentsSubmitted。
+         */
+        t.segmentsUploaded = t.segments.filter((s) => s.remotePath).length;
+        t.segmentsSubmitted = t.segments.filter((s) => s.r2Key).length;
 
         // 未上传的段（关闭了上传或未配置 OpenList）留在本地
         const kept = segs.filter((s) => !s.deleted && !s.r2Key).length;
         const failed = (t.failedSegments || []).length;
         onLog(
-          `直播录制结束：共 ${segs.length} 段，已存 R2 ${t.segmentsUploaded} 段` +
+          `直播录制结束：共 ${segs.length} 段，已存 R2 ${t.segmentsSubmitted} 段` +
             (failed ? `，${failed} 段失败` : '') +
             (!t.upload ? `，全部保留本地（${kept} 段）` : ''),
         );
@@ -1123,12 +1335,19 @@ export class TaskManager extends EventEmitter {
           .filter((s) => s.r2Key)
           .sort((a, b) => a.index - b.index)
           .map((s) => s.r2Key);
+        // 缺段不合并：少几段拼出来的 MP4 能正常播放，但内容中间是断的，
+        // 比直接失败更难发现。宁可留在「转码失败」让用户补齐后重试。
+        const missingSegs = t.segments.length - stagedKeys.length;
 
-        if (stagedKeys.length && transcodeConfigured()) {
+        if (stagedKeys.length && transcodeConfigured() && !missingSegs) {
           const outName = `${t.baseName || 'live'}.mp4`;
           const openlistDir = this._remoteDirOf(t);
+          t.mergeKeys = stagedKeys;
+          t.expectedPath = `${openlistDir}/${outName}`;
           onLog(`提交合并转码：${stagedKeys.length} 段 → ${outName}`);
           try {
+            // 不传 ac.signal：用户点「停止」时 signal 已经 abort，
+            // 但停止之后照样应该把已录的内容合并出来
             await dispatchTranscode(
               buildTranscodeInputs({
                 r2Keys: stagedKeys,
@@ -1138,12 +1357,31 @@ export class TaskManager extends EventEmitter {
               }),
             );
             t.mergedSubmitted = true;
-            t.expectedPath = `${openlistDir}/${outName}`;
+            /**
+             * 必须同步写上 mp4State=pending 和提交时间。
+             *
+             * 轮询器靠这两个字段去找 expectedPath；只写 mergedSubmitted
+             * 的话 MP4 永远不会被确认，remotePath 永远为空，
+             * 超时也永远不触发 —— 任务显示「完成」，网盘里却没有文件。
+             */
+            t.mp4State = 'pending';
+            t.mp4SubmittedAt = Date.now();
+            t.mergeError = '';
             onLog(`合并转码已提交，完成后 MP4 会出现在 ${t.expectedPath}`);
           } catch (e) {
-            onLog(`合并转码提交失败：${e.message}（分段仍在 R2，可重试）`);
+            t.mergedSubmitted = false;
+            t.mp4State = 'failed';
             t.mergeError = e.message;
+            onLog(`合并转码提交失败：${e.message}（分段仍在 R2，可重试）`);
           }
+        } else if (stagedKeys.length && missingSegs) {
+          t.mergeKeys = stagedKeys;
+          t.expectedPath = `${this._remoteDirOf(t)}/${t.baseName || 'live'}.mp4`;
+          t.mp4State = 'failed';
+          t.mergeError = `有 ${missingSegs} 段未上传到 R2，已跳过合并`;
+          onLog(
+            `有 ${missingSegs} 段未上传到 R2，跳过自动合并；补齐后在历史记录里点「重新合并」`,
+          );
         } else if (stagedKeys.length) {
           onLog('转码链路未配置，分段保留在 R2，不会自动合并');
         }
@@ -1153,9 +1391,11 @@ export class TaskManager extends EventEmitter {
           ? t.mergedSubmitted
             ? '已停止（转码中）'
             : '已停止'
-          : t.mergedSubmitted
+          : t.mp4State === 'pending'
             ? '合并转码中'
-            : '已完成';
+            : t.mp4State === 'failed'
+              ? '合并转码失败'
+              : '已完成';
         t.finishedAt = Date.now();
         this._emit(t);
         this._saveState();
@@ -1222,7 +1462,6 @@ export class TaskManager extends EventEmitter {
                 outName: `${base}.mp4`,
                 openlistDir,
                 taskId: t.id,
-                segIndex: 0,
               }),
             );
 
@@ -1387,9 +1626,17 @@ export class TaskManager extends EventEmitter {
        * 本地这份删掉不会丢数据，不必为了它保留整个目录。
        */
       const segs = t.segments || [];
+      /**
+       * 「这一段已经有着落」的判定。
+       *
+       * staged / merged 也要算 —— 合并流程里段只到 R2 为止，
+       * 本地那份删掉不会丢数据。漏掉它们会让直播任务的目录
+       * 永远走不到清理分支。
+       */
+      const HANDLED = ['pending', 'done', 'staged', 'merged'];
       const allHandled = segs.length
-        ? segs.every((s) => s.remotePath || s.mp4State === 'pending' || s.mp4State === 'done')
-        : Boolean(t.remotePath) || t.mp4State === 'pending' || t.mp4State === 'done';
+        ? segs.every((s) => s.remotePath || HANDLED.includes(s.mp4State))
+        : Boolean(t.remotePath) || HANDLED.includes(t.mp4State);
 
       const mayHaveUnuploaded =
         Boolean(t._stopRequested) ||
@@ -1436,6 +1683,14 @@ export class TaskManager extends EventEmitter {
   /** 从任务对象提炼一条精简的历史记录（不含日志，避免体积过大） */
   _historyRecord(t) {
     const segs = t.segments || [];
+    /**
+     * 这个任务是不是「合并转码」模式。
+     *
+     * 合并任务的产物是整场一个 MP4，段本身不会出现在 OpenList，
+     * 所以不能用「有几段的 remotePath 非空」来算进度 —— 前端据此
+     * 换一套展示（合并徽章 + 单个重传按钮），而不是逐段统计。
+     */
+    const merged = this._isMerged(t);
     return {
       id: t.id,
       url: t.url,
@@ -1451,19 +1706,38 @@ export class TaskManager extends EventEmitter {
       finishedAt: t.finishedAt,
       remotePath: t.remotePath || '',
       segmentCount: t.segmentCount || segs.length || 0,
-      segmentsUploaded: segs.filter((s) => s.remotePath).length,
+      /**
+       * 合并模式：MP4 是整场一个文件，落地后所有段一起算已落地；
+       * 确认前是 0（段只是在 R2 里排队，不能算已在网盘）。
+       */
+      segmentsUploaded:
+        merged && t.mp4State === 'done'
+          ? t.segmentCount || segs.length
+          : segs.filter((s) => s.remotePath).length,
+      merged,
+      mergeError: t.mergeError || '',
       /**
        * 转码状态。
-       * segmentsUploaded 只算"确认落地"的段；transcodePending 是已提交
-       * 但 MP4 还没出现在 OpenList 的段数。前端据此显示「转码中 N 段」。
+       * 非合并任务看 segments[].mp4State；合并任务的状态挂在任务本身，
+       * 段是 staged/merged，不会出现 pending。
        */
       mp4State: t.mp4State || 'none',
       expectedPath: t.expectedPath || '',
-      segmentsSubmitted: segs.filter((s) => s.mp4State === 'pending' || s.mp4State === 'done').length,
-      transcodePending: segs.filter((s) => s.mp4State === 'pending').length +
-        (t.mp4State === 'pending' && !segs.length ? 1 : 0),
-      transcodeFailed: segs.filter((s) => s.mp4State === 'failed').length +
-        (t.mp4State === 'failed' && !segs.length ? 1 : 0),
+      segmentsSubmitted: merged
+        ? segs.filter((s) => s.r2Key).length
+        : segs.filter((s) => s.mp4State === 'pending' || s.mp4State === 'done').length,
+      transcodePending: merged
+        ? t.mp4State === 'pending'
+          ? 1
+          : 0
+        : segs.filter((s) => s.mp4State === 'pending').length +
+          (t.mp4State === 'pending' && !segs.length ? 1 : 0),
+      transcodeFailed: merged
+        ? t.mp4State === 'failed'
+          ? 1
+          : 0
+        : segs.filter((s) => s.mp4State === 'failed').length +
+          (t.mp4State === 'failed' && !segs.length ? 1 : 0),
       failedSegments: (t.failedSegments || []).map((f) => ({
         index: f.index,
         filename: f.filename,
@@ -1471,7 +1745,13 @@ export class TaskManager extends EventEmitter {
         error: f.error,
       })),
       remoteDir: (() => {
-        const first = segs.find((s) => s.remotePath)?.remotePath || t.remotePath || '';
+        // 合并任务在确认前没有 remotePath，用 expectedPath 兜底，
+        // 否则「文件夹」按钮会凭空消失
+        const first =
+          segs.find((s) => s.remotePath)?.remotePath ||
+          t.remotePath ||
+          t.expectedPath ||
+          '';
         if (!first) return '';
         const k = first.lastIndexOf('/');
         return k > 0 ? first.slice(0, k) : '';

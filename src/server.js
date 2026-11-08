@@ -17,6 +17,7 @@ import {
   parseCookies,
   SESSION_TTL_MS,
 } from './util/auth.js';
+import { createLoginGuard } from './util/login-guard.js';
 import { killAllChildren } from './downloader.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -94,22 +95,8 @@ function requireAuth(req, res, next) {
   return res.status(401).json({ error: '未登录' });
 }
 
-/** 登录失败限流：同一来源 10 分钟内最多 20 次，防止在线爆破 */
-const LOGIN_WINDOW_MS = 10 * 60 * 1000;
-const LOGIN_MAX_ATTEMPTS = 20;
-const loginHits = new Map();
-
-function loginBlocked(ip) {
-  const now = Date.now();
-  if (loginHits.size > 5000) loginHits.clear(); // 防止来源过多时内存无限增长
-  const rec = loginHits.get(ip);
-  if (!rec || now > rec.resetAt) {
-    loginHits.set(ip, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
-    return false;
-  }
-  rec.count++;
-  return rec.count > LOGIN_MAX_ATTEMPTS;
-}
+/** 登录失败限流：同一来源 10 分钟内最多 20 次**失败**（成功不计数） */
+const loginGuard = createLoginGuard({ windowMs: 10 * 60 * 1000, maxAttempts: 20 });
 
 /** 只有走 HTTPS 时才加 Secure，否则本地 http 调试会登录不上 */
 function isSecureReq(req) {
@@ -121,6 +108,8 @@ function isSecureReq(req) {
 // ---------------- 公开接口 ----------------
 app.get('/api/health', (req, res) => {
   const authed = isAuthed(req);
+  // 只算一次：transcodeConfigured() 要读一遍配置，别在响应体里重复调用
+  const tcOn = transcodeConfigured();
   res.json({
     ok: true,
     version: '1.0.0',
@@ -142,12 +131,47 @@ app.get('/api/health', (req, res) => {
     },
     // 转码链路状态。前端据此决定要不要显示 MP4 相关提示
     transcode: {
-      enabled: transcodeConfigured(),
-      repo: transcodeConfigured() ? config.transcode.repo : '',
+      enabled: tcOn,
+      repo: tcOn ? config.transcode.repo : '',
       crf: config.transcode.crf,
       preset: config.transcode.preset,
     },
   });
+});
+
+/**
+ * 概览卡片的「今日完成」。
+ *
+ * 必须由服务端全量统计：前端拿到的历史记录只有当前页 + 当前筛选，
+ * 用它算出来的数字会随搜索/翻页跳动。这里直接扫历史库 + 内存任务，
+ * 按 id 去重（同一个任务可能两边都有），日期按中国时区。
+ */
+app.get('/api/stats', requireAuth, async (req, res) => {
+  try {
+    const hs = getHistoryStore();
+    await hs.load();
+
+    const ymd = (ms) =>
+      new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Shanghai',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      }).format(new Date(ms));
+
+    const today = ymd(Date.now());
+    const ids = new Set();
+    for (const h of hs.items || []) {
+      if (h.status === 'done' && h.finishedAt && ymd(h.finishedAt) === today) ids.add(h.id);
+    }
+    for (const t of mgr.tasks.values()) {
+      if (t.status === 'done' && t.finishedAt && ymd(t.finishedAt) === today) ids.add(t.id);
+    }
+
+    res.json({ ok: true, today, todayDone: ids.size });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post('/api/login', (req, res) => {
@@ -158,13 +182,16 @@ app.post('/api/login', (req, res) => {
       code: 'NO_PASSWORD_CONFIGURED',
     });
   }
-  if (loginBlocked(req.ip || 'unknown')) {
+  const ip = req.ip || 'unknown';
+  if (loginGuard.blocked(ip)) {
     return res.status(429).json({ error: '尝试次数过多，请 10 分钟后再试' });
   }
   const { password } = req.body || {};
   if (!safeEqual(password || '', config.auth.password)) {
+    loginGuard.noteFailure(ip);
     return res.status(401).json({ error: '密码错误' });
   }
+  loginGuard.clear(ip);
   const token = signSession(config.auth.secret);
   const cookie = [
     `${SESSION_COOKIE}=${encodeURIComponent(token)}`,
@@ -276,7 +303,13 @@ app.post('/api/tasks/:id/retry-upload', async (req, res) => {
       console.error(`[retry-upload] ${req.params.id} 失败：${e.message}`);
     });
 
-    res.status(202).json({ ok: true, accepted: true, segments: check.count });
+    res.status(202).json({
+      ok: true,
+      accepted: true,
+      segments: check.count,
+      merged: Boolean(check.merged),
+      missing: check.missing || 0,
+    });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
@@ -385,8 +418,19 @@ app.get('/api/events', (req, res) => {
   });
   res.write(': connected\n\n');
 
-  // 首帧推送全量
-  res.write(`event: snapshot\ndata: ${JSON.stringify({ tasks: mgr.list() })}\n\n`);
+  /**
+   * 首帧推送全量。
+   *
+   * 只给「正在跑」和「刚结束」的任务带日志：任务最多保留 200 条、
+   * 每条 200 行日志，全带上就是几 MB 的 JSON，每次打开页面/重连都要传一遍，
+   * 手机和 1GB 实例都吃不消。历史里的日志本来也没人看。
+   */
+  const snapshot = mgr.list().map((t) => {
+    const running = ['queued', 'downloading', 'uploading'].includes(t.status);
+    const recent = t.finishedAt && Date.now() - t.finishedAt < 5 * 60 * 1000;
+    return running || recent ? t : { ...t, logs: [] };
+  });
+  res.write(`event: snapshot\ndata: ${JSON.stringify({ tasks: snapshot })}\n\n`);
 
   const onUpdate = (t) => {
     try {
@@ -470,16 +514,32 @@ function renderIndex() {
 }
 
 /**
+ * 直接访问 /index.html 时也要走模板渲染。
+ *
+ * express.static 会把磁盘上的 index.html 原样吐出来，里面的
+ * {{V_JS}} / {{V_CSS}} / {{V_THEME}} 不会被替换，浏览器拿到的是
+ * `app.js?v={{V_JS}}` → 404，整页白屏。`index: false` 只关掉了
+ * 目录索引，挡不住对文件的直接请求，所以这里单独接一下。
+ */
+app.get('/index.html', (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache');
+  res.type('html').send(renderIndex());
+});
+
+/**
  * 静态资源。
  *
  * index 参数设为 false：不让 static 自动返回 index.html。
  * 否则访问 / 时 static 会直接吐原始文件，下面的 app.get('*')
  * 根本没机会执行，{{V_JS}} 占位符也就替换不掉。
+ *
+ * 也不要开 extensions: ['html'] —— 它会让 /index 也命中 index.html，
+ * 同样吐出未替换占位符的原始模板（整页白屏）。public 下只有
+ * index.html 一个页面，且已经单独接管，不需要扩展名回退。
  */
 app.use(
   express.static(PUBLIC_DIR, {
     index: false,
-    extensions: ['html'],
     maxAge: '1h',
   }),
 );

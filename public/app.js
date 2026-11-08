@@ -37,14 +37,8 @@ const state = {
   authRequired: false,
   limits: {},
   histTotal: 0,
-  /**
-   * 最近一次加载的历史记录条目。
-   *
-   * 「今日完成」需要跨会话统计：服务重启后内存里的任务没了，
-   * 但历史记录还在 OpenList 上。这里缓存一份供 updateStats 用。
-   * 只保留最近加载的那一页 —— 统计今日完成够用了。
-   */
-  histItems: [],
+  /** 服务端统计的「今日完成」，由 /api/stats 刷新 */
+  todayDone: 0,
   health: null,
 };
 
@@ -214,19 +208,31 @@ function metricsHtml(t) {
    *   已落地 —— MP4 确认出现在 OpenList（segmentsUploaded）
    *   转码中 —— 已提交 Actions，等 MP4 落地
    *   失败   —— 提交失败或转码超时，可重试
+   *
+   * 合并任务只产出一个 MP4，所以不再按段报"已落地 N 段"，
+   * 否则永远显示 0 段，看着像丢了。
    */
   if (t.live && (t.segmentCount || t.segmentsDone)) {
     const total = t.segmentCount || t.segmentsDone || 0;
-    const up = t.segmentsUploaded || 0;
-    const pending = (t.segments || []).filter((s) => s.mp4State === 'pending').length;
+    const merged = Boolean(t.mergedSubmitted || (t.mergeKeys || []).length);
     const bad = (t.failedSegments || []).length +
       (t.segments || []).filter((s) => s.mp4State === 'failed').length;
+
     if (t.status === 'done') {
       let s = `分段 ${total} 段`;
-      if (total) s += `，已落地 ${up} 段`;
-      if (pending) s += `，转码中 ${pending} 段`;
-      if (bad) s += `，${bad} 段失败`;
-      push('录制', s, pending ? 'ok' : '');
+      if (merged) {
+        if (t.remotePath) s += '，已合并为 1 个 MP4';
+        else if (t.mp4State === 'pending') s += '，合并转码中';
+        else if (t.mp4State === 'failed') s += '，合并失败';
+        else s += '，未合并';
+      } else {
+        const up = t.segmentsUploaded || 0;
+        const pending = (t.segments || []).filter((s) => s.mp4State === 'pending').length;
+        if (total) s += `，已落地 ${up} 段`;
+        if (pending) s += `，转码中 ${pending} 段`;
+        if (bad) s += `，${bad} 段失败`;
+      }
+      push('录制', s, merged && t.mp4State === 'pending' ? 'ok' : '');
     } else if (t.status === 'uploading' || t.status === 'downloading') {
       // 进行中已在上面显示过「已提交」，这里只补总数
       push('分段', `${total} 段`);
@@ -460,33 +466,42 @@ function updateStats() {
   $('#statSpeed').textContent = speed > 0 ? fmtSpeed(speed) : '—';
   $('#statSpeedSub').textContent = running.length ? `${running.length} 个任务在跑` : '空闲';
 
-  /**
-   * 「今日完成」统计今天真正结束的任务数。
-   *
-   * 数据来源有两个，必须合并去重：
-   *   1) 内存里的任务（state.tasks）—— 本次会话的
-   *   2) 历史记录（state.histItems）—— 重启后从 OpenList 恢复的
-   *
-   * 之前只数内存里的，重启一次就归零了。
-   * 用 id 去重：同一个任务可能既在内存又在历史里。
-   */
-  const doneIds = new Set();
-  for (const t of tasks) {
-    if (t.status === 'done' && isTodayCN(t.finishedAt || t.createdAt)) {
-      doneIds.add(t.id);
-    }
-  }
-  for (const h of state.histItems || []) {
-    if (h.status === 'done' && isTodayCN(h.finishedAt || h.createdAt)) {
-      doneIds.add(h.id);
-    }
-  }
+  renderTodayDone();
+}
 
-  const todayDone = doneIds.size;
-  $('#statDone').textContent = todayDone;
-  $('#statDoneSub').textContent = todayDone
-    ? `今天 ${todayDone} 个任务`
-    : '今天还没有完成任务';
+/**
+ * 「今日完成」必须由服务端全量统计。
+ *
+ * 之前用前端缓存的历史列表算，有两个坑：
+ *   1) 那份列表只有当前页（20 条）且带搜索/状态筛选 ——
+ *      搜一次「失败」，这个数字就归零了
+ *   2) 不打开历史面板就一直是空数组，重启后首屏永远显示 0
+ */
+async function refreshTodayDone() {
+  try {
+    const r = await fetch('/api/stats');
+    if (!r.ok) return;
+    const d = await r.json();
+    state.todayDone = d.todayDone || 0;
+    renderTodayDone();
+  } catch {
+    /* 概览数字，失败就保持原值 */
+  }
+}
+
+/** 本地兜底：服务端还没刷新时，至少把刚完成的任务算进去 */
+function countDoneTodayLocal() {
+  let n = 0;
+  for (const t of state.tasks.values()) {
+    if (t.status === 'done' && isTodayCN(t.finishedAt || t.createdAt)) n++;
+  }
+  return n;
+}
+
+function renderTodayDone() {
+  const n = Math.max(state.todayDone || 0, countDoneTodayLocal());
+  $('#statDone').textContent = n;
+  $('#statDoneSub').textContent = n ? `今天 ${n} 个任务` : '今天还没有完成任务';
 }
 
 function updateTabCounts() {
@@ -533,12 +548,18 @@ async function refreshHistoryCount() {
 
 /* ---------------- SSE ---------------- */
 
+/** 连续失败次数。用于区分「网络抖动」和「会话过期」 */
+let sseFailures = 0;
+
 function connectSSE() {
   if (state.es) state.es.close();
   const es = new EventSource('/api/events');
   state.es = es;
 
-  es.addEventListener('open', () => setPill('#chipSse', 'on', '已连接'));
+  es.addEventListener('open', () => {
+    sseFailures = 0;
+    setPill('#chipSse', 'on', '已连接');
+  });
 
   es.addEventListener('snapshot', (e) => {
     const d = JSON.parse(e.data);
@@ -559,6 +580,7 @@ function connectSSE() {
     upsertTask(t);
     // 任务刚结束 → 刷新历史计数（历史面板打开时顺带刷新列表）
     if (!wasRunning && t.finishedAt) {
+      refreshTodayDone();
       if (!$('#panelHistory').hidden) loadHistory();
       else updateTabCounts();
     }
@@ -587,6 +609,25 @@ function connectSSE() {
 
   es.onerror = () => {
     setPill('#chipSse', 'off', '重连中');
+    sseFailures++;
+
+    /**
+     * EventSource 拿不到 HTTP 状态码，401（会话过期）和网络抖动看起来一样。
+     * 连续失败 3 次就主动探一次 /api/tasks：
+     *   - 401 → 会话确实过期了，关掉 SSE 弹登录框，别再每 3 秒撞一次
+     *   - 其它 → 当网络问题，继续自动重连
+     */
+    if (sseFailures === 3) {
+      fetch('/api/tasks')
+        .then((r) => {
+          if (r.status === 401) {
+            es.close();
+            showLogin();
+          }
+        })
+        .catch(() => {});
+    }
+
     if (es.readyState === EventSource.CLOSED) setTimeout(connectSSE, 3000);
   };
 }
@@ -719,27 +760,40 @@ function showLogin() {
 
 async function doLogin() {
   const password = $('#pwdInput').value;
-  const r = await fetch('/api/login', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ password }),
-  });
-  if (r.ok) {
-    $('#loginMask').classList.remove('show');
-    $('#pwdInput').value = '';
-    connectSSE();
-    // 未登录时 /api/health 不下发 openlistUrl，登录后立刻补一次
-    refreshChips();
-    toast('登录成功', 'ok');
-  } else {
-    toast('密码错误', 'err');
+  const btn = $('#btnLogin');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    });
+    if (r.ok) {
+      $('#loginMask').classList.remove('show');
+      $('#pwdInput').value = '';
+      connectSSE();
+      // 未登录时 /api/health 不下发 openlistUrl，登录后立刻补一次
+      refreshChips();
+      refreshTodayDone();
+      refreshHistoryCount();
+      toast('登录成功', 'ok');
+    } else {
+      // 429（尝试过多）和 503（未配置密码）都带上服务端的说明
+      const j = await r.json().catch(() => ({}));
+      toast(j.error || '密码错误', 'err');
+    }
+  } catch (e) {
+    // 网络断了 / 服务没起来时 fetch 会 reject，之前这里是未捕获的 Promise
+    toast(`无法连接服务：${e.message}`, 'err');
+  } finally {
+    btn.disabled = false;
   }
 }
 
 function showConfigMissing() {
   $('#loginDialog').innerHTML = `
     <div class="dialog-icon warn">${icon('alert')}</div>
-    <h2>未配置访问密码</h2>
+    <h2 id="loginTitle">未配置访问密码</h2>
     <div class="dialog-body">
       <p>为安全起见，本服务必须设置 <code>PANEL_PASSWORD</code> 才能使用 —— 它能往你的 OpenList 写入任意文件。</p>
       <p>前往 <b>GitHub 仓库 → Settings → Secrets and variables → Actions</b>，添加 Secret <code>PANEL_PASSWORD</code>，然后重新运行 <b>Deploy to Cloady</b> 工作流。</p>
@@ -757,9 +811,29 @@ function renderHistItem(h) {
 
   // 转码状态先算出来：徽章、meta、重试按钮都要用
   const segs = h.segments || [];
-  const pendingMp4 =
-    h.transcodePending ?? segs.filter((s) => s.mp4State === 'pending').length;
-  const failedMp4 = h.transcodeFailed ?? segs.filter((s) => s.mp4State === 'failed').length;
+  /**
+   * 合并任务：整场一个 MP4，状态挂在任务上（h.mp4State），
+   * 段只有 staged / merged 两种，不会出现 pending。
+   * 不能再用「有几段 pending」去算，那样永远算出 0。
+   *
+   * 旧记录没有 merged 字段，按同样特征兜底推断：段全在 R2、
+   * 没有任何一段落地。这样历史里的老任务也能显示「重新合并」而不是
+   * 「N 段未完成」。
+   */
+  const merged = Boolean(h.merged) ||
+    (segs.length > 0 &&
+      segs.every((s) => s.mp4State === 'staged' || s.mp4State === 'merged') &&
+      !h.remotePath);
+  const pendingMp4 = merged
+    ? h.mp4State === 'pending'
+      ? 1
+      : 0
+    : (h.transcodePending ?? segs.filter((s) => s.mp4State === 'pending').length);
+  const failedMp4 = merged
+    ? h.mp4State === 'failed'
+      ? 1
+      : 0
+    : (h.transcodeFailed ?? segs.filter((s) => s.mp4State === 'failed').length);
 
   const badge = {
     done: `<span class="badge done">${icon('check', 'ic ic-xs')}完成</span>`,
@@ -773,7 +847,7 @@ function renderHistItem(h) {
    * 而实际上 MP4 可能还在 Actions 里跑。
    */
   const tcBadge = pendingMp4
-    ? '<span class="badge processing">转码中</span>'
+    ? `<span class="badge processing">${merged ? '合并转码中' : '转码中'}</span>`
     : failedMp4
       ? '<span class="badge failed">转码失败</span>'
       : '';
@@ -792,15 +866,37 @@ function renderHistItem(h) {
   /**
    * 待处理数量。
    *
-   * 直播：真正"没着落"的段 = 总数 - 已落地 - 转码中。
-   *   - 已落地：MP4 确认出现在 OpenList
-   *   - 转码中：已提交 Actions，正在等 MP4 落地（不算失败，不能催重试）
-   *   - 其余：提交失败 / 从没提交 / 容器重启打断 → 需要「重传」
+   * 合并任务：只有"合并失败"才算待处理，数量恒为 1（一次合并）。
+   * 不能按段数算 —— 段全在 R2 里、MP4 还没生成时，会显示成
+   * 「N 段未完成」并弹出一个「重传 N」按钮，点下去还会拆成 N 个 MP4。
    *
-   * 单文件：转码中的单独提示，没提交成功的算未完成。
+   * 非合并任务：没着落的段 = 总数 - 已落地 - 转码中。
    */
   let missing = 0;
-  if (h.live && h.segment !== false) {
+  if (merged) {
+    const total = h.segmentCount || segs.length || 0;
+    const staged = h.segmentsSubmitted || 0;
+    let seg = `<span>分段 <b>${total}</b> 段`;
+    if (h.remotePath) {
+      seg += `，已合并为 <b class="ok">1 个 MP4</b>`;
+    } else if (pendingMp4) {
+      seg += `，<b class="ok">合并转码中</b>`;
+      if (staged) seg += `（已存 R2 ${staged} 段）`;
+    } else if (failedMp4) {
+      missing = 1;
+      seg += `，<b class="err">合并失败</b>`;
+    } else if (staged) {
+      /**
+       * 旧记录：段都在 R2，但没有 merged 字段、也没有 mp4State，
+       * 无法判断 MP4 到底生成没有。给一个「重新合并」的入口，
+       * 总比显示成「已完成」然后让用户去网盘里找强。
+       */
+      missing = 1;
+      seg += `，已存 R2 ${staged} 段（合并状态未知）`;
+    }
+    seg += '</span>';
+    meta.push(seg);
+  } else if (h.live && h.segment !== false) {
     const total = h.segmentCount || 0;
     const up = h.segmentsUploaded || 0;
     missing = Math.max(0, total - up - pendingMp4);
@@ -819,12 +915,14 @@ function renderHistItem(h) {
     meta.push('<span class="err">上传未完成</span>');
   }
   if (h.remotePath) meta.push(`<span class="ok" title="${esc(h.remotePath)}">${icon('cloud', 'ic ic-xs')} ${esc(h.remotePath)}</span>`);
+  if (h.mergeError) meta.push(`<span class="err" title="${esc(h.mergeError)}">${esc(h.mergeError)}</span>`);
   if (h.error) meta.push(`<span class="err" title="${esc(h.error)}">${esc(h.error)}</span>`);
 
-  // 目录：优先用后端算好的 remoteDir，其次从 remotePath / 首段路径推
+  // 目录：优先用后端算好的 remoteDir，其次从 remotePath / 预期路径推
   const dir =
     h.remoteDir ||
     folderOf(h.remotePath) ||
+    folderOf(h.expectedPath) ||
     folderOf((h.segments || []).find((s) => s.remotePath)?.remotePath || '');
 
   const folderBtn = dir
@@ -841,9 +939,10 @@ function renderHistItem(h) {
    * 曾经显示成「重传 4」而实际只有 2 段。failedMp4 只用于徽章。
    */
   const needRetry = missing;
+  const retryLabel = merged ? '重新合并' : `重传 ${needRetry}`;
   const retryUpBtn = needRetry
     ? `<button class="btn btn-warn btn-xs" data-hact="retryup" data-hid="${h.id}"
-         title="${needRetry} 段未完成，点击重试">${icon('refresh', 'ic ic-xs')}重传 ${needRetry}</button>`
+         title="${merged ? '重新提交一次整场合并转码' : `${needRetry} 段未完成，点击重试`}">${icon('refresh', 'ic ic-xs')}${retryLabel}</button>`
     : '';
 
   return `
@@ -889,8 +988,6 @@ async function loadHistory() {
     const d = await r.json();
     hist.pages = d.pages;
     state.histTotal = d.total;
-    // 缓存下来供「今日完成」统计用
-    state.histItems = d.items || [];
     updateStats();
 
     if (!d.items.length) {
@@ -960,16 +1057,24 @@ $('#urlInput').addEventListener('keydown', (e) => {
 });
 
 $('#btnClear').addEventListener('click', async () => {
-  const r = await fetch('/api/tasks/clear', { method: 'POST' });
-  const j = await r.json();
-  for (const [id, t] of state.tasks) {
-    if (!RUNNING.includes(t.status)) {
-      state.tasks.delete(id);
-      state.logs.delete(id);
+  try {
+    const r = await fetch('/api/tasks/clear', { method: 'POST' });
+    if (r.status === 401) { showLogin(); return; }
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || '清空失败');
+    for (const [id, t] of state.tasks) {
+      if (!RUNNING.includes(t.status)) {
+        state.tasks.delete(id);
+        state.logs.delete(id);
+      }
     }
+    renderAll();
+    toast(`已清空 ${j.removed ?? 0} 条`);
+  } catch (e) {
+    // 之前没有 try：会话过期时 j.removed 是 undefined，
+    // 会弹出「已清空 undefined 条」，用户以为成功了
+    toast(e.message, 'err');
   }
-  renderAll();
-  toast(`已清空 ${j.removed} 条`);
 });
 
 $('#btnLogin').addEventListener('click', doLogin);
@@ -1009,12 +1114,18 @@ $('#btnHistRefresh').addEventListener('click', loadHistory);
 
 $('#btnHistClear').addEventListener('click', async () => {
   if (!confirm('确定清空全部历史记录？此操作不可恢复。')) return;
-  const r = await fetch('/api/history', { method: 'DELETE' });
-  const j = await r.json();
-  toast(`已清空 ${j.removed} 条历史`);
-  hist.page = 1;
-  state.histTotal = 0;
-  loadHistory();
+  try {
+    const r = await fetch('/api/history', { method: 'DELETE' });
+    if (r.status === 401) { showLogin(); return; }
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || '清空失败');
+    toast(`已清空 ${j.removed ?? 0} 条历史`);
+    hist.page = 1;
+    state.histTotal = 0;
+    loadHistory();
+  } catch (e) {
+    toast(e.message, 'err');
+  }
 });
 
 // 历史条目操作
@@ -1043,20 +1154,40 @@ document.addEventListener('click', async (e) => {
     if (!link) return toast('未配置 OpenList 地址', 'err');
     window.open(link, '_blank', 'noopener');
   } else if (hact === 'retryup') {
-    // 重试上传失败的分段
+    // 重试上传失败的分段 / 重新提交合并
     const hid = item?.dataset.hid;
     if (!hid) return;
-    item.disabled = true;
+    /**
+     * 必须禁用的是按钮本身。
+     *
+     * 之前写成 `item.disabled = true`，而 item 是 .hist-item 这个 div ——
+     * 给 div 设 disabled 没有任何效果，请求还没回来时再点一下就会
+     * 再发一次。合并任务连点两次 = 两次 workflow_dispatch，
+     * 白白多跑一个 3 小时的 Actions。
+     */
+    btn.disabled = true;
     try {
       const r = await fetch(`/api/tasks/${hid}/retry-upload`, { method: 'POST' });
+      if (r.status === 401) { showLogin(); return; }
       const j = await r.json();
       if (!r.ok) throw new Error(j.error);
-      toast(`已提交 ${j.submitted} 段${j.failed ? `，仍失败 ${j.failed} 段` : ''}`, j.failed ? 'warn' : 'ok');
+      /**
+       * 接口是 202 fire-and-forget，返回里只有 segments（待处理数量），
+       * 没有 submitted/failed —— 那是同步时代的字段。具体成败看任务日志。
+       */
+      toast(
+        j.merged
+          ? `已重新提交合并转码${j.missing ? `（含 ${j.missing} 段待补传）` : ''}，完成后 MP4 会出现在网盘`
+          : `已提交 ${j.segments || 0} 段重传，进度见任务日志`,
+        'ok',
+      );
       loadHistory();
+      // 后台任务是异步的，3 秒后再刷一次才能看到状态变化
+      setTimeout(loadHistory, 3000);
     } catch (e) {
       toast(e.message, 'err');
     } finally {
-      item.disabled = false;
+      btn.disabled = false;
     }
   } else if (hact === 'retry') {
     try {
@@ -1122,53 +1253,64 @@ document.addEventListener('click', (e) => {
 /* ---------------- 启动 ---------------- */
 
 (async function init() {
-  applyTheme(document.documentElement.dataset.theme || 'dark', false);
-  await refreshChips();
-
-  // 未配置密码时不给登录框，直接提示去配置
   try {
-    const h = await (await fetch('/api/health')).json();
-    if (h.passwordConfigured === false) { showConfigMissing(); return; }
-  } catch { /* 忽略，继续常规流程 */ }
+    applyTheme(document.documentElement.dataset.theme || 'dark', false);
+    await refreshChips();
 
-  const r = await fetch('/api/tasks');
-  if (r.status === 401) { showLogin(); return; }
-  if (r.status === 503) { showConfigMissing(); return; }
+    // 未配置密码时不给登录框，直接提示去配置
+    try {
+      const h = await (await fetch('/api/health')).json();
+      if (h.passwordConfigured === false) { showConfigMissing(); return; }
+    } catch { /* 忽略，继续常规流程 */ }
 
-  connectSSE();
-  setInterval(refreshChips, 30000);
+    const r = await fetch('/api/tasks');
+    if (r.status === 401) { showLogin(); return; }
+    if (r.status === 503) { showConfigMissing(); return; }
 
-  /**
-   * 登录后立刻拉一次历史总数。
-   *
-   * 不这么做的话，「历史记录」标签上的数字要等用户点进去才正确 ——
-   * 因为总数来自 /api/history，而那个请求原本只在切到历史页时才发。
-   */
-  refreshHistoryCount();
-  // 每 60 秒刷新一次，别人在另一台设备上删了记录也能同步
-  setInterval(refreshHistoryCount, 60000);
+    connectSSE();
+    setInterval(refreshChips, 30000);
 
-  /**
-   * 定时把「刚结束、已过保留期」的卡片从进行中列表移走。
-   *
-   * 没有这个定时器的话，结束的卡片会一直挂着，
-   * 直到下一次有任务更新触发重渲染才消失。
-   */
-  setInterval(() => {
-    const el = $('#taskList');
-    if (!el) return;
-    let removed = false;
-    $$('.task', el).forEach((card) => {
-      const t = state.tasks.get(card.dataset.id);
-      if (t && !isActiveTask(t)) {
-        card.remove();
-        removed = true;
+    /**
+     * 登录后立刻拉一次历史总数。
+     *
+     * 不这么做的话，「历史记录」标签上的数字要等用户点进去才正确 ——
+     * 因为总数来自 /api/history，而那个请求原本只在切到历史页时才发。
+     */
+    refreshHistoryCount();
+    // 每 60 秒刷新一次，别人在另一台设备上删了记录也能同步
+    setInterval(refreshHistoryCount, 60000);
+
+    // 概览的「今日完成」由服务端统计，启动时拉一次
+    refreshTodayDone();
+    setInterval(refreshTodayDone, 60000);
+
+    /**
+     * 定时把「刚结束、已过保留期」的卡片从进行中列表移走。
+     *
+     * 没有这个定时器的话，结束的卡片会一直挂着，
+     * 直到下一次有任务更新触发重渲染才消失。
+     */
+    setInterval(() => {
+      const el = $('#taskList');
+      if (!el) return;
+      let removed = false;
+      $$('.task', el).forEach((card) => {
+        const t = state.tasks.get(card.dataset.id);
+        if (t && !isActiveTask(t)) {
+          card.remove();
+          removed = true;
+        }
+      });
+      if (removed) {
+        if (!el.querySelector('.task')) el.innerHTML = emptyTasksHtml();
+        updateStats();
+        updateTabCounts();
       }
-    });
-    if (removed) {
-      if (!el.querySelector('.task')) el.innerHTML = emptyTasksHtml();
-      updateStats();
-      updateTabCounts();
-    }
-  }, 15000);
+    }, 15000);
+  } catch (e) {
+    // 之前这里没有兜底：/api/tasks 网络失败会让整个 init 静默中断，
+    // 页面停在「连接中」，用户完全不知道发生了什么
+    toast(`初始化失败：${e.message}，请刷新页面`, 'err');
+    console.error('[init]', e);
+  }
 })();

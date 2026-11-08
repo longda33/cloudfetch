@@ -29,18 +29,20 @@ export class TranscodeError extends Error {
  * transcode.yml 里声明的一致。之前三个调用点各拼一遍，改一个字段
  * 很容易漏掉另外两个。
  */
-export function buildTranscodeInputs({
-  sourceUrl,
-  r2Key,
-  r2Keys,
-  outName,
-  openlistDir,
-  taskId,
-  segIndex = 0,
-}) {
+export function buildTranscodeInputs({ sourceUrl, r2Key, r2Keys, outName, openlistDir, taskId }) {
+  /**
+   * 返回的每个键都必须在 transcode.yml 的 `on.workflow_dispatch.inputs`
+   * 里声明过。
+   *
+   * GitHub 的 dispatch 接口对未声明的 input 直接返回
+   * 422 `Unexpected inputs provided: ["xxx"]`，整条转码链路会挂掉，
+   * 而且报错信息里不会告诉你是哪个字段少了声明。
+   * test/transcode-flow.test.js 里有一条用例专门比对这两个集合。
+   */
   return {
     // 单文件模式用 source_url，多段合并模式用 r2_keys（逗号分隔）
     source_url: String(sourceUrl || ''),
+    // 单文件模式下用来在 Actions 里删掉 R2 源文件（合并模式用 r2_keys 逐段删）
     r2_key: String(r2Key || ''),
     r2_keys: Array.isArray(r2Keys) ? r2Keys.join(',') : String(r2Keys || ''),
     out_name: String(outName),
@@ -64,18 +66,41 @@ export async function dispatchTranscode(inputs, { signal } = {}) {
   }
 
   const url = `https://api.github.com/repos/${repo}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      'Content-Type': 'application/json',
-      'User-Agent': 'cloudfetch',
-    },
-    body: JSON.stringify({ ref, inputs }),
-    signal,
-  });
+
+  /**
+   * 必须带超时。
+   *
+   * dispatch 发生在录制收尾阶段，调用方要等它返回才会把任务标成 done。
+   * GitHub 偶尔会长时间不响应（不是失败，就是挂着），而 fetch 默认
+   * 永不超时 —— 一次挂住就等于任务永远停在「下载中」，用户只能重启服务。
+   */
+  const timeout = AbortSignal.timeout(Math.max(5000, config.transcode.dispatchTimeoutMs));
+  const merged = signal ? AbortSignal.any([signal, timeout]) : timeout;
+
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'Content-Type': 'application/json',
+        'User-Agent': 'cloudfetch',
+      },
+      body: JSON.stringify({ ref, inputs }),
+      signal: merged,
+    });
+  } catch (e) {
+    if (e?.name === 'TimeoutError') {
+      throw new TranscodeError(
+        `触发转码超时（${Math.round(config.transcode.dispatchTimeoutMs / 1000)} 秒无响应）。` +
+          'GitHub API 可能临时不可用，稍后可在历史记录里重试',
+        0,
+      );
+    }
+    throw e;
+  }
 
   // 成功返回 204 No Content
   if (res.status === 204) return { ok: true };
