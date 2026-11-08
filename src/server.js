@@ -5,7 +5,7 @@ import express from 'express';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { config, openlistConfigured, printConfig } from './config.js';
+import { config, openlistConfigured, printConfig, transcodeConfigured } from './config.js';
 import { getTaskManager } from './tasks.js';
 import { getOpenList } from './openlist.js';
 import { getHistoryStore } from './history.js';
@@ -464,7 +464,7 @@ app.get('*', (req, res) => {
 // ---------------- 启动 ----------------
 printConfig();
 
-const server = app.listen(config.port, config.host, () => {
+export const server = app.listen(config.port, config.host, () => {
   console.log(`[server] 监听 http://${config.host}:${config.port}`);
 });
 
