@@ -414,7 +414,41 @@ function updateTabCounts() {
   const running = tasks.filter((t) => RUNNING.includes(t.status)).length;
   const finished = tasks.filter((t) => !RUNNING.includes(t.status)).length;
   $('#cntActive').textContent = running;
-  $('#cntHistory').textContent = state.histTotal || finished;
+
+  /**
+   * 历史记录数量必须以服务端的总数为准。
+   *
+   * 之前写成 `state.histTotal || finished`，问题有两个：
+   *   1) 登录后 state.histTotal 还是 0，只能拿内存里的 finished 兜底，
+   *      而历史记录大多存在 OpenList 上、不在内存里，所以数量偏少；
+   *   2) 点进历史记录后才加载，这时 histTotal 才被填上，
+   *      于是「点一下数字才对」。
+   *
+   * 现在：histTotal 有值就用它，没值时才用 finished 兜底。
+   * 并且在登录成功后主动拉一次总数，见 refreshHistoryCount()。
+   */
+  $('#cntHistory').textContent =
+    state.histTotal > 0 ? state.histTotal : finished;
+}
+
+/**
+ * 只拉历史记录的总数，不加载列表。
+ *
+ * 登录后立刻调一次，让「历史记录」标签上的数字在用户点进去之前就是对的。
+ * per_page=1 是为了少传数据 —— 只要 d.total。
+ */
+async function refreshHistoryCount() {
+  try {
+    const r = await fetch('/api/history?page=1&pageSize=1');
+    if (!r.ok) return;
+    const d = await r.json();
+    if (typeof d.total === 'number') {
+      state.histTotal = d.total;
+      updateTabCounts();
+    }
+  } catch {
+    /* 拉不到就保持原样，不打扰用户 */
+  }
 }
 
 /* ---------------- SSE ---------------- */
@@ -565,9 +599,9 @@ async function refreshChips() {
     state.authRequired = h.authRequired;
     state.limits = h.limits || {};
 
-    setPill('#chipOpenlist',
+    setPill('#chipR2',
       h.openlist ? 'on' : 'warn',
-      h.openlist ? 'OpenList 已配置' : 'OpenList 未配置');
+      h.transcode?.enabled ? 'R2 转码已启用' : 'R2 转码未配置');
 
     if (state.limits.maxConcurrent != null) {
       $('#statRunningSub').textContent = `并发上限 ${state.limits.maxConcurrent}`;
@@ -992,6 +1026,16 @@ document.addEventListener('click', (e) => {
 
   connectSSE();
   setInterval(refreshChips, 30000);
+
+  /**
+   * 登录后立刻拉一次历史总数。
+   *
+   * 不这么做的话，「历史记录」标签上的数字要等用户点进去才正确 ——
+   * 因为总数来自 /api/history，而那个请求原本只在切到历史页时才发。
+   */
+  refreshHistoryCount();
+  // 每 60 秒刷新一次，别人在另一台设备上删了记录也能同步
+  setInterval(refreshHistoryCount, 60000);
 
   /**
    * 定时把「刚结束、已过保留期」的卡片从进行中列表移走。

@@ -11,7 +11,8 @@ import { config, transcodeConfigured } from './config.js';
 import { runDownload } from './downloader.js';
 import { getOpenList, buildRemotePath } from './openlist.js';
 import { getHistoryStore } from './history.js';
-import { submitTaskArtifacts } from './transcode.js';
+import { submitTaskArtifacts, dispatchTranscode } from './transcode.js';
+import { getR2 } from './r2.js';
 import { detectKind, humanSize } from './util/links.js';
 
 /** 目录剩余空间（字节）；拿不到就返回 null，不要因为探测失败就阻断任务 */
@@ -418,23 +419,58 @@ export class TaskManager extends EventEmitter {
         date: t.createdAt,
       });
       try {
-        await ol.uploadFile(local, remote, { onLog: (m) => this._log(t, m) });
-        const seg = (t.segments || []).find((s) => s.index === item.index);
-        if (seg) seg.remotePath = remote;
-
         /**
-         * 单文件任务没有 segments 数组，index=0 就是那个唯一的文件。
-         * 补传成功后要把 remotePath 写到任务上，否则前端和
-         * _historyRecord 都以为它还没传。
+         * 重传走和首次相同的链路：转码配置好了就 R2 → Actions，
+         * 否则退回直接传 OpenList。不能一律传 OpenList，
+         * 否则重传的结果和正常流程不一致（一个 MP4 一个 FLV）。
          */
-        if (!t.segments?.length) {
-          t.remotePath = remote;
+        if (transcodeConfigured()) {
+          const r2 = getR2();
+          const base = path.basename(item.filename || '', path.extname(item.filename || ''));
+          const key = `${config.r2.prefix}/${t.id}/${base}.flv`;
+          const openlistDir = this._remoteDirOf(t);
+
+          this._log(t, `第 ${item.index} 段重传：上传 R2 → ${key}`);
+          await r2.putFile(local, key, { contentType: 'video/x-flv' });
+          this._log(t, `第 ${item.index} 段已上传 R2，触发转码`);
+          await dispatchTranscode({
+            source_url: r2.presignGet(key, config.r2.presignExpires),
+            r2_key: key,
+            out_name: `${base}.mp4`,
+            openlist_dir: openlistDir,
+            crf: String(config.transcode.crf),
+            preset: config.transcode.preset,
+            task_id: t.id,
+            seg_index: String(item.index),
+          });
+
+          const seg = (t.segments || []).find((s) => s.index === item.index);
+          if (seg) seg.remotePath = `${openlistDir}/${base}.mp4`;
+          if (!t.segments?.length) {
+            t.remotePath = `${openlistDir}/${base}.mp4`;
+            t.transcoded = { submitted: 1, failed: 0, skipped: false };
+          }
+          this._log(t, `第 ${item.index} 段重传成功 → ${openlistDir}/${base}.mp4`);
+        } else {
+          await ol.uploadFile(local, remote, { onLog: (m) => this._log(t, m) });
+          const seg = (t.segments || []).find((s) => s.index === item.index);
+          if (seg) seg.remotePath = remote;
+
+          /**
+           * 单文件任务没有 segments 数组，index=0 就是那个唯一的文件。
+           * 补传成功后要把 remotePath 写到任务上，否则前端和
+           * _historyRecord 都以为它还没传。
+           */
+          if (!t.segments?.length) {
+            t.remotePath = remote;
+          }
+          this._log(t, `第 ${item.index} 段重试成功 → ${remote}`);
         }
 
         ok++;
-        this._log(t, `第 ${item.index} 段重试成功 → ${remote}`);
         if (config.openlist.deleteAfterUpload) {
           await fsp.rm(local, { force: true }).catch(() => {});
+          const seg = (t.segments || []).find((s) => s.index === item.index);
           if (seg) seg.deleted = true;
           if (!t.segments?.length) t.localPath = '';
         }
@@ -567,17 +603,102 @@ export class TaskManager extends EventEmitter {
      */
     const pendingUploads = new Set();
 
+    /**
+     * 分段处理：先传 R2，再触发转码，**不直接传 OpenList**。
+     *
+     * 流程（用户指定）：
+     *   Unikraft 录制 → R2 → GitHub Actions 转码 → OpenList
+     *
+     * OpenList 只存最终的 MP4，不再存原始 FLV。
+     * 好处是网盘里只有能直接播放的文件，不用再筛。
+     *
+     * 失败处理：任何一步失败都**不删本地文件**，
+     * 并登记到 failedSegments，用户可以在历史记录里点「重传」。
+     */
     const doUploadSegment = async (rec) => {
       if (!t.upload) {
         onLog(`第 ${rec.index} 段：未开启上传，保留本地`);
         return;
       }
+      if (!transcodeConfigured()) {
+        // 没配转码链路时退回旧行为：直接传 OpenList 存原始文件
+        onLog(`第 ${rec.index} 段：转码链路未配置，直接传 OpenList`);
+        await uploadSegmentToOpenList(rec);
+        return;
+      }
+
+      onLog(`第 ${rec.index} 段开始处理：R2 → 转码 → OpenList（${humanSize(rec.size)}）`);
+      try {
+        await uploadSegmentToR2(rec);
+      } catch (e) {
+        onLog(`第 ${rec.index} 段 R2 上传失败：${e.message}（文件保留本地）`);
+        recordFailure(rec, `R2 上传失败：${e.message}`);
+        throw e;
+      }
+
+      /**
+       * 转码已经派出去了，MP4 的落点是可以算出来的（Actions 按
+       * openlist_dir + out_name 写），所以这里就把 remotePath 填上。
+       *
+       * 不填的话：segmentsUploaded 永远是 0，历史记录显示「已传 0 段」，
+       * 清理逻辑也会误判成"还没传成功"而保留整个任务目录。
+       */
+      const base = path.basename(rec.filename, path.extname(rec.filename));
+      rec.remotePath = `${this._remoteDirOf(t)}/${base}.mp4`;
+      rec.transcoded = true;
+      t.segmentsUploaded = (t.segmentsUploaded || 0) + 1;
+      // 成功了就从失败列表里移除（可能是重传成功的）
+      t.failedSegments = (t.failedSegments || []).filter((x) => x.index !== rec.index);
+      onLog(`第 ${rec.index} 段已送转码 → ${rec.remotePath}`);
+      this._emit(t);
+
+      /**
+       * R2 上传成功、转码已派出，本地文件就没用了。
+       *
+       * 注意顺序：失败时不删（上面 catch 里直接 throw，走不到这里），
+       * 只有确认 R2 有了副本才删。
+       */
+      if (config.openlist.deleteAfterUpload) {
+        try {
+          await fsp.rm(rec.path, { force: true });
+          rec.deleted = true;
+        } catch (e) {
+          onLog(`第 ${rec.index} 段删除失败：${e.message}`);
+        }
+      }
+    };
+
+    /** 把分段传到 R2 并触发转码 */
+    const uploadSegmentToR2 = async (rec) => {
+      const r2 = getR2();
+      const base = path.basename(rec.filename, path.extname(rec.filename));
+      const key = `${config.r2.prefix}/${t.id}/${base}.flv`;
+
+      await r2.putFile(rec.path, key, { contentType: 'video/x-flv', signal: ac.signal });
+      rec.r2Key = key;
+
+      // OpenList 目标目录（Actions 转完往这里传）
+      const openlistDir = this._remoteDirOf(t);
+      await dispatchTranscode({
+        source_url: r2.presignGet(key, config.r2.presignExpires),
+        r2_key: key,
+        out_name: `${base}.mp4`,
+        openlist_dir: openlistDir,
+        crf: String(config.transcode.crf),
+        preset: config.transcode.preset,
+        task_id: t.id,
+        seg_index: String(rec.index),
+      });
+      rec.transcodeSubmitted = true;
+    };
+
+    /** 旧路径：转码未配置时直接把 FLV 传 OpenList */
+    const uploadSegmentToOpenList = async (rec) => {
       const ol = getOpenList();
       if (!ol.configured) {
         onLog(`第 ${rec.index} 段：OpenList 未配置，保留本地`);
         return;
       }
-
       const remote = buildRemotePath(rec.filename, {
         taskId: t.id,
         baseName: t.baseName,
@@ -585,30 +706,14 @@ export class TaskManager extends EventEmitter {
       });
       onLog(`第 ${rec.index} 段开始上传 → ${remote}（${humanSize(rec.size)}）`);
       try {
-        await ol.uploadFile(rec.path, remote, {
-          signal: ac.signal,
-          onLog,
-        });
+        await ol.uploadFile(rec.path, remote, { signal: ac.signal, onLog });
       } catch (e) {
         onLog(`第 ${rec.index} 段上传失败：${e.message}`);
-        // 记下来，前端可以点「重试」
-        t.failedSegments = [
-          ...(t.failedSegments || []).filter((x) => x.index !== rec.index),
-          {
-            index: rec.index,
-            filename: rec.filename,
-            size: rec.size,
-            localPath: rec.path,
-            error: e.message,
-          },
-        ];
-        this._emit(t);
+        recordFailure(rec, e.message);
         throw e;
       }
-
       rec.remotePath = remote;
       t.segmentsUploaded = (t.segmentsUploaded || 0) + 1;
-      // 上传成功就从失败列表里移除（可能是重试成功的）
       t.failedSegments = (t.failedSegments || []).filter((x) => x.index !== rec.index);
       onLog(`第 ${rec.index} 段已上传：${remote}`);
       this._emit(t);
@@ -621,6 +726,21 @@ export class TaskManager extends EventEmitter {
           onLog(`第 ${rec.index} 段删除失败：${e.message}`);
         }
       }
+    };
+
+    /** 登记一个失败的分段，供前端「重传」按钮使用 */
+    const recordFailure = (rec, error) => {
+      t.failedSegments = [
+        ...(t.failedSegments || []).filter((x) => x.index !== rec.index),
+        {
+          index: rec.index,
+          filename: rec.filename,
+          size: rec.size,
+          localPath: rec.path,
+          error,
+        },
+      ];
+      this._emit(t);
     };
 
     /** 包装一层，把 promise 登记进集合；错误仍原样抛给下载器去记日志 */
@@ -756,75 +876,121 @@ export class TaskManager extends EventEmitter {
         this._emit(t);
         this._saveState();
 
-        const remote = buildRemotePath(dl.filename, {
-          taskId: t.id,
-          baseName: t.baseName,
-          date: t.createdAt,
-        });
-        onLog(`开始上传 → ${remote}`);
-
-        try {
-          await ol.uploadFile(dl.filePath, remote, {
-            signal: ac.signal,
-            onProgress: (total, uploaded) => {
-              t.uploaded = uploaded;
-              t.percent = total ? Math.min(99.9, (uploaded / total) * 100) : 0;
-              this._emit(t);
-            },
-            onLog,
-          });
-        } catch (e) {
-          /**
-           * 单文件上传失败也要登记，否则文件会被下面的清理逻辑删掉。
-           *
-           * 之前这里没有 try，异常直接冒到外层 catch，而外层清理条件是
-           * `!t.failedSegments?.length` —— failedSegments 只有直播分段
-           * 上传失败才会填，单文件永远是空数组，于是 jobDir 被整个删除，
-           * 下载好的文件白下，还没法重传。
-           *
-           * 用 index=0 作为单文件的段号，复用同一套重传机制。
-           */
-          t.failedSegments = [
-            {
-              index: 0,
-              filename: dl.filename,
-              size: dl.size,
-              localPath: dl.filePath,
-              error: e.message,
-            },
-          ];
-          this._emit(t);
-          throw e;
-        }
-
-        t.remotePath = remote;
-        t.percent = 100;
-        // 传成功了就把可能残留的失败记录清掉（重传成功的场景）
-        t.failedSegments = [];
-        onLog(`上传完成：${remote}`);
-        this._emit(t);
-        this._saveState();
-
         /**
-         * 转码必须在删本地文件之前。
+         * 流程：本地 → R2 → GitHub Actions 转码 → OpenList 存 MP4
          *
-         * 转码链路是「本地文件 → R2 → GitHub」，本地删了就传不上去了。
-         * 所以顺序是：OpenList 上传成功 → 提交转码 → 删本地。
+         * 不直接把原始文件传 OpenList —— 网盘里只放最终能播的 MP4。
+         * 转码链路没配时才退回「直接传 OpenList」。
          */
-        await this._submitTranscodes(
-          t,
-          [{ index: 0, filename: dl.filename, path: dl.filePath, size: dl.size }],
-          onLog,
-        );
+        if (transcodeConfigured()) {
+          const r2 = getR2();
+          const base = path.basename(dl.filename, path.extname(dl.filename));
+          const key = `${config.r2.prefix}/${t.id}/${base}.flv`;
+          const openlistDir = this._remoteDirOf(t);
 
-        // ---------- 3. 删除本地 ----------
-        if (config.openlist.deleteAfterUpload) {
           try {
-            await fsp.rm(dl.filePath, { force: true });
-            onLog('已删除本地文件');
-            t.localPath = '';
+            onLog(`上传到 R2 → ${key}（${humanSize(dl.size)}）`);
+            await r2.putFile(dl.filePath, key, {
+              contentType: 'video/x-flv',
+              signal: ac.signal,
+            });
+            t.r2Key = key;
+            t.percent = 100;
+            this._emit(t);
+
+            onLog('触发 GitHub Actions 转码…');
+            await dispatchTranscode({
+              source_url: r2.presignGet(key, config.r2.presignExpires),
+              r2_key: key,
+              out_name: `${base}.mp4`,
+              openlist_dir: openlistDir,
+              crf: String(config.transcode.crf),
+              preset: config.transcode.preset,
+              task_id: t.id,
+              seg_index: '0',
+            });
+
+            t.transcoded = { submitted: 1, failed: 0, skipped: false };
+            t.remotePath = `${openlistDir}/${base}.mp4`;
+            t.failedSegments = [];
+            onLog(`已提交转码：${base}.mp4 → ${openlistDir}`);
+            onLog('Actions 跑完会自动把 MP4 传到 OpenList');
+            this._emit(t);
+            this._saveState();
           } catch (e) {
-            onLog(`删除本地文件失败：${e.message}`);
+            // 任何一步失败都保留本地文件并登记，供「重传」使用
+            t.failedSegments = [
+              {
+                index: 0,
+                filename: dl.filename,
+                size: dl.size,
+                localPath: dl.filePath,
+                error: e.message,
+              },
+            ];
+            onLog(`转码提交失败：${e.message}（文件保留本地）`);
+            this._emit(t);
+            throw e;
+          }
+
+          // 只有 R2 上传 + 触发都成功，才删本地
+          if (config.openlist.deleteAfterUpload) {
+            try {
+              await fsp.rm(dl.filePath, { force: true });
+              onLog('已删除本地文件');
+              t.localPath = '';
+            } catch (e) {
+              onLog(`删除本地文件失败：${e.message}`);
+            }
+          }
+        } else {
+          // ---------- 未配置转码：直接传 OpenList ----------
+          const remote = buildRemotePath(dl.filename, {
+            taskId: t.id,
+            baseName: t.baseName,
+            date: t.createdAt,
+          });
+          onLog(`开始上传 → ${remote}`);
+
+          try {
+            await ol.uploadFile(dl.filePath, remote, {
+              signal: ac.signal,
+              onProgress: (total, uploaded) => {
+                t.uploaded = uploaded;
+                t.percent = total ? Math.min(99.9, (uploaded / total) * 100) : 0;
+                this._emit(t);
+              },
+              onLog,
+            });
+          } catch (e) {
+            t.failedSegments = [
+              {
+                index: 0,
+                filename: dl.filename,
+                size: dl.size,
+                localPath: dl.filePath,
+                error: e.message,
+              },
+            ];
+            this._emit(t);
+            throw e;
+          }
+
+          t.remotePath = remote;
+          t.percent = 100;
+          t.failedSegments = [];
+          onLog(`上传完成：${remote}`);
+          this._emit(t);
+          this._saveState();
+
+          if (config.openlist.deleteAfterUpload) {
+            try {
+              await fsp.rm(dl.filePath, { force: true });
+              onLog('已删除本地文件');
+              t.localPath = '';
+            } catch (e) {
+              onLog(`删除本地文件失败：${e.message}`);
+            }
           }
         }
       }
@@ -977,15 +1143,19 @@ export class TaskManager extends EventEmitter {
 
   /** 算任务的远端目录，供转码结果落地时对照 */
   _remoteDirOf(t) {
-    const segs = t.segments || [];
-    const first = segs.find((s) => s.remotePath)?.remotePath || t.remotePath || '';
-    if (!first) {
-      // 兜底：按规则自己拼
-      return buildRemotePath('', { taskId: t.id, baseName: t.baseName, date: t.createdAt })
-        .replace(/\/$/, '');
-    }
-    const i = first.lastIndexOf('/');
-    return i > 0 ? first.slice(0, i) : '';
+    /**
+     * 一律按规则计算，不依赖已经上传成功的 remotePath。
+     *
+     * 之前优先从 segments[].remotePath 反推目录，但新流程里
+     * remotePath 是在转码**提交时**就算出来的，那时还没有任何
+     * 分段真的传成功 —— 反推会拿到空字符串，导致 Actions 把 MP4
+     * 传到错误的位置。规则是确定性的，直接算更可靠。
+     */
+    return buildRemotePath('', {
+      taskId: t.id,
+      baseName: t.baseName,
+      date: t.createdAt,
+    }).replace(/\/$/, '');
   }
 
   /** 从任务对象提炼一条精简的历史记录（不含日志，避免体积过大） */

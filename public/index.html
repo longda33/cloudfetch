@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="color-scheme" content="dark light">
 <title>CloudFetch · 云端下载器</title>
-<meta name="description" content="粘贴链接即可云端下载，实时进度，自动上传 OpenList 并清理本地文件。">
+<meta name="description" content="粘贴链接即可云端下载，经 R2 中转、GitHub 自动转码 MP4，最终存入 OpenList 并清理本地文件。">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☁️</text></svg>">
 <!--
   主题初始化必须放在样式表之前、并且是阻塞脚本，否则会先渲染一帧默认主题再跳变（闪白）。
@@ -63,8 +63,8 @@
         <span class="pill" id="chipSse" data-state="idle" title="实时推送连接状态">
           <i class="dot"></i><span data-role="text">连接中</span>
         </span>
-        <span class="pill" id="chipOpenlist" data-state="idle" title="OpenList 配置状态">
-          <i class="dot"></i><span data-role="text">OpenList</span>
+        <span class="pill" id="chipR2" data-state="idle" title="R2 转码链路状态">
+          <i class="dot"></i><span data-role="text">R2</span>
         </span>
         <span class="pill" id="chipDisk" data-state="idle" title="临时目录磁盘空间">
           <i class="dot"></i><span data-role="text">磁盘</span>
@@ -80,7 +80,7 @@
   <section class="hero">
     <div class="hero-copy">
       <h1>把链接丢进来，剩下的交给云端</h1>
-      <p>支持 <b>HTTP 直链</b>、<b>HLS</b>、<b>FLV / RTMP 直播</b>；下完自动上传 OpenList 并清理本地，磁盘占用恒定在一两段文件。</p>
+      <p>支持 <b>HTTP 直链</b>、<b>HLS</b>、<b>FLV / RTMP 直播</b>；下完经 <b>R2 中转</b>、<b>GitHub 自动转码 MP4</b>，再存入 OpenList 并清理本地，磁盘占用恒定在一两段文件。</p>
     </div>
 
     <form class="composer" id="composer" autocomplete="off">
@@ -103,13 +103,13 @@
           <label class="switch" title="关闭后文件只留在服务器本地">
             <input type="checkbox" id="uploadToggle" checked>
             <span class="switch-track"><span class="switch-thumb"></span></span>
-            <span>上传 OpenList</span>
+            <span>转码后存 OpenList</span>
           </label>
-          <button class="btn btn-primary" id="btnAddSeg" type="submit" title="直播按时间切段，每段独立上传">
+          <button class="btn btn-primary" id="btnAddSeg" type="submit" title="直播按时间切段，每段独立走 R2 → 转码 → OpenList">
             <svg class="ic" aria-hidden="true"><use href="#i-layers"></use></svg>
             分段下载
           </button>
-          <button class="btn btn-ghost" id="btnAddWhole" type="button" title="整场录成单个文件，停止后才上传">
+          <button class="btn btn-ghost" id="btnAddWhole" type="button" title="整场录成单个文件，停止后走 R2 → 转码 → OpenList">
             <svg class="ic" aria-hidden="true"><use href="#i-download"></use></svg>
             全段下载
           </button>
@@ -117,8 +117,8 @@
       </div>
 
       <p class="hint">
-        <span><b>分段下载</b>：按时间切段，每段独立上传，断流不丢已录内容。</span>
-        <span><b>全段下载</b>：整场一个文件，需手动停止才上传。</span>
+        <span><b>分段下载</b>：按时间切段，每段独立转码上传，断流不丢已录内容。</span>
+        <span><b>全段下载</b>：整场一个文件，需手动停止才转码上传。</span>
         <span class="nowrap">提交快捷键 <kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>Enter</kbd></span>
       </p>
     </form>
@@ -234,7 +234,7 @@
   <div class="dialog" id="loginDialog">
     <div class="dialog-icon"><svg class="ic" aria-hidden="true"><use href="#i-lock"></use></svg></div>
     <h2>需要访问密码</h2>
-    <p>这个面板能把任意文件写进你的 OpenList，请先验证身份。</p>
+    <p>这个面板能把任意文件转码后写进你的 OpenList，请先验证身份。</p>
     <input type="password" id="pwdInput" placeholder="输入访问密码" autocomplete="current-password" aria-label="访问密码">
     <button class="btn btn-primary btn-block" id="btnLogin" type="button">进入面板</button>
     <p class="dialog-foot">密码来自环境变量 <code>PANEL_PASSWORD</code></p>
