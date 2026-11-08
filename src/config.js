@@ -186,13 +186,13 @@ export const config = {
     /** 总开关。需要同时配好 R2 和下面三项才会真正生效 */
     enabled: bool(env.TRANSCODE_ENABLED, true),
     /** GitHub 仓库，形如 longda33/cloudfetch */
-    repo: env.GITHUB_REPO || '',
+    repo: env.GH_REPO || '',
     /** workflow 文件名（.github/workflows/ 下的文件名） */
-    workflow: env.GITHUB_TRANSCODE_WORKFLOW || 'transcode.yml',
+    workflow: env.GH_WORKFLOW || 'transcode.yml',
     /** 触发用的分支 */
-    ref: env.GITHUB_TRANSCODE_REF || 'main',
+    ref: env.GH_REF || 'main',
     /** fine-grained PAT */
-    token: env.GITHUB_TOKEN || '',
+    token: env.GH_PAT || '',
     /** CRF 值，越小越清晰、体积越大。23 是 H.264 的常用平衡点 */
     crf: num(env.TRANSCODE_CRF, 23),
     /** 编码预设。veryfast 在 4 核上速度/体积比最合适 */

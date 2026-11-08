@@ -34,7 +34,7 @@ export class TranscodeError extends Error {
 export async function dispatchTranscode(inputs, { signal } = {}) {
   const { repo, workflow, ref, token } = config.transcode;
   if (!repo || !token) {
-    throw new TranscodeError('未配置 GITHUB_REPO / GITHUB_TOKEN，无法触发转码');
+    throw new TranscodeError('未配置 GH_REPO / GH_PAT，无法触发转码');
   }
 
   const url = `https://api.github.com/repos/${repo}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`;
@@ -56,7 +56,7 @@ export async function dispatchTranscode(inputs, { signal } = {}) {
   if (res.status === 404) {
     throw new TranscodeError(
       `触发失败：仓库或 workflow 不存在（${repo} / ${workflow}）。` +
-        '检查 GITHUB_REPO 拼写、workflow 文件名，以及 PAT 是否有 Actions 写权限',
+        '检查 GH_REPO 拼写、workflow 文件名，以及 PAT 是否有 Actions 写权限',
       404,
     );
   }
