@@ -62,8 +62,13 @@ jobs:
         with:
           node-version: '20'
 
-      - name: 检查 ffmpeg
+      # ubuntu-latest 默认不带 ffmpeg，必须自己装。
+      # apt 源里的 ffmpeg 已编译进 libx264 和 aac，够用。
+      - name: 安装 ffmpeg
         run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
           ffmpeg -version | head -1
           ffmpeg -hide_banner -encoders 2>/dev/null | grep -E 'libx264|aac' || {
             echo "::error::ffmpeg 缺少 libx264 或 aac 编码器"
@@ -80,7 +85,7 @@ jobs:
           PRESET: ${{ inputs.preset }}
           TASK_ID: ${{ inputs.task_id }}
           SEG_INDEX: ${{ inputs.seg_index }}
-          OPENLIST_URL: ${{ secrets.OPENLIST_URL }}
+          OPENLIST_URL: ${{ vars.OPENLIST_URL }}
           OPENLIST_TOKEN: ${{ secrets.OPENLIST_TOKEN }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}

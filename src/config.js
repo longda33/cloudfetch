@@ -192,7 +192,7 @@ export const config = {
     /** 触发用的分支 */
     ref: env.GH_REF || 'main',
     /** fine-grained PAT */
-    token: env.GH_PAT || '',
+    token: env.GH_TOKEN || '',
     /** CRF 值，越小越清晰、体积越大。23 是 H.264 的常用平衡点 */
     crf: num(env.TRANSCODE_CRF, 23),
     /** 编码预设。veryfast 在 4 核上速度/体积比最合适 */
