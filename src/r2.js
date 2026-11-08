@@ -76,7 +76,17 @@ export class R2Client {
   /** 计算 SigV4 签名，返回可直接用于 fetch 的 headers */
   _sign({ method, key, query = '', payloadHash, headers = {} }) {
     const { amzDate, dateStamp } = amzDates();
-    const canonicalUri = '/' + uriEncode(key, false);
+
+    /**
+     * canonicalUri 必须和实际请求路径**逐字节一致**。
+     *
+     * 之前这里只写 `/${key}`，而 _url() 拼的是 `/${bucket}/${key}`，
+     * 两边不一致 → R2 报 SignatureDoesNotMatch。
+     * 实际报错信息里 R2 会回显它自己算的 StringToSign，但
+     * canonical request 的哈希对不上时是看不出差异的，
+     * 只能靠比对请求路径发现。
+     */
+    const canonicalUri = '/' + uriEncode(this.bucket, false) + '/' + uriEncode(key, false);
     const canonicalQuery = query;
 
     // 参与签名的最小头集合
