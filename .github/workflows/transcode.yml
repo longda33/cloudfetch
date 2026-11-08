@@ -1,0 +1,106 @@
+name: 转码 FLV → MP4
+
+# 由 Unikraft 实例通过 workflow_dispatch 触发。
+# 也支持手动运行：填好参数即可。
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: '源文件下载地址（R2 预签名 URL）'
+        required: true
+        type: string
+      r2_key:
+        description: 'R2 对象键，转完用来清理'
+        required: false
+        type: string
+        default: ''
+      out_name:
+        description: '输出文件名（含 .mp4）'
+        required: true
+        type: string
+        default: 'output.mp4'
+      openlist_dir:
+        description: 'OpenList 目标目录'
+        required: true
+        type: string
+        default: '/od-20200439/cloudfetch'
+      crf:
+        description: 'H.264 CRF（越小越清晰）'
+        required: false
+        type: string
+        default: '23'
+      preset:
+        description: 'x264 preset'
+        required: false
+        type: string
+        default: 'veryfast'
+      task_id:
+        description: '来源任务 id（仅用于标记）'
+        required: false
+        type: string
+        default: ''
+      seg_index:
+        description: '段序号（仅用于标记）'
+        required: false
+        type: string
+        default: '0'
+
+# 同一个任务的多段转码互不干扰，但同一段不要并发跑两遍
+concurrency:
+  group: transcode-${{ inputs.task_id }}-${{ inputs.seg_index }}
+  cancel-in-progress: false
+
+jobs:
+  transcode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 检查 ffmpeg
+        run: |
+          ffmpeg -version | head -1
+          ffmpeg -hide_banner -encoders 2>/dev/null | grep -E 'libx264|aac' || {
+            echo "::error::ffmpeg 缺少 libx264 或 aac 编码器"
+            exit 1
+          }
+
+      - name: 转码并上传
+        env:
+          SOURCE_URL: ${{ inputs.source_url }}
+          R2_KEY: ${{ inputs.r2_key }}
+          OUT_NAME: ${{ inputs.out_name }}
+          OPENLIST_DIR: ${{ inputs.openlist_dir }}
+          CRF: ${{ inputs.crf }}
+          PRESET: ${{ inputs.preset }}
+          TASK_ID: ${{ inputs.task_id }}
+          SEG_INDEX: ${{ inputs.seg_index }}
+          OPENLIST_URL: ${{ secrets.OPENLIST_URL }}
+          OPENLIST_TOKEN: ${{ secrets.OPENLIST_TOKEN }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_DELETE_AFTER: 'true'
+        run: node scripts/transcode-worker.mjs
+
+      - name: 写入摘要
+        if: always()
+        run: |
+          {
+            echo "## 转码结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 输出文件 | \`${{ inputs.out_name }}\` |"
+            echo "| 目标目录 | \`${{ inputs.openlist_dir }}\` |"
+            echo "| CRF | ${{ inputs.crf }} |"
+            echo "| 任务 | \`${{ inputs.task_id }}\` 第 ${{ inputs.seg_index }} 段 |"
+            echo "| 状态 | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

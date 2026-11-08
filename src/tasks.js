@@ -7,10 +7,11 @@ import fsp from 'node:fs/promises';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { config } from './config.js';
+import { config, transcodeConfigured } from './config.js';
 import { runDownload } from './downloader.js';
 import { getOpenList, buildRemotePath } from './openlist.js';
 import { getHistoryStore } from './history.js';
+import { submitTaskArtifacts } from './transcode.js';
 import { detectKind, humanSize } from './util/links.js';
 
 /** 目录剩余空间（字节）；拿不到就返回 null，不要因为探测失败就阻断任务 */
@@ -710,6 +711,19 @@ export class TaskManager extends EventEmitter {
         t.finishedAt = Date.now();
         this._emit(t);
         this._saveState();
+
+        /**
+         * 逐段送去转码。
+         *
+         * 只提交「已经成功上传到 OpenList」的段 —— 转码链路是 OpenList
+         * 的附加产物，OpenList 没传成功的段送过去也没意义（转完还得再传一次）。
+         *
+         * 放在 return 之前同步等待，是因为任务状态要反映"转码已提交"，
+         * 否则用户看到 done 却不知道后面还有活。整个提交过程只是
+         * PUT 到 R2 + 一次 HTTP 调用，几秒到几十秒，可以接受。
+         */
+        await this._submitTranscodes(t, segs, onLog);
+
         return;
       }
 
@@ -790,6 +804,18 @@ export class TaskManager extends EventEmitter {
         onLog(`上传完成：${remote}`);
         this._emit(t);
         this._saveState();
+
+        /**
+         * 转码必须在删本地文件之前。
+         *
+         * 转码链路是「本地文件 → R2 → GitHub」，本地删了就传不上去了。
+         * 所以顺序是：OpenList 上传成功 → 提交转码 → 删本地。
+         */
+        await this._submitTranscodes(
+          t,
+          [{ index: 0, filename: dl.filename, path: dl.filePath, size: dl.size }],
+          onLog,
+        );
 
         // ---------- 3. 删除本地 ----------
         if (config.openlist.deleteAfterUpload) {
@@ -888,6 +914,80 @@ export class TaskManager extends EventEmitter {
     }
   }
 
+  /**
+   * 把任务产物提交到转码链路（R2 → GitHub Actions）。
+   *
+   * 只处理「已经在 OpenList 上传成功」的文件：转码是 OpenList 的附加产物，
+   * 源文件都没传成功的，转完还得再传一次，没意义。
+   *
+   * 整个方法不抛异常 —— 转码失败不能影响主流程。用户至少还有 OpenList
+   * 上的原始 FLV 可以看，只是没有 MP4 版本。
+   *
+   * @param {object} t 任务对象
+   * @param {Array<{index:number, filename:string, path:string, size:number}>} files
+   * @param {function} onLog
+   */
+  async _submitTranscodes(t, files, onLog) {
+    if (!transcodeConfigured()) {
+      // 没配就静默跳过，不打扰用户
+      return;
+    }
+
+    // 只挑真的传上去了的那些
+    const uploaded = new Set(
+      (t.segments || []).filter((s) => s.remotePath).map((s) => s.index),
+    );
+    const candidates = files.filter((f) => {
+      // 单文件没有 segments 数组，用 remotePath 判断
+      if (!(t.segments || []).length) return Boolean(t.remotePath);
+      return uploaded.has(f.index);
+    });
+
+    if (!candidates.length) {
+      onLog?.('没有已成功上传的文件，跳过转码');
+      return;
+    }
+
+    // 目标目录 = OpenList 上传目录 + 任务子目录，和 FLV 放一起便于对照
+    const remoteDir = this._remoteDirOf(t);
+    onLog?.(`提交 ${candidates.length} 个文件转码（H.264 CRF ${config.transcode.crf}）…`);
+
+    const r = await submitTaskArtifacts({
+      files: candidates,
+      openlistDir: remoteDir,
+      taskId: t.id,
+      onLog,
+    });
+
+    t.transcoded = { submitted: r.submitted, failed: r.failed, skipped: Boolean(r.skipped) };
+
+    if (r.skipped) {
+      onLog?.('转码链路未启用，MP4 版本不会生成');
+    } else if (r.submitted) {
+      onLog?.(
+        `转码已提交：${r.submitted} 个文件` +
+          (r.failed ? `，${r.failed} 个提交失败` : '') +
+          '（Actions 跑完会自动传到 OpenList）',
+      );
+    }
+
+    this._emit(t);
+    this._saveState();
+  }
+
+  /** 算任务的远端目录，供转码结果落地时对照 */
+  _remoteDirOf(t) {
+    const segs = t.segments || [];
+    const first = segs.find((s) => s.remotePath)?.remotePath || t.remotePath || '';
+    if (!first) {
+      // 兜底：按规则自己拼
+      return buildRemotePath('', { taskId: t.id, baseName: t.baseName, date: t.createdAt })
+        .replace(/\/$/, '');
+    }
+    const i = first.lastIndexOf('/');
+    return i > 0 ? first.slice(0, i) : '';
+  }
+
   /** 从任务对象提炼一条精简的历史记录（不含日志，避免体积过大） */
   _historyRecord(t) {
     const segs = t.segments || [];
@@ -927,6 +1027,8 @@ export class TaskManager extends EventEmitter {
         remotePath: s.remotePath || '',
       })),
       error: t.error || '',
+      /** 转码提交结果，前端用来显示「MP4 生成中」之类的提示 */
+      transcoded: t.transcoded || null,
       duration:
         t.startedAt && t.finishedAt ? Math.round((t.finishedAt - t.startedAt) / 1000) : 0,
     };

@@ -2,7 +2,7 @@
 
 云端下载器：粘贴链接 → 实时进度 → 自动上传 OpenList → 删除本地文件。
 
-部署在 [Cloady](https://cloady.com) PaaS 上，也可本地 / Docker 自托管。
+部署在 [Unikraft Cloud](https://unikraft.com) 上，也可本地 / Docker 自托管。
 
 ## 特性
 
@@ -16,7 +16,40 @@
 - **强重试**：连接超时、空闲超时、分片失败、上传失败全部带指数退避重试
 - **实时进度**：SSE 推送，Web 面板显示速度 / 百分比 / 剩余时间 / 已录段数
 - **自动上云**：每段录完立即上传 OpenList，成功后删除本地，不占磁盘
-- **省存储**：默认下到 `/tmp`，不占持久卷
+- **可选 MP4 转码**：录完的 FLV 走 Cloudflare R2 中转，由 GitHub Actions（4 核）转成 H.264 MP4 再传回 OpenList
+
+## 转码链路（可选）
+
+```
+Unikraft 录制 FLV
+   ↓ 上传 OpenList（原有逻辑，保证有原始文件可看）
+   ↓ 同时 PUT 到 Cloudflare R2
+   ↓ workflow_dispatch 触发 GitHub Actions（只传预签名 URL，不传文件）
+GitHub Actions（ubuntu-latest，4 核）
+   ↓ 从 R2 下载 → ffmpeg 转 H.264 + AAC CRF23 → faststart
+   ↓ 分片上传 MP4 到 OpenList
+   ↓ 删掉 R2 里的源文件
+```
+
+**为什么不在 Unikraft 上转**：实例只有 1 vCPU，转 30 分钟 1080p 要跑半小时以上，
+而且转码期间录制会被拖慢。GitHub Actions 免费给 4 核，公开仓库分钟数无限。
+
+**为什么用 R2 中转而不是 GitHub**：GitHub 仓库单文件 100MB、LFS 免费只有 1GB，
+一段直播就爆了。R2 免费 10GB，S3 兼容，国内访问也正常。
+
+配置见 `.env.example` 的「转码链路」段。全部留空则自动关闭，行为退回「FLV 直接传 OpenList」。
+
+需要在 GitHub 仓库配置这些 Secrets：
+
+| Secret | 说明 |
+|---|---|
+| `OPENLIST_URL` | OpenList 地址 |
+| `OPENLIST_TOKEN` | OpenList 令牌 |
+| `R2_ACCOUNT_ID` | Cloudflare 账户 ID |
+| `R2_ACCESS_KEY_ID` | R2 API Token 的 Access Key |
+| `R2_SECRET_ACCESS_KEY` | R2 API Token 的 Secret |
+| `R2_BUCKET` | 桶名 |
+
 
 ## 快速开始
 

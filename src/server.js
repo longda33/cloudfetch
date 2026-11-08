@@ -140,6 +140,13 @@ app.get('/api/health', (req, res) => {
       maxFileSizeText: humanSize(config.download.maxFileSize),
       maxQueue: config.download.maxQueue,
     },
+    // 转码链路状态。前端据此决定要不要显示 MP4 相关提示
+    transcode: {
+      enabled: transcodeConfigured(),
+      repo: transcodeConfigured() ? config.transcode.repo : '',
+      crf: config.transcode.crf,
+      preset: config.transcode.preset,
+    },
   });
 });
 

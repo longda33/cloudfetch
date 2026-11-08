@@ -154,6 +154,51 @@ export const config = {
     secret: SESSION_SECRET,
   },
 
+  // ---------- Cloudflare R2（转码中转）----------
+  /**
+   * 为什么要中转：
+   *   Unikraft 只有 1 vCPU，用它跑 ffmpeg 转码会拖到比录制还慢。
+   *   把 FLV 丢到 R2，由 GitHub Actions（4 核）转成 MP4 再传回 OpenList。
+   *
+   * 全部留空时整套转码链路自动关闭，行为退回到"直接传 OpenList"。
+   */
+  r2: {
+    accountId: env.R2_ACCOUNT_ID || '',
+    accessKeyId: env.R2_ACCESS_KEY_ID || '',
+    secretAccessKey: env.R2_SECRET_ACCESS_KEY || '',
+    bucket: env.R2_BUCKET || '',
+    /** 自定义 endpoint，兼容 MinIO / B2；留空时按 accountId 拼 R2 地址 */
+    endpoint: env.R2_ENDPOINT || '',
+    /** 对象键前缀，便于和别的用途隔离 */
+    prefix: (env.R2_PREFIX || 'cloudfetch').replace(/^\/+|\/+$/g, ''),
+    /** 预签名 URL 有效期（秒）。Actions 拿到后立刻下载，1 小时够用 */
+    presignExpires: num(env.R2_PRESIGN_EXPIRES, 3600),
+  },
+
+  // ---------- GitHub Actions 转码 ----------
+  /**
+   * 录制完成后触发 workflow_dispatch，让 Actions 去 R2 取文件转码。
+   *
+   * 需要 fine-grained PAT，权限：Actions = Read and write。
+   * 留空则不触发，FLV 原样留在 R2（不会丢，但要手动处理）。
+   */
+  transcode: {
+    /** 总开关。需要同时配好 R2 和下面三项才会真正生效 */
+    enabled: bool(env.TRANSCODE_ENABLED, true),
+    /** GitHub 仓库，形如 longda33/cloudfetch */
+    repo: env.GITHUB_REPO || '',
+    /** workflow 文件名（.github/workflows/ 下的文件名） */
+    workflow: env.GITHUB_TRANSCODE_WORKFLOW || 'transcode.yml',
+    /** 触发用的分支 */
+    ref: env.GITHUB_TRANSCODE_REF || 'main',
+    /** fine-grained PAT */
+    token: env.GITHUB_TOKEN || '',
+    /** CRF 值，越小越清晰、体积越大。23 是 H.264 的常用平衡点 */
+    crf: num(env.TRANSCODE_CRF, 23),
+    /** 编码预设。veryfast 在 4 核上速度/体积比最合适 */
+    preset: env.TRANSCODE_PRESET || 'veryfast',
+  },
+
   // ---------- 其他 ----------
   /** ffmpeg 可执行文件路径 */
   ffmpegPath: env.FFMPEG_PATH || 'ffmpeg',
@@ -162,6 +207,21 @@ export const config = {
   /** 任务完成后保留记录时长（毫秒），默认 24 小时 */
   taskRetention: num(env.TASK_RETENTION, 24 * 60 * 60 * 1000),
 };
+
+/** 转码链路是否完整可用（R2 + GitHub 都配好才启用） */
+export function transcodeConfigured() {
+  const r = config.r2;
+  const t = config.transcode;
+  return Boolean(
+    t.enabled &&
+      r.accountId &&
+      r.accessKeyId &&
+      r.secretAccessKey &&
+      r.bucket &&
+      t.repo &&
+      t.token,
+  );
+}
 
 /** 检查 OpenList 是否已配置 */
 export function openlistConfigured() {
