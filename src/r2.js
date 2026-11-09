@@ -71,6 +71,21 @@ export class R2Client {
     this.region = 'auto'; // R2 固定用 auto
   }
 
+  /**
+   * 是否具备可用的配置。
+   *
+   * 之前 ping() 里写了 `if (!this.configured)`，但类上**根本没有这个属性**
+   * —— 只有 OpenList 客户端有同名 getter，R2 这边漏了。
+   * 于是 this.configured 恒为 undefined，`!undefined` 为 true，
+   * ping() 永远返回「未配置」，即使环境变量全都填好了。
+   *
+   * 线上表现：右上角 R2 一直显示异常，但录制上传一切正常
+   * （那些路径不经过 ping）。
+   */
+  get configured() {
+    return Boolean(this.accountId && this.accessKeyId && this.secretAccessKey && this.bucket);
+  }
+
   /** 计算 SigV4 签名，返回可直接用于 fetch 的 headers */
   _sign({ method, key, query = '', payloadHash, headers = {} }) {
     const { amzDate, dateStamp } = amzDates();

@@ -72,6 +72,73 @@ test('R2 ping：连不上时返回 ok:false 而不是抛错', async (t) => {
   // 关键：不能抛异常，否则接口会 500，前端状态灯永远停在"检测中"
 });
 
+/**
+ * 这条测试专门盯一个真实发生过的 bug。
+ *
+ * 现象：环境变量全配好了，右上角 R2 却一直显示「未配置 R2」。
+ * 根因：ping() 里写了 `if (!this.configured)`，但 R2Client 类上
+ * **根本没有 configured 这个属性**（只有 OpenList 客户端有同名 getter）。
+ * this.configured 恒为 undefined，`!undefined` 为 true，
+ * 于是不管配没配，都走进「未配置」分支直接返回。
+ *
+ * 之前那条「未配置时返回 ok:false」的测试抓不住它：
+ * 传空字符串时 this.configured 是 undefined，断言恰好通过，
+ * 看起来是对的。
+ *
+ * 所以这条反过来断言：**配置齐全时，绝不能返回「未配置」**。
+ * 只要 configured getter 被删掉或写错，这条立刻红。
+ */
+test('R2 ping：配置齐全时不能误报「未配置」', async (t) => {
+  t.after(async () => {
+    await fsp.rm(TMP, { recursive: true, force: true });
+  });
+
+  const { R2Client } = await import('../src/r2.js');
+  const c = new R2Client({
+    accountId: 'testacct',
+    accessKeyId: 'AKIDTEST',
+    secretAccessKey: 'SECRETTEST',
+    bucket: 'testbucket',
+    // 故意指向不可达地址：我们要断言的是"它**真的去请求了**"，
+    // 而不是"请求成功了"
+    endpoint: 'http://127.0.0.1:1',
+  });
+
+  assert.equal(c.configured, true, '配置齐全时 configured 应为 true');
+
+  const r = await c.ping({ prefix: 'cloudfetch' });
+  assert.equal(r.ok, false, '连不上所以 ok 是 false，这没问题');
+  assert.doesNotMatch(
+    r.reason,
+    /未配置/,
+    `配置齐全时不该走「未配置」分支，实际原因：${r.reason}`,
+  );
+  // 真实原因是连接失败，说明它确实发了请求
+  assert.match(r.reason, /连接失败|超时/, `应报连接层面的错误，实际：${r.reason}`);
+});
+
+test('R2 configured getter：缺任何一个字段都为 false', async (t) => {
+  t.after(async () => {
+    await fsp.rm(TMP, { recursive: true, force: true });
+  });
+
+  const { R2Client } = await import('../src/r2.js');
+  const full = {
+    accountId: 'a',
+    accessKeyId: 'b',
+    secretAccessKey: 'c',
+    bucket: 'd',
+    endpoint: 'http://127.0.0.1:1',
+  };
+
+  assert.equal(new R2Client(full).configured, true, '齐全时 true');
+
+  for (const k of ['accountId', 'accessKeyId', 'secretAccessKey', 'bucket']) {
+    const partial = { ...full, [k]: '' };
+    assert.equal(new R2Client(partial).configured, false, `缺 ${k} 时应为 false`);
+  }
+});
+
 test('/api/status 返回稳定的结构，且两个服务互不阻塞', async (t) => {
   t.after(async () => {
     await fsp.rm(TMP, { recursive: true, force: true });
