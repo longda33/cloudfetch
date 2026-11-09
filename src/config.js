@@ -213,11 +213,11 @@ export const config = {
      * 转码超时（毫秒）。超过这个时间还没在 OpenList 看到 MP4，
      * 判定为失败，前端给出「重试」入口（从 R2 源文件重新触发，不用重录）。
      *
-     * 必须比 transcode.yml 的 timeout-minutes 更长，否则 Actions 还在跑
+     * 必须比 transcode.yml 的 timeout-minutes **更长**，否则 Actions 还在跑
      * 就被判失败，用户一点重试就会排队跑第二遍。
-     * 现在 yml 是 300 分钟，这里给 330 分钟。
+     * 现在 yml 是 350 分钟，这里给 380 分钟。
      */
-    timeoutMs: num(env.TRANSCODE_TIMEOUT, 330 * 60 * 1000),
+    timeoutMs: num(env.TRANSCODE_TIMEOUT, 380 * 60 * 1000),
     /** 单次 workflow_dispatch 的超时（毫秒）。不能等太久，它在录制收尾路径上 */
     dispatchTimeoutMs: num(env.TRANSCODE_DISPATCH_TIMEOUT, 30 * 1000),
   },

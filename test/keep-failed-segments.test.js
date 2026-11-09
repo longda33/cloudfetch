@@ -201,12 +201,112 @@ test('clearFinished：批量清理也保留失败分段', async (t) => {
     segments: [{ index: 1, r2Key: 'b/0001.flv', mp4State: 'done' }],
   });
 
-  const n = await mgr.clearFinished();
+  const { removed, kept } = await mgr.clearFinished();
 
-  assert.equal(n, 2, '两个任务都应从列表清掉');
+  assert.equal(removed, 1, '只应清掉成功那个任务');
+  assert.equal(kept, 1, '失败任务要留在列表里，否则源文件会变成孤儿');
   assert.deepEqual(
     deleted,
     ['b/0001.flv'],
     `批量清理应只删成功的，实际：${deleted.join(',')}`,
+  );
+  assert.equal(mgr.tasks.has('a'), true, '有受保护源分段的任务不能被批量清掉');
+});
+
+/* ---------------- 合并转码（真正出事故的那条路径） ---------------- */
+
+/**
+ * 合并流程里，失败状态挂在**任务**上（t.mp4State='failed'），
+ * 而每段仍是 'staged'（只表示"已存进 R2"）。
+ *
+ * 只按段级 mp4State 分类的话，staged 既不是 pending 也不是 failed，
+ * 会被当成正常段全删 —— 这正是 29 段 1.42GB 丢失那次的情形。
+ */
+function mergedFailedTask(id, n = 3) {
+  return {
+    id,
+    status: 'done',
+    createdAt: Date.now(),
+    finishedAt: Date.now(),
+    mergedSubmitted: true,
+    mergeKeys: Array.from({ length: n }, (_, i) => `${id}/000${i + 1}.flv`),
+    mp4State: 'failed',
+    mergeError: '转码超时：超过等待上限仍未在 OpenList 看到 MP4',
+    segmentCount: n,
+    segmentsUploaded: 0,
+    segments: Array.from({ length: n }, (_, i) => ({
+      index: i + 1,
+      r2Key: `${id}/000${i + 1}.flv`,
+      mp4State: 'staged',
+      remotePath: '',
+    })),
+  };
+}
+
+test('合并失败（段是 staged）：remove 默认保留全部源分段', async (t) => {
+  const { mgr, deleted, cleanup } = await makeMgr();
+  t.after(cleanup);
+
+  const id = 'merged-failed-remove';
+  mgr.tasks.set(id, mergedFailedTask(id));
+
+  await mgr.remove(id);
+
+  assert.deepEqual(
+    deleted,
+    [],
+    `合并失败时源分段必须保留，实际删了 ${deleted.length} 个：${deleted.join(',')}`,
+  );
+  assert.equal(mgr.tasks.has(id), false, '任务本身应该从列表移除');
+});
+
+test('合并失败（段是 staged）：clearFinished 也保留全部源分段', async (t) => {
+  const { mgr, deleted, cleanup } = await makeMgr();
+  t.after(cleanup);
+
+  const id = 'merged-failed-clear';
+  mgr.tasks.set(id, mergedFailedTask(id));
+
+  const r = await mgr.clearFinished();
+
+  assert.deepEqual(deleted, [], '批量清理绝不能烧掉合并失败的源分段');
+  assert.equal(r.kept, 1, '应报告有 1 条任务因保留源文件未清理');
+  assert.equal(mgr.tasks.has(id), true, '这类任务必须留在列表里，否则界面上再也找不到');
+});
+
+test('合并失败：remove({force:true}) 才真的删源分段', async (t) => {
+  const { mgr, deleted, cleanup } = await makeMgr();
+  t.after(cleanup);
+
+  const id = 'merged-failed-force';
+  mgr.tasks.set(id, mergedFailedTask(id, 2));
+
+  await mgr.remove(id, { force: true });
+
+  assert.deepEqual(
+    deleted.sort(),
+    ['merged-failed-force/0001.flv', 'merged-failed-force/0002.flv'],
+    `force 时应该全删，实际：${deleted.join(',')}`,
+  );
+});
+
+test('合并成功（段是 merged）：源分段正常删除', async (t) => {
+  const { mgr, deleted, cleanup } = await makeMgr();
+  t.after(cleanup);
+
+  const id = 'merged-done';
+  const task = mergedFailedTask(id, 2);
+  task.mp4State = 'done';
+  task.mergeError = '';
+  task.remotePath = '/cloudfetch/x/live.mp4';
+  for (const s of task.segments) s.mp4State = 'merged';
+  mgr.tasks.set(id, task);
+
+  await mgr.remove(id);
+
+  assert.deepEqual(
+    deleted.sort(),
+    ['merged-done/0001.flv', 'merged-done/0002.flv'],
+    '合并成功后 R2 源文件没有保留价值，应该清掉',
   );
 });

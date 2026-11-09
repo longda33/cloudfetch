@@ -214,9 +214,25 @@ app.post('/api/logout', (req, res) => {
 // ---------------- 受保护接口 ----------------
 app.use('/api', requireAuth);
 
+/**
+ * 任务列表（带日志，但只给"正在跑 / 刚结束"的任务带）。
+ *
+ * 任务最多保留 200 条、每条 200 行日志，全带上就是几 MB 的 JSON。
+ * /api/tasks 在打开页面、清空列表后都会调，SSE 首帧也要用同一份数据，
+ * 统一在这里裁剪，别让前端为了几个历史任务的日志拖慢首屏。
+ */
+function listTasksForClient() {
+  const now = Date.now();
+  return mgr.list().map((t) => {
+    const running = ['queued', 'downloading', 'uploading'].includes(t.status);
+    const recent = t.finishedAt && now - t.finishedAt < 5 * 60 * 1000;
+    return running || recent ? t : { ...t, logs: [] };
+  });
+}
+
 /** 任务列表 */
 app.get('/api/tasks', (req, res) => {
-  res.json({ tasks: mgr.list() });
+  res.json({ tasks: listTasksForClient() });
 });
 
 /** 单个任务 */
@@ -337,11 +353,11 @@ app.delete('/api/tasks/:id', async (req, res) => {
   }
 });
 
-/** 清空已结束（同时清掉磁盘目录） */
+/** 清空已结束（同时清掉磁盘目录；有失败源分段的任务会保留） */
 app.post('/api/tasks/clear', async (req, res) => {
   try {
-    const n = await mgr.clearFinished();
-    res.json({ ok: true, removed: n });
+    const { removed, kept } = await mgr.clearFinished();
+    res.json({ ok: true, removed, kept });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -379,7 +395,9 @@ app.get('/api/status', async (req, res) => {
     })(),
     (async () => {
       try {
-        return await getOpenList().check();
+        // 状态灯用 6 秒超时：默认 20 秒是给上传/列目录用的，
+        // 挂在状态探测上会让灯一直转圈，也让前端每 30 秒占住一条连接 20 秒
+        return await getOpenList().check({ timeout: 6000 });
       } catch (e) {
         return { ok: false, reason: e.message };
       }
@@ -387,8 +405,21 @@ app.get('/api/status', async (req, res) => {
   ]);
 
   res.json({
-    r2: { ok: Boolean(r2.ok), reason: r2.reason || '', ms: r2.ms || 0, bucket: r2.bucket || '' },
-    openlist: { ok: Boolean(openlist.ok), reason: openlist.reason || '', user: openlist.user || '' },
+    r2: {
+      ok: Boolean(r2.ok),
+      // 区分「没配」和「配了但连不上」——前端显示不一样：
+      // 没配是中性提示，连不上才是红色异常
+      configured: getR2().configured,
+      reason: r2.reason || '',
+      ms: r2.ms || 0,
+      bucket: r2.bucket || '',
+    },
+    openlist: {
+      ok: Boolean(openlist.ok),
+      configured: openlistConfigured(),
+      reason: openlist.reason || '',
+      user: openlist.user || '',
+    },
     checkedAt: Date.now(),
   });
 });
@@ -471,16 +502,10 @@ app.get('/api/events', (req, res) => {
   /**
    * 首帧推送全量。
    *
-   * 只给「正在跑」和「刚结束」的任务带日志：任务最多保留 200 条、
-   * 每条 200 行日志，全带上就是几 MB 的 JSON，每次打开页面/重连都要传一遍，
-   * 手机和 1GB 实例都吃不消。历史里的日志本来也没人看。
+   * 日志裁剪规则和 /api/tasks 一致（见 listTasksForClient）：
+   * 只给「正在跑」和「刚结束」的任务带日志。
    */
-  const snapshot = mgr.list().map((t) => {
-    const running = ['queued', 'downloading', 'uploading'].includes(t.status);
-    const recent = t.finishedAt && Date.now() - t.finishedAt < 5 * 60 * 1000;
-    return running || recent ? t : { ...t, logs: [] };
-  });
-  res.write(`event: snapshot\ndata: ${JSON.stringify({ tasks: snapshot })}\n\n`);
+  res.write(`event: snapshot\ndata: ${JSON.stringify({ tasks: listTasksForClient() })}\n\n`);
 
   const onUpdate = (t) => {
     try {
@@ -625,6 +650,16 @@ function shutdown(sig) {
   }
   try {
     killAllChildren();
+  } catch {
+    /* ignore */
+  }
+  /**
+   * 历史记录是 3 秒防抖写盘的，直接退出会丢掉最近几次变更。
+   * 这里主动 flush 一次：本地写很快，远端备份失败也不影响（有本地兜底）。
+   * 下面 server.close 之后还有最多 5 秒才强制退出，够它跑完。
+   */
+  try {
+    getHistoryStore().flush().catch(() => {});
   } catch {
     /* ignore */
   }

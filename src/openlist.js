@@ -163,15 +163,26 @@ export class OpenListClient {
   }
 
   /** 校验连接与 token */
-  async check() {
+  async check({ timeout = 20000 } = {}) {
     if (!this.configured) {
       return { ok: false, reason: '未配置 OpenList 地址或令牌' };
     }
     try {
-      const me = await this.request('GET', '/api/me', { timeout: 20000 });
+      const me = await this.request('GET', '/api/me', { timeout });
       return { ok: true, user: me?.username || me?.name || 'unknown', baseUrl: this.baseUrl };
     } catch (e) {
-      return { ok: false, reason: e.message };
+      /**
+       * 超时在 fetch 层是 AbortError，原始文案是
+       * "This operation was aborted"，显示在状态灯提示里完全看不懂。
+       * 这里翻成人话（只影响状态探测，不影响上传/下载的取消逻辑）。
+       */
+      const aborted = e?.name === 'AbortError' || /abort/i.test(String(e?.message || ''));
+      return {
+        ok: false,
+        reason: aborted
+          ? `OpenList 连接超时（${Math.round(timeout / 1000)} 秒无响应）`
+          : e.message,
+      };
     }
   }
 

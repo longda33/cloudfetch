@@ -240,7 +240,15 @@ export class R2Client {
 
   async deleteObject(key) {
     const headers = this._sign({ method: 'DELETE', key, payloadHash: EMPTY_SHA256 });
-    const res = await fetch(this._url(key), { method: 'DELETE', headers });
+    /**
+     * 必须带超时：这个方法是 fire-and-forget 调用的，
+     * 没有超时就会留下一个永远 pending 的 Promise 和一条不释放的连接。
+     */
+    const res = await fetch(this._url(key), {
+      method: 'DELETE',
+      headers,
+      signal: AbortSignal.timeout(30000),
+    });
     // S3 的 DELETE 是幂等的，404 也算成功
     if (!res.ok && res.status !== 404) {
       const txt = await res.text().catch(() => '');
@@ -249,10 +257,20 @@ export class R2Client {
     return true;
   }
 
-  /** 检查对象是否存在，返回字节数或 null */
+  /**
+   * 检查对象是否存在，返回字节数或 null。
+   *
+   * 带超时：这个方法在 _retryMerged 里是 await 的，
+   * 而重试入口有一个 retrying 互斥锁。R2 半死不活时 fetch 会一直挂着，
+   * 锁就永远不释放 —— 用户之后每次点「重新合并」都会得到"正在重试中"。
+   */
   async headObject(key) {
     const headers = this._sign({ method: 'HEAD', key, payloadHash: EMPTY_SHA256 });
-    const res = await fetch(this._url(key), { method: 'HEAD', headers });
+    const res = await fetch(this._url(key), {
+      method: 'HEAD',
+      headers,
+      signal: AbortSignal.timeout(15000),
+    });
     if (res.status === 404) return null;
     if (!res.ok) throw new R2Error(`R2 HEAD 失败：HTTP ${res.status}`, res.status);
     return Number(res.headers.get('content-length')) || 0;

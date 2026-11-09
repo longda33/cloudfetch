@@ -68,6 +68,15 @@ function stampCN(ms = Date.now()) {
   return `${get('year')}${get('month')}${get('day')}${get('hour')}${get('minute')}${get('second')}`;
 }
 
+/**
+ * 历史记录里最多保留多少条分段明细。
+ *
+ * 明细只用于前端推断「文件夹」按钮和合并任务特征，统计数字都是
+ * 预聚合字段（segmentCount / segmentsUploaded / transcodePending）。
+ * 不截断的话单条记录 32KB、200 条约 6MB，每次历史变更都要整份重传 OpenList。
+ */
+const HISTORY_SEGMENT_SAMPLE = 20;
+
 /** 任务状态机 */
 export const STATUS = {
   QUEUED: 'queued',       // 排队中
@@ -177,16 +186,33 @@ export class TaskManager extends EventEmitter {
           t.finishedAt &&
           now - t.finishedAt > config.taskRetention
         ) {
+          /**
+           * 还有必须保留的 R2 源分段 → 不自动清。
+           *
+           * 任务一旦从列表消失，界面上就再也没有入口去「重新合并」或
+           * 「强制删除」，那些分段会变成永久孤儿，只能手动进 R2 删。
+           * 代价是这类任务会一直挂在列表里，但它们本来就是需要用户处理的。
+           */
+          if (this._hasProtectedSources(t)) {
+            console.warn(
+              `[tasks] 任务 ${id} 已过保留期，但仍有转码失败的源分段，暂不清理（可在界面上重试或强制删除）`,
+            );
+            continue;
+          }
           this.tasks.delete(id);
           this._disposeTask(t);
           this._removeJobDir(id).catch(() => {});
           changed = true;
         }
       }
-      // 超出上限时删最老的已完成任务
+      // 超出上限时删最老的已完成任务（同样跳过有受保护源分段的）
       if (this.tasks.size > config.maxTasks) {
         const finished = [...this.tasks.values()]
-          .filter((t) => [STATUS.DONE, STATUS.FAILED, STATUS.CANCELED].includes(t.status))
+          .filter(
+            (t) =>
+              [STATUS.DONE, STATUS.FAILED, STATUS.CANCELED].includes(t.status) &&
+              !this._hasProtectedSources(t),
+          )
           .sort((a, b) => a.createdAt - b.createdAt);
         while (this.tasks.size > config.maxTasks && finished.length) {
           const t = finished.shift();
@@ -198,6 +224,65 @@ export class TaskManager extends EventEmitter {
       }
       if (changed) this._saveState();
     }, 5 * 60 * 1000).unref?.();
+  }
+
+  /**
+   * 计算某个任务删除时「哪些 R2 对象该删、哪些必须保留」。
+   *
+   * 纯函数，无副作用 —— _disposeTask / clearFinished / 过期清理器共用，
+   * 保证三处对「什么该留」的判断完全一致。
+   *
+   * 规则：
+   *   - pending            → 都不动（Actions 正在下载）
+   *   - 合并任务整体失败    → 全部保留（段是 staged，但整场都失败）
+   *   - 段级 failed        → 保留（旧的逐段转码路径）
+   *   - 其它               → 删
+   *   - force=true         → 除 pending 外全删
+   */
+  _planDispose(t, { force = false } = {}) {
+    const del = new Set();
+    const keep = new Set();
+
+    const r = config.r2;
+    if (!r.accessKeyId || !r.secretAccessKey || !r.bucket) return { del, keep };
+
+    // 合并转码进行中：Actions 正在逐段拉取，删了它就会失败
+    if (t.mergedSubmitted && t.mp4State === 'pending') return { del, keep };
+
+    /**
+     * 合并任务的失败状态挂在**任务**上，段本身还是 staged。
+     *
+     * 只看段级 mp4State 的话，staged 既不是 pending 也不是 failed，
+     * 会被当成"正常段"全删 —— 这正是 2.4 小时直播（29 段）丢失那次的情形：
+     * 转码超时后任务 mp4State=failed，但每段仍是 staged，删任务时 29 段全没了。
+     */
+    const merged = Boolean(t.mergedSubmitted || (t.mergeKeys || []).length);
+    const mergedFailed = merged && t.mp4State === 'failed';
+
+    const classify = (key, mp4State) => {
+      if (!key) return;
+      if (mp4State === 'pending') return;
+      if ((mergedFailed || mp4State === 'failed') && !force) {
+        keep.add(key);
+        return;
+      }
+      del.add(key);
+    };
+
+    classify(t.r2Key, t.mp4State);
+    for (const s of t.segments || []) classify(s.r2Key, s.mp4State);
+
+    return { del, keep };
+  }
+
+  /**
+   * 这个任务是否还有「必须保留」的 R2 源文件。
+   *
+   * 用来拦住批量清理和过期清理：任务一旦从列表里消失，
+   * 界面上就再也没有入口去重跑或强制删除，源文件会变成永久孤儿。
+   */
+  _hasProtectedSources(t) {
+    return this._planDispose(t).keep.size > 0;
   }
 
   /**
@@ -220,49 +305,16 @@ export class TaskManager extends EventEmitter {
    * 显示失败，就点了删除清理界面 —— 于是这 29 段源文件全被删掉。
    * 等修好转码参数想重跑时，**源数据已经不存在了**，那场直播彻底丢失。
    *
-   * 现在的规则：
-   *   - mp4State === 'failed' 的分段，**保留**，除非调用方显式传 force
-   *   - 用户真要清空间，可以在界面上二次确认（force=true）
-   *
-   * 代价是失败任务会占着 R2 空间。这是有意的权衡：
-   * R2 免费 10GB 能存约 7 场这样的直播，而丢失的直播是找不回来的。
-   * 真有空间压力时，前端会提示，用户再手动清。
+   * 现在的规则见 _planDispose()。代价是失败任务会占着 R2 空间，
+   * 这是有意的权衡：R2 免费 10GB 能存约 7 场这样的直播，
+   * 而丢失的直播是找不回来的。
    *
    * @param {object} t 任务
    * @param {{force?: boolean}} [opts] force=true 时连失败的分段也删
    * @returns {{deleted: number, kept: number}} 删除与保留的计数
    */
   _disposeTask(t, { force = false } = {}) {
-    const r = config.r2;
-    if (!r.accessKeyId || !r.secretAccessKey || !r.bucket) {
-      return { deleted: 0, kept: 0 };
-    }
-
-    // 合并转码进行中：Actions 正在逐段拉取，删了它就会失败
-    if (t.mergedSubmitted && t.mp4State === 'pending') {
-      return { deleted: 0, kept: 0 };
-    }
-
-    const del = new Set();
-    const keep = new Set();
-
-    /** 判断单个对象该删还是该留 */
-    const classify = (key, mp4State) => {
-      if (!key) return;
-      // Actions 正在用它
-      if (mp4State === 'pending') return;
-      // 转码失败：源文件是重跑的唯一希望，非 force 不删
-      if (mp4State === 'failed' && !force) {
-        keep.add(key);
-        return;
-      }
-      del.add(key);
-    };
-
-    classify(t.r2Key, t.mp4State);
-    for (const s of t.segments || []) {
-      classify(s.r2Key, s.mp4State);
-    }
+    const { del, keep } = this._planDispose(t, { force });
 
     if (del.size) {
       const r2 = getR2();
@@ -274,22 +326,17 @@ export class TaskManager extends EventEmitter {
     /**
      * 记录「保留了几个」。
      *
-     * 不能直接调 this._log(t.id, ...)：调用点（remove / clearFinished）
-     * 通常已经把任务从 this.tasks 删掉了，而 _log 内部会去
-     * this.logs.get(id) 取数组，拿不到就抛 TypeError。
-     * 这里只在该任务仍有日志缓冲时追加，否则静默跳过 ——
-     * 这条日志是给人看的说明，不该因为任务已删就炸掉整个删除流程。
+     * 直接写 t.logs：调用点（remove / clearFinished）已经把任务从
+     * this.tasks 删掉了，而 _log(t, ...) 只操作传入的对象本身，不会抛错。
+     * 这条日志是给人看的说明，任务对象还在内存里，写进去前端也能看到。
      */
-    if (keep.size) {
-      const buf = this.logs?.get?.(t.id);
-      if (Array.isArray(buf)) {
-        buf.push(
-          `${new Date().toLocaleTimeString('zh-CN', {
-            hour12: false,
-            timeZone: 'Asia/Shanghai',
-          })} 保留了 ${keep.size} 个转码失败的分段（可重试），未删除`,
-        );
-      }
+    if (keep.size && Array.isArray(t.logs)) {
+      const line = `[${new Date().toLocaleTimeString('zh-CN', {
+        hour12: false,
+        timeZone: 'Asia/Shanghai',
+      })}] 保留了 ${keep.size} 个转码失败的分段（可重试），未删除`;
+      t.logs.push(line);
+      if (t.logs.length > 200) t.logs.shift();
     }
 
     return { deleted: del.size, kept: keep.size };
@@ -563,20 +610,28 @@ export class TaskManager extends EventEmitter {
   }
 
   /**
-   * 清掉所有已结束任务的磁盘目录。
+   * 清掉所有已结束任务。
    *
    * 这里**永不 force**：批量清理最容易误伤，而且用户点这个按钮时
    * 想的是"清掉界面上那些已完成的任务"，不是"把失败任务的源文件也烧了"。
    * 失败分段要清，得走单个 remove({force:true})。
    *
-   * @returns {Promise<number>} 清掉的任务数
+   * 还有源分段要保留的任务**不删**：任务一消失，界面上就再没有
+   * 「重新合并」和「强制删除」的入口，R2 里那些分段会变成永久孤儿。
+   * 所以这类任务留在列表里，由用户决定是重试还是彻底删掉。
+   *
+   * @returns {Promise<{removed: number, kept: number}>}
    */
   async clearFinished() {
     const done = [];
+    let kept = 0;
     for (const [id, t] of this.tasks) {
-      if ([STATUS.DONE, STATUS.FAILED, STATUS.CANCELED].includes(t.status)) {
-        done.push(id);
+      if (![STATUS.DONE, STATUS.FAILED, STATUS.CANCELED].includes(t.status)) continue;
+      if (this._hasProtectedSources(t)) {
+        kept++;
+        continue;
       }
+      done.push(id);
     }
     for (const id of done) {
       const t = this.tasks.get(id);
@@ -589,7 +644,7 @@ export class TaskManager extends EventEmitter {
     for (const id of done) {
       await this._removeJobDir(id);
     }
-    return done.length;
+    return { removed: done.length, kept };
   }
 
   /** 删除某个任务的临时目录，失败只记日志不抛错 */
@@ -1832,8 +1887,16 @@ export class TaskManager extends EventEmitter {
         const k = first.lastIndexOf('/');
         return k > 0 ? first.slice(0, k) : '';
       })(),
-      // 直播分段只记远端路径，不记本地路径
-      segments: segs.map((s) => ({
+      /**
+       * 只存前 20 条分段明细。
+       *
+       * 一场 3 小时直播是 288 段，每段 6 个字段 ≈ 110 字节 → 单条历史记录 32KB，
+       * 200 条就是 6MB（实测 segments 占 98%）。而 history.json 每次变更都要
+       * 整份重写并上传 OpenList，这些明细纯属浪费：界面上用的都是
+       * segmentCount / segmentsUploaded / transcodePending 这些预聚合字段，
+       * 明细只用来推断「文件夹」按钮和合并任务特征。
+       */
+      segments: segs.slice(0, HISTORY_SEGMENT_SAMPLE).map((s) => ({
         index: s.index,
         filename: s.filename,
         size: s.size,

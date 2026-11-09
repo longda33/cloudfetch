@@ -718,8 +718,17 @@ async function act(kind, id) {
        * 就点删除，29 段源文件全被清掉，修好后也没法重跑。
        */
       const t = state.tasks.get(id);
-      const failedCount = (t?.segments || []).filter((s) => s.mp4State === 'failed').length
-        + (t?.mp4State === 'failed' && !(t?.segments || []).length ? 1 : 0);
+      const segs = t?.segments || [];
+      /**
+       * 合并任务的失败状态挂在任务上（t.mp4State === 'failed'），
+       * 段本身还是 staged —— 只数 segment.mp4State === 'failed' 会得到 0，
+       * 于是最关键的那类任务反而不会弹确认框。
+       */
+      const mergedFailed = Boolean(t?.mergedSubmitted) && t?.mp4State === 'failed';
+      const failedCount = mergedFailed
+        ? segs.length || 1
+        : segs.filter((s) => s.mp4State === 'failed').length +
+          (t?.mp4State === 'failed' && !segs.length ? 1 : 0);
 
       let force = false;
       if (failedCount > 0) {
@@ -733,9 +742,12 @@ async function act(kind, id) {
          * R2 上的失败分段保留。真要清空间得在第二问点"确定"，
          * 而那一问的文案写明了后果。
          */
+        const what = mergedFailed
+          ? `这个任务的合并转码失败，${failedCount} 个源分段还在 R2 上`
+          : `这个任务有 ${failedCount} 个转码失败的分段`;
         const okRemove = confirm(
-          `这个任务有 ${failedCount} 个转码失败的分段。\n\n`
-          + '从列表移除后，R2 上的源文件会**保留**，方便以后修复了重新转码。\n\n'
+          `${what}。\n\n`
+          + '从列表移除后，R2 上的源文件会保留，方便以后修复了重新转码。\n\n'
           + '确定要移除吗？',
         );
         if (!okRemove) return;
@@ -764,6 +776,12 @@ async function act(kind, id) {
   }
 }
 
+/**
+ * 配置类状态（健康检查 + 磁盘）：只读环境变量和本地 statfs，秒回。
+ *
+ * 启动时 await 它没问题。真正打网络的 /api/status 拆到
+ * refreshServiceStatus() 里，见下面的说明。
+ */
 async function refreshChips() {
   try {
     const h = await (await fetch('/api/health')).json();
@@ -780,49 +798,6 @@ async function refreshChips() {
     // 刷新 health 之后就看不到今日统计了。
   } catch { /* 静默 */ }
 
-  /**
-   * 服务连通性探测。
-   *
-   * 和上面 /api/health 的分工：
-   *   health  = 配置了没有（读环境变量，秒回）
-   *   status  = 现在能不能用（真发请求到 R2 / OpenList）
-   *
-   * 之前右上角只显示 health 里的 transcode.enabled，
-   * 那只说明环境变量填了 —— R2 密钥过期、OpenList 挂了，
-   * 状态灯照样是绿的，等于没在监控。
-   *
-   * 这个请求会真的打网络，可能慢到几秒，所以：
-   *   - 放在 health 之后，不阻塞上面的界面更新
-   *   - 失败就显示红色 + 原因，不弹 toast（状态灯自己就是提示）
-   */
-  try {
-    const s = await (await fetch('/api/status')).json();
-
-    // R2
-    if (s.r2?.ok) {
-      setPill('#chipR2', 'on', `R2 正常${s.r2.ms ? ` ${s.r2.ms}ms` : ''}`);
-      $('#chipR2').title = `Cloudflare R2 连通正常（桶 ${s.r2.bucket || '-'}，${s.r2.ms || 0}ms）`;
-    } else {
-      setPill('#chipR2', 'off', 'R2 异常');
-      $('#chipR2').title = `Cloudflare R2 不可用：${s.r2?.reason || '未知原因'}`;
-    }
-
-    // OpenList
-    if (s.openlist?.ok) {
-      setPill('#chipOpenlist', 'on', 'OpenList 正常');
-      $('#chipOpenlist').title = `OpenList 连通正常（用户 ${s.openlist.user || '-'}）`;
-    } else {
-      setPill('#chipOpenlist', 'off', 'OpenList 异常');
-      $('#chipOpenlist').title = `OpenList 不可用：${s.openlist?.reason || '未知原因'}`;
-    }
-  } catch (e) {
-    // 连自己后端都请求不通，两个都标红
-    setPill('#chipR2', 'off', 'R2 未知');
-    setPill('#chipOpenlist', 'off', 'OpenList 未知');
-    $('#chipR2').title = `状态探测失败：${e.message}`;
-    $('#chipOpenlist').title = `状态探测失败：${e.message}`;
-  }
-
   try {
     const d = await (await fetch('/api/disk')).json();
     if (d.total > 0) {
@@ -835,6 +810,75 @@ async function refreshChips() {
       bar.className = used > 90 ? 'err' : used > 75 ? 'warn' : '';
     }
   } catch { /* 静默 */ }
+}
+
+/**
+ * 服务连通性探测（R2 / OpenList）。
+ *
+ * 和 refreshChips 的分工：
+ *   health = 配置了没有（读环境变量，秒回）
+ *   status = **现在能不能用**（真发请求到 R2 / OpenList，可能慢到十几秒）
+ *
+ * 这个函数**永远不要 await 在启动路径上**：
+ * 后端探测超时是 R2 8s + OpenList 20s，await 的话 R2 挂了整页要白屏 8 秒，
+ * OpenList 挂了要白屏 20 秒才能看到任务列表 —— 状态灯不该拖累主界面。
+ */
+async function refreshServiceStatus() {
+  let resp;
+  try {
+    resp = await fetch('/api/status');
+  } catch (e) {
+    setPill('#chipR2', 'off', 'R2 未知');
+    setPill('#chipOpenlist', 'off', 'OpenList 未知');
+    $('#chipR2').title = `状态探测失败：${e.message}`;
+    $('#chipOpenlist').title = `状态探测失败：${e.message}`;
+    return;
+  }
+
+  /**
+   * 未登录时 /api/status 返回 401。
+   * 这时显示"异常"是误导 —— 服务可能完全正常，只是没通过鉴权。
+   * 回到中性态，等登录后再探测。
+   */
+  if (resp.status === 401) {
+    setPill('#chipR2', 'idle', 'R2');
+    setPill('#chipOpenlist', 'idle', 'OpenList');
+    $('#chipR2').title = '登录后显示 Cloudflare R2 连通性';
+    $('#chipOpenlist').title = '登录后显示 OpenList 连通性';
+    return;
+  }
+
+  let s;
+  try {
+    s = await resp.json();
+  } catch {
+    return;
+  }
+
+  // R2
+  if (s.r2?.configured === false) {
+    // 没配置 ≠ 故障：不转码是合法的使用方式，用中性色，别吓人
+    setPill('#chipR2', 'idle', 'R2 未配置');
+    $('#chipR2').title = '未配置 Cloudflare R2，转码链路关闭（原始文件直接传 OpenList）';
+  } else if (s.r2?.ok) {
+    setPill('#chipR2', 'on', `R2 正常${s.r2.ms ? ` ${s.r2.ms}ms` : ''}`);
+    $('#chipR2').title = `Cloudflare R2 连通正常（桶 ${s.r2.bucket || '-'}，${s.r2.ms || 0}ms）`;
+  } else {
+    setPill('#chipR2', 'off', 'R2 异常');
+    $('#chipR2').title = `Cloudflare R2 不可用：${s.r2?.reason || '未知原因'}`;
+  }
+
+  // OpenList
+  if (s.openlist?.configured === false) {
+    setPill('#chipOpenlist', 'idle', 'OpenList 未配置');
+    $('#chipOpenlist').title = '未配置 OpenList，下载的文件只保留在服务器本地';
+  } else if (s.openlist?.ok) {
+    setPill('#chipOpenlist', 'on', 'OpenList 正常');
+    $('#chipOpenlist').title = `OpenList 连通正常（用户 ${s.openlist.user || '-'}）`;
+  } else {
+    setPill('#chipOpenlist', 'off', 'OpenList 异常');
+    $('#chipOpenlist').title = `OpenList 不可用：${s.openlist?.reason || '未知原因'}`;
+  }
 }
 
 /* ---------------- 登录 ---------------- */
@@ -860,6 +904,8 @@ async function doLogin() {
       connectSSE();
       // 未登录时 /api/health 不下发 openlistUrl，登录后立刻补一次
       refreshChips();
+      // 状态灯要等登录后才探得动（未登录是 401），这里不 await
+      refreshServiceStatus();
       refreshTodayDone();
       refreshHistoryCount();
       toast('登录成功', 'ok');
@@ -1142,20 +1188,42 @@ $('#urlInput').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); addTasks(); }
 });
 
+/**
+ * 重新拉一遍任务列表。
+ *
+ * 「清空已结束」现在会保留「有转码失败源分段」的任务（否则源文件会变成
+ * 界面上的孤儿）。所以不能像以前那样在本地把所有非运行任务删掉 ——
+ * 那样会和后端不一致，下一次 SSE 快照又把它们"变回来"。
+ */
+async function reloadTasks() {
+  try {
+    const r = await fetch('/api/tasks');
+    if (!r.ok) return;
+    const d = await r.json();
+    state.tasks.clear();
+    state.logs.clear();
+    for (const t of d.tasks || []) {
+      state.tasks.set(t.id, t);
+      if (Array.isArray(t.logs)) state.logs.set(t.id, t.logs);
+    }
+    renderAll();
+  } catch {
+    /* 拉不到就保持现状，等下一次 SSE */
+  }
+}
+
 $('#btnClear').addEventListener('click', async () => {
   try {
     const r = await fetch('/api/tasks/clear', { method: 'POST' });
     if (r.status === 401) { showLogin(); return; }
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || '清空失败');
-    for (const [id, t] of state.tasks) {
-      if (!RUNNING.includes(t.status)) {
-        state.tasks.delete(id);
-        state.logs.delete(id);
-      }
+    await reloadTasks();
+    let msg = `已清空 ${j.removed ?? 0} 条`;
+    if (j.kept) {
+      msg += `；${j.kept} 条转码失败的任务因保留源文件未清理，可单独重试或删除`;
     }
-    renderAll();
-    toast(`已清空 ${j.removed ?? 0} 条`);
+    toast(msg, j.kept ? 'warn' : 'ok');
   } catch (e) {
     // 之前没有 try：会话过期时 j.removed 是 undefined，
     // 会弹出「已清空 undefined 条」，用户以为成功了
@@ -1355,6 +1423,16 @@ document.addEventListener('click', (e) => {
 
     connectSSE();
     setInterval(refreshChips, 30000);
+
+    /**
+     * 服务状态灯单独刷新，**不 await**。
+     *
+     * /api/status 会真的去 HEAD R2、GET OpenList，后端超时是 8s / 20s。
+     * 之前在 refreshChips 里 await 它，结果 R2 一挂整页白屏 8 秒、
+     * OpenList 一挂白屏 20 秒 —— 状态灯把主界面拖死了。
+     */
+    refreshServiceStatus();
+    setInterval(refreshServiceStatus, 30000);
 
     /**
      * 登录后立刻拉一次历史总数。

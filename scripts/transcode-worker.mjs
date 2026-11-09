@@ -16,6 +16,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
+import { fetchRetry as fetchRetryRaw } from './lib/fetch-retry.mjs';
 
 const {
   SOURCE_URL = '',
@@ -42,6 +43,9 @@ const {
 } = process.env;
 
 const log = (...a) => console.log(`[transcode]`, ...a);
+
+/** 把重试日志接到本脚本的 log 上，调用点就不用每次传 */
+const fetchRetry = (url, opts, o = {}) => fetchRetryRaw(url, opts, { ...o, log });
 const fail = (msg) => {
   console.error(`[transcode] 错误：${msg}`);
   process.exit(1);
@@ -232,6 +236,15 @@ async function transcode(input, output) {
     '-hide_banner',
     '-loglevel', 'warning',
     '-stats',
+    /**
+     * +genpts 是**输入选项**，必须放在 -i 之前。
+     *
+     * 放在 -i 之后它作用于输出封装器，对已经读进来的包不生效 ——
+     * 合并出来的 FLV 里那些 PTS 跳变仍然会被解码器当成时间戳空洞，
+     * 只能靠复制帧填，于是 speed 掉到 0.45x。
+     * 放在输入侧才是文档里的用法：读包时按帧率重算连续时间戳。
+     */
+    '-fflags', '+genpts',
     '-i', input,
     // 视频：libx264，yuv420p 保证兼容性（手机/浏览器/电视都能播）
     '-c:v', 'libx264',
@@ -300,22 +313,20 @@ async function mergeAndTranscode(parts, workDir, output) {
     '-hide_banner',
     '-loglevel', 'warning',
     '-stats',
+    /**
+     * +genpts 是**输入选项**，必须放在 -i 之前。
+     *
+     * 直播源每约 54 秒断流一次，重连后 PTS 会跳变；concat 用 -c copy
+     * 会原样保留这些跳变。放在 -i 之后（输出侧）对已经读进来的包不生效，
+     * 于是跳变原样留在 merged.flv 里，后面转码时只能靠复制帧填，
+     * dup 数接近 frame 数（实测 797 万 / 809 万），speed 掉到 0.452x。
+     */
+    '-fflags', '+genpts',
     '-f', 'concat',
     '-safe', '0',
     '-i', listPath,
-    /**
-     * +genpts 重新生成连续时间戳。
-     *
-     * 直播源每约 54 秒断流一次，重连后 PTS 会跳变。concat 时用 -c copy
-     * 原样保留这些跳变，转码器遇到时间戳不连续只能靠**复制帧**填补，
-     * 于是出现 dup 数接近 frame 数的情况（实测 dup=797 万 / frame=809 万），
-     * 转码速度被拖到 0.452x —— 2.4 小时的直播要跑 5 小时以上，
-     * 直接撞上 300 分钟的 timeout。
-     *
-     * +genpts 让 ffmpeg 按帧率重新算一套连续的时间戳，重复帧消失。
-     * 这是**无损**的：只改时间戳元数据，不动任何一个像素。
-     */
-    '-fflags', '+genpts',
+    // 把负时间戳平移到 0，避免每段起点不一致导致的抖动
+    '-avoid_negative_ts', 'make_zero',
     // 不解码，只重新封装
     '-c', 'copy',
     '-y',
@@ -351,7 +362,7 @@ async function uploadToOpenList(localPath, remoteDir) {
   // 小文件直接单请求，省掉 multipart 的三次往返
   if (total <= CHUNK) {
     const buf = await fsp.readFile(localPath);
-    const res = await fetch(`${OPENLIST_URL.replace(/\/+$/, '')}/api/fs/put`, {
+    await fetchRetry(`${OPENLIST_URL.replace(/\/+$/, '')}/api/fs/put`, {
       method: 'PUT',
       headers: {
         Authorization: OPENLIST_TOKEN,
@@ -361,10 +372,7 @@ async function uploadToOpenList(localPath, remoteDir) {
       },
       body: buf,
     });
-    if (!res.ok) {
-      const t = await res.text().catch(() => '');
-      fail(`OpenList PUT 失败：HTTP ${res.status} ${t.slice(0, 300)}`);
-    }
+    // fetchRetry 只返回 2xx，走到这里就是成功
     log('上传完成（单请求）');
     return remotePath;
   }
@@ -373,7 +381,7 @@ async function uploadToOpenList(localPath, remoteDir) {
   const base = OPENLIST_URL.replace(/\/+$/, '');
   const auth = { Authorization: OPENLIST_TOKEN };
 
-  const initRes = await fetch(`${base}/api/fs/multipart/init`, {
+  const initRes = await fetchRetry(`${base}/api/fs/multipart/init`, {
     method: 'POST',
     headers: {
       ...auth,
@@ -385,10 +393,7 @@ async function uploadToOpenList(localPath, remoteDir) {
       Overwrite: 'true',
     },
   });
-  if (!initRes.ok) {
-    const t = await initRes.text().catch(() => '');
-    fail(`multipart init 失败：HTTP ${initRes.status} ${t.slice(0, 300)}`);
-  }
+  // fetchRetry 只返回 2xx，失败会抛（4xx 不重试，5xx/429/网络错误重试）
   const init = await initRes.json();
   const uploadId = init?.data?.upload_id || init?.upload_id;
   const chunkSize = init?.data?.chunk_size || CHUNK;
@@ -415,48 +420,48 @@ async function uploadToOpenList(localPath, remoteDir) {
         filled += bytesRead;
       }
 
-      // 分片可能因为网络抖动失败，重试 3 次
-      let ok = false;
-      let lastErr = '';
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        const r = await fetch(`${base}/api/fs/multipart/chunk`, {
-          method: 'PUT',
-          headers: {
-            ...auth,
-            'X-Upload-Id': uploadId,
-            'X-Chunk-Index': String(i),
-            'Content-Type': 'application/octet-stream',
-            'Content-Length': String(len),
+      /**
+       * 分片重试。
+       *
+       * 之前只对 409/429 重试，其它 5xx 直接 break —— 一个 502 就能让
+       * 已经跑了 2-4 小时的转码整场失败，而重跑又要几小时。
+       * 现在交给 fetchRetry：网络错误 / 409 / 429 / 5xx 都退避重试，
+       * 只有真正的 4xx 参数错误才立刻失败。
+       */
+      try {
+        await fetchRetry(
+          `${base}/api/fs/multipart/chunk`,
+          {
+            method: 'PUT',
+            headers: {
+              ...auth,
+              'X-Upload-Id': uploadId,
+              'X-Chunk-Index': String(i),
+              'Content-Type': 'application/octet-stream',
+              'Content-Length': String(len),
+            },
+            body: buf,
           },
-          body: buf,
-        });
-        if (r.ok) {
-          ok = true;
-          break;
-        }
-        lastErr = `HTTP ${r.status} ${(await r.text().catch(() => '')).slice(0, 200)}`;
-        if (r.status === 409 || r.status === 429) {
-          await new Promise((res) => setTimeout(res, 1000 * attempt));
-        } else {
-          break;
-        }
+          { attempts: 5, label: `第 ${i + 1}/${totalChunks} 片` },
+        );
+      } catch (e) {
+        fail(`第 ${i + 1}/${totalChunks} 片上传失败：${e.message}`);
       }
-      if (!ok) fail(`第 ${i + 1}/${totalChunks} 片上传失败：${lastErr}`);
       log(`  分片 ${i + 1}/${totalChunks} 完成`);
     }
   } finally {
     await fh.close();
   }
 
-  const doneRes = await fetch(`${base}/api/fs/multipart/complete`, {
-    method: 'POST',
-    headers: { ...auth, 'X-Upload-Id': uploadId, 'Content-Type': 'application/json' },
-    body: JSON.stringify({}),
-  });
-  if (!doneRes.ok) {
-    const t = await doneRes.text().catch(() => '');
-    fail(`multipart complete 失败：HTTP ${doneRes.status} ${t.slice(0, 300)}`);
-  }
+  await fetchRetry(
+    `${base}/api/fs/multipart/complete`,
+    {
+      method: 'POST',
+      headers: { ...auth, 'X-Upload-Id': uploadId, 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    },
+    { attempts: 4, label: 'multipart complete' },
+  );
 
   log('上传完成（分片）');
   return remotePath;

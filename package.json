@@ -11,7 +11,7 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "test": "node --test",
-    "check": "node --check src/server.js && node --check src/tasks.js && node --check src/openlist.js && node --check src/downloader.js && node --check src/config.js && node --check src/history.js && node --check src/util/links.js && node --check src/util/auth.js && node --check src/util/writer.js && node --check src/util/login-guard.js && node --check src/r2.js && node --check src/transcode.js && node --check scripts/transcode-worker.mjs && node --check public/app.js && node --check public/theme.js"
+    "check": "node --check src/server.js && node --check src/tasks.js && node --check src/openlist.js && node --check src/downloader.js && node --check src/config.js && node --check src/history.js && node --check src/util/links.js && node --check src/util/auth.js && node --check src/util/writer.js && node --check src/util/login-guard.js && node --check src/r2.js && node --check src/transcode.js && node --check scripts/transcode-worker.mjs && node --check scripts/lib/fetch-retry.mjs && node --check public/app.js && node --check public/theme.js"
   },
   "dependencies": {
     "express": "^4.21.2"

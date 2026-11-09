@@ -107,8 +107,9 @@ test('clearFinished() 会清掉所有已结束任务的目录，但保留进行�
   const dirFail = await makeJobDir(failId, [{ name: 'b.flv', size: 2048 }]);
   const dirRun = await makeJobDir(runningId, [{ name: 'c.flv', size: 3072 }]);
 
-  const n = await mgr.clearFinished();
-  assert.equal(n, 2, '应清掉 2 个已结束任务');
+  const { removed, kept } = await mgr.clearFinished();
+  assert.equal(removed, 2, '应清掉 2 个已结束任务');
+  assert.equal(kept, 0, '这些任务没有 R2 源分段，不该有保留项');
 
   assert.equal(await fsp.stat(dirDone).then(() => true).catch(() => false), false, 'done 目录应删除');
   assert.equal(await fsp.stat(dirFail).then(() => true).catch(() => false), false, 'failed 目录应删除');

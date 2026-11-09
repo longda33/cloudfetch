@@ -178,6 +178,55 @@ test('合并任务提交后必须处于 pending，否则轮询器永远确认不
   assert.ok(t.expectedPath, '必须记下预期路径供轮询器查询');
 });
 
+test('转码超时必须比 workflow 的 timeout-minutes 更长', async () => {
+  const yml = await fsp.readFile(
+    path.join(ROOT, '.github', 'workflows', 'transcode.yml'),
+    'utf8',
+  );
+  const m = yml.match(/timeout-minutes:\s*(\d+)/);
+  assert.ok(m, 'transcode.yml 里应该有 timeout-minutes');
+
+  const jobMinutes = Number(m[1]);
+  const svcMinutes = config.transcode.timeoutMs / 60000;
+  assert.ok(
+    svcMinutes > jobMinutes,
+    `服务端超时 ${svcMinutes} 分钟必须大于 workflow 的 ${jobMinutes} 分钟；` +
+      '否则 Actions 还在跑就被判失败，用户点重试会排队跑第二遍',
+  );
+});
+
+test('历史记录只保留少量分段明细，避免 history.json 膨胀', () => {
+  const t = makeMergedTask('merged-big');
+  // 一场 3 小时直播 ≈ 288 段
+  t.segments = Array.from({ length: 288 }, (_, i) => ({
+    index: i + 1,
+    filename: `0${i + 1}_live_x.flv`,
+    size: 50 * 1024 * 1024,
+    remotePath: '',
+    expectedPath: '',
+    mp4State: 'staged',
+    r2Key: `cloudfetch/${t.id}/0${i + 1}_live_x.flv`,
+    localPath: '',
+  }));
+  t.segmentCount = 288;
+  t.segmentsSubmitted = 288;
+
+  const rec = mgr._historyRecord(t);
+
+  assert.equal(rec.segmentCount, 288, '聚合字段必须保留完整数字');
+  assert.equal(rec.segmentsSubmitted, 288);
+  assert.ok(
+    rec.segments.length <= 20,
+    `明细应截断到 20 条，实际 ${rec.segments.length}`,
+  );
+
+  const bytes = Buffer.byteLength(JSON.stringify(rec));
+  assert.ok(
+    bytes < 8 * 1024,
+    `单条历史记录应小于 8KB（200 条约 1.6MB），实际 ${(bytes / 1024).toFixed(1)}KB`,
+  );
+});
+
 test('轮询确认到 MP4 后写 remotePath，并把所有段标成 merged', async () => {
   const t = makeMergedTask('merged-confirm');
   openlistHas = true;
@@ -259,18 +308,28 @@ test('缺段时补传后再合并，仍然只提交一次', async () => {
   assert.equal(dispatched[0].r2_keys.split(',').length, 3);
 });
 
-test('合并转码进行中时，删任务不能清 R2（Actions 还在下载）', async () => {
+test('合并转码进行中时删任务不清 R2；失败时默认保留，force 才清', async () => {
   const t = makeMergedTask('merged-dispose-pending', { mp4State: 'pending' });
   calls.length = 0;
   mgr._disposeTask(t);
   await new Promise((r) => setTimeout(r, 50));
-  assert.equal(count('delete-r2'), 0);
+  assert.equal(count('delete-r2'), 0, 'Actions 正在下载，不能删');
 
+  /**
+   * 合并失败：段是 staged、失败状态挂在任务上。
+   * 这些源分段是重跑的唯一依据，默认必须保留 ——
+   * 曾经因为按段级状态分类，29 段 1.42GB 被整场删光。
+   */
   const t2 = makeMergedTask('merged-dispose-failed', { mp4State: 'failed' });
   calls.length = 0;
   mgr._disposeTask(t2);
   await new Promise((r) => setTimeout(r, 50));
-  assert.equal(count('delete-r2'), 3, '失败后 R2 源文件应可清理');
+  assert.equal(count('delete-r2'), 0, '失败时默认保留源分段，方便重跑');
+
+  calls.length = 0;
+  mgr._disposeTask(t2, { force: true });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(count('delete-r2'), 3, 'force 才允许清掉失败分段');
 });
 
 test('旧记录只有 mergeError 时也能识别成合并任务，走一次合并重试', async () => {
