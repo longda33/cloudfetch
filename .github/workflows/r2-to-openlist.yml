@@ -1,0 +1,120 @@
+name: R2 → OpenList 搬迁
+
+# 一次性运维任务：把 R2 上积压的分段原样搬到 OpenList。
+# 不合并、不转码、不改名。传完删掉 R2 上的对象。
+#
+# 为什么用 Actions 而不是本地跑：
+#   1. 1.4GB 走本地带宽慢且占磁盘
+#   2. Actions 到 R2 和 OpenList 都是机房级带宽
+#   3. 本地跑要处理断点续传，Actions 上失败了重跑一次就行
+
+on:
+  workflow_dispatch:
+    inputs:
+      r2_prefix:
+        description: 'R2 前缀（例如 cloudfetch/<taskId>）'
+        required: true
+        type: string
+      openlist_dir:
+        description: 'OpenList 目标目录'
+        required: true
+        type: string
+      dry_run:
+        description: '只列计划，不实际传输'
+        required: false
+        default: false
+        type: boolean
+      keep_r2:
+        description: '传完保留 R2 对象（不删）'
+        required: false
+        default: false
+        type: boolean
+
+# 同一个前缀不允许并发跑，否则会重复上传同一批文件
+concurrency:
+  group: r2-to-openlist-${{ inputs.r2_prefix }}
+  cancel-in-progress: false
+
+jobs:
+  transfer:
+    # 固定大版本，避免 ubuntu-latest 迁移时突然失败
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 设置 Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: 校验参数
+        run: |
+          set -euo pipefail
+          if [ -z "${{ inputs.r2_prefix }}" ]; then
+            echo "::error::缺少 r2_prefix"
+            exit 1
+          fi
+          if [ -z "${{ inputs.openlist_dir }}" ]; then
+            echo "::error::缺少 openlist_dir"
+            exit 1
+          fi
+          echo "前缀: ${{ inputs.r2_prefix }}"
+          echo "目标: ${{ inputs.openlist_dir }}"
+          echo "dry_run: ${{ inputs.dry_run }}"
+          echo "keep_r2: ${{ inputs.keep_r2 }}"
+
+      - name: 执行搬迁
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          OPENLIST_URL: ${{ vars.OPENLIST_URL }}
+          OPENLIST_TOKEN: ${{ secrets.OPENLIST_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # 逐项检查环境变量，缺哪个说哪个，不要笼统报"配置缺失"
+          missing=0
+          for v in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET OPENLIST_URL OPENLIST_TOKEN; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::缺少 $v"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+          ARGS=(--prefix "${{ inputs.r2_prefix }}" --dir "${{ inputs.openlist_dir }}")
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+          if [ "${{ inputs.keep_r2 }}" = "true" ]; then
+            ARGS+=(--keep-r2)
+          fi
+
+          node scripts/r2-to-openlist.mjs "${ARGS[@]}" 2>&1 | tee /tmp/transfer.log
+
+      - name: 写入摘要
+        if: always()
+        run: |
+          {
+            echo "## R2 → OpenList 搬迁"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 前缀 | \`${{ inputs.r2_prefix }}\` |"
+            echo "| 目标 | \`${{ inputs.openlist_dir }}\` |"
+            echo "| dry-run | ${{ inputs.dry_run }} |"
+            echo "| 保留 R2 | ${{ inputs.keep_r2 }} |"
+            echo "| 结果 | ${{ job.status }} |"
+            echo ""
+            if [ -f /tmp/transfer.log ]; then
+              echo "### 尾部日志"
+              echo '```'
+              tail -30 /tmp/transfer.log
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

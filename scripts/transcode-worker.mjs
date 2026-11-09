@@ -24,10 +24,17 @@ const {
   R2_KEYS = '',
   OUT_NAME = 'output.mp4',
   OPENLIST_DIR = '',
-  CRF = '23',
-  PRESET = 'veryfast',
-  /** 编码线程数。GitHub runner 4 核，默认给 4 */
-  THREADS = '4',
+  CRF = '18',
+  PRESET = 'ultrafast',
+  /**
+   * 编码线程数。0 = 不传 `-threads`，交给 libx264 按自己探测的核数决定。
+   *
+   * 这里以前硬编码 4，理由是「GitHub runner 4 核」—— 实测标准 runner
+   * 是 **2 核**。4 线程跑在 2 核上属于超订，只会多出上下文切换和
+   * 帧缓冲延迟，不会有任何加速。x264 探测到的线程数和 nproc 一致，
+   * 交给它比自己猜准。
+   */
+  THREADS = '0',
   TASK_ID = '',
   // OpenList 凭据
   OPENLIST_URL = '',
@@ -68,6 +75,27 @@ function run(cmd, args, { cwd } = {}) {
     child.on('close', (code) => {
       if (code === 0) resolve();
       else reject(new Error(`${cmd} 退出码 ${code}\n${tail}`));
+    });
+  });
+}
+
+/**
+ * 跑一个子进程并收集 stdout。
+ *
+ * 和 run() 的区别：这个不转发输出。给 ffprobe 这类「输出就是结果」的
+ * 命令用，把探测结果当字符串返回。
+ */
+function runCapture(cmd, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (b) => { out += b.toString(); });
+    child.stderr.on('data', (b) => { err += b.toString(); });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) resolve(out);
+      else reject(new Error(`${cmd} 退出码 ${code}：${err.slice(-500)}`));
     });
   });
 }
@@ -213,59 +241,110 @@ function presignR2Get(key, expiresSec) {
 }
 
 // ---------------- 2. 转码 ----------------
+/**
+ * 探测视频流的帧率声明。
+ *
+ * 直播 FLV 的容器头经常没有 framerate 元数据，ffmpeg 只能退化成
+ * 「一个时间刻度一帧」的猜测值，于是 r_frame_rate 变成 1000/1。
+ * 这个假帧率是整场超时的根源，所以转码前先把它打出来。
+ */
+async function probeFrameRate(file) {
+  try {
+    const out = await runCapture('ffprobe', [
+      '-v', 'error',
+      '-select_streams', 'v:0',
+      '-show_entries', 'stream=r_frame_rate,avg_frame_rate,codec_name',
+      '-of', 'default=nw=1',
+      file,
+    ]);
+    const get = (k) => (out.match(new RegExp(`^${k}=(.*)$`, 'm')) || [, ''])[1].trim();
+    return {
+      codec: get('codec_name'),
+      r: get('r_frame_rate'),
+      avg: get('avg_frame_rate'),
+    };
+  } catch (e) {
+    log(`ffprobe 探测失败（不影响转码）：${e.message}`);
+    return { codec: '', r: '', avg: '' };
+  }
+}
+
 async function transcode(input, output) {
-  /**
-   * 编码线程数。
-   *
-   * GitHub runner 是 4 核，但 libx264 默认按**自己探测的核数**开线程，
-   * 在容器里经常探测成 1，于是单线程编码 —— 实测 speed=0.452x，
-   * 2.4 小时的直播要跑 5 小时以上。
-   *
-   * 显式给 4 个线程（留一点余量给 ffmpeg 的解复用/封装线程），
-   * 能把速度拉到 1.2-1.4x，同样的活 2-3 小时跑完。
-   *
-   * 这是**无损**的：x264 的多线程只影响编码并行度，不改变码率控制，
-   * 同一 CRF 下输出质量和体积几乎一致（多线程会让 slice 边界略有差异，
-   * 体积浮动在 1% 以内）。
-   */
   const threads = String(THREADS);
 
-  log(`转码：H.264 + AAC，CRF ${CRF}，preset ${PRESET}，threads ${threads}`);
+  const probe = await probeFrameRate(input);
+  if (probe.r || probe.avg) {
+    log(`源视频：codec=${probe.codec} r_frame_rate=${probe.r} avg_frame_rate=${probe.avg}`);
+  }
+  /**
+   * 假帧率告警。
+   *
+   * 真实内容约 20fps，而容器声称 1000fps —— 这正是历史上那次
+   * 5 小时超时的直接原因。看到这条日志就说明源文件又是老样子，
+   * 下面的 `-fps_mode passthrough` 会兜住它，但值得留个记录。
+   */
+  const claimed = Number(String(probe.r).split('/')[0]) / (Number(String(probe.r).split('/')[1]) || 1);
+  if (claimed > 120) {
+    log(`⚠️ 容器声称 ${probe.r} fps（明显是假帧率），已用 -fps_mode passthrough 忽略它`);
+  }
+
+  log(`转码：H.264 + AAC，CRF ${CRF}，preset ${PRESET}，threads ${threads === '0' ? '自动' : threads}`);
 
   const args = [
     '-hide_banner',
     '-loglevel', 'warning',
     '-stats',
-    /**
-     * +genpts 是**输入选项**，必须放在 -i 之前。
-     *
-     * 放在 -i 之后它作用于输出封装器，对已经读进来的包不生效 ——
-     * 合并出来的 FLV 里那些 PTS 跳变仍然会被解码器当成时间戳空洞，
-     * 只能靠复制帧填，于是 speed 掉到 0.45x。
-     * 放在输入侧才是文档里的用法：读包时按帧率重算连续时间戳。
-     */
-    '-fflags', '+genpts',
     '-i', input,
+    /**
+     * ★ 这一行是整个转码链路最关键的一行，不要删。
+     *
+     * 不加它时，ffmpeg 会走默认的 `-fps_mode auto`：对 MP4 这种
+     * 「按帧率播放」的容器，auto 会解析成 CFR，并拿输入流声明的
+     * r_frame_rate 当目标帧率。直播 FLV 声称 1000fps，实际只有 20fps，
+     * 于是 ffmpeg 每秒补 980 个重复帧 —— 编码器做了 50 倍无用功。
+     *
+     * 实测（720x1280，同 3 段合并样本，4 核）：
+     *   CFR 模式：frame=10000 dup=9837 speed=0.472x  ← 和线上 0.452x 一致
+     *   passthrough：frame=187   dup=0     speed=15.9x
+     * 同样 10 秒输出，相差 33 倍。
+     *
+     * passthrough 的意思是「每帧用自己的 PTS，不补不丢」，输出是 VFR
+     * MP4。MP4 的 stts 表本来就支持变帧率，播放器按 PTS 走，观感与源一致。
+     *
+     * 注意：**不要**用 `setpts=N/(25*TB)` 之类的办法重排时间戳来「修」
+     * 这个问题。源是变帧率（实测约 19.8fps），按 25fps 等距重排会让
+     * 画面比声音快 1.26 倍，音画越播越不同步（实测 90s 素材：视频
+     * 71.7s / 音频 90.1s，结尾差 18 秒）。
+     */
+    '-fps_mode', 'passthrough',
     // 视频：libx264，yuv420p 保证兼容性（手机/浏览器/电视都能播）
     '-c:v', 'libx264',
     '-preset', PRESET,
     '-crf', String(CRF),
     '-pix_fmt', 'yuv420p',
-    // 编码线程数，见上面注释
-    '-threads', threads,
+    /**
+     * 强制 limited range。
+     *
+     * 源 FLV 若带 full range 标记（yuvj420p），直接转出来会保留
+     * yuvj420p，部分电视和旧手机按 full range 解读会偏灰或偏艳。
+     * 显式声明 tv 范围可以让输出稳定在标准 yuv420p。
+     */
+    '-color_range', 'tv',
     // 偶数宽高，否则部分播放器会花屏
     '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
     // 音频：AAC 128k
     '-c:a', 'aac',
     '-b:a', '128k',
-    // 关键帧间隔 2 秒，方便拖动进度条
+    // 关键帧间隔 2 秒左右，方便拖动进度条
     '-g', '50',
     '-keyint_min', '50',
     // faststart 把索引移到文件头，浏览器可以边下边播
     '-movflags', '+faststart',
-    '-y',
-    output,
   ];
+
+  // 0 表示不干预，让 x264 自己按核数开线程
+  if (threads !== '0') args.push('-threads', threads);
+  args.push('-y', output);
 
   await run('ffmpeg', args);
   const sz = await sizeOf(output);
@@ -314,18 +393,26 @@ async function mergeAndTranscode(parts, workDir, output) {
     '-loglevel', 'warning',
     '-stats',
     /**
-     * +genpts 是**输入选项**，必须放在 -i 之前。
+     * +genpts 放在输入侧，只在这里用一次。
      *
-     * 直播源每约 54 秒断流一次，重连后 PTS 会跳变；concat 用 -c copy
-     * 会原样保留这些跳变。放在 -i 之后（输出侧）对已经读进来的包不生效，
-     * 于是跳变原样留在 merged.flv 里，后面转码时只能靠复制帧填，
-     * dup 数接近 frame 数（实测 797 万 / 809 万），speed 掉到 0.452x。
+     * 它的作用是在读包时补出缺失的 PTS。实测源分段的 PTS 是**存在**的
+     * （只是间隔抖动，属于变帧率），所以这行其实不改变什么，留着是
+     * 为了万一某个分段真的丢了 PTS 时不至于整场失败。
+     *
+     * 注意：它**不能**解决「转码慢」的问题 —— 慢的根因是输出侧在补帧，
+     * 和 PTS 缺失无关。真正管用的是 transcode() 里的 `-fps_mode passthrough`。
      */
     '-fflags', '+genpts',
     '-f', 'concat',
     '-safe', '0',
     '-i', listPath,
-    // 把负时间戳平移到 0，避免每段起点不一致导致的抖动
+    /**
+     * 把负时间戳平移到 0。
+     *
+     * concat demuxer 会按每个分段的**实际末帧 PTS** 给下一段加偏移，
+     * 所以各段虽然都从 0 开始，拼起来仍然是连续的（实测 0.18 → 30.23
+     * → 60.35 → 90.07，无重叠）。这里只是兜住个别分段首帧为负的情况。
+     */
     '-avoid_negative_ts', 'make_zero',
     // 不解码，只重新封装
     '-c', 'copy',
