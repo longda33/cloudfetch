@@ -212,25 +212,87 @@ export class TaskManager extends EventEmitter {
    * 之后所有上传都失败，而且报错是 R2 PUT 403，很难联想到是空间问题。
    *
    * 正在转码的不能删：Actions 还在下载它。
+   *
+   * ---- 2026-11 补充：转码失败的分段**默认不删** ----
+   *
+   * 出过一次真实事故：一场 2.4 小时的直播（29 段，1.42GB）转码
+   * 撞上 Actions 超时被取消，mp4State 标成 failed。用户看到任务
+   * 显示失败，就点了删除清理界面 —— 于是这 29 段源文件全被删掉。
+   * 等修好转码参数想重跑时，**源数据已经不存在了**，那场直播彻底丢失。
+   *
+   * 现在的规则：
+   *   - mp4State === 'failed' 的分段，**保留**，除非调用方显式传 force
+   *   - 用户真要清空间，可以在界面上二次确认（force=true）
+   *
+   * 代价是失败任务会占着 R2 空间。这是有意的权衡：
+   * R2 免费 10GB 能存约 7 场这样的直播，而丢失的直播是找不回来的。
+   * 真有空间压力时，前端会提示，用户再手动清。
+   *
+   * @param {object} t 任务
+   * @param {{force?: boolean}} [opts] force=true 时连失败的分段也删
+   * @returns {{deleted: number, kept: number}} 删除与保留的计数
    */
-  _disposeTask(t) {
+  _disposeTask(t, { force = false } = {}) {
     const r = config.r2;
-    if (!r.accessKeyId || !r.secretAccessKey || !r.bucket) return;
+    if (!r.accessKeyId || !r.secretAccessKey || !r.bucket) {
+      return { deleted: 0, kept: 0 };
+    }
 
     // 合并转码进行中：Actions 正在逐段拉取，删了它就会失败
-    if (t.mergedSubmitted && t.mp4State === 'pending') return;
+    if (t.mergedSubmitted && t.mp4State === 'pending') {
+      return { deleted: 0, kept: 0 };
+    }
 
-    const keys = new Set();
-    if (t.r2Key && t.mp4State !== 'pending') keys.add(t.r2Key);
+    const del = new Set();
+    const keep = new Set();
+
+    /** 判断单个对象该删还是该留 */
+    const classify = (key, mp4State) => {
+      if (!key) return;
+      // Actions 正在用它
+      if (mp4State === 'pending') return;
+      // 转码失败：源文件是重跑的唯一希望，非 force 不删
+      if (mp4State === 'failed' && !force) {
+        keep.add(key);
+        return;
+      }
+      del.add(key);
+    };
+
+    classify(t.r2Key, t.mp4State);
     for (const s of t.segments || []) {
-      if (s.r2Key && s.mp4State !== 'pending') keys.add(s.r2Key);
+      classify(s.r2Key, s.mp4State);
     }
-    if (!keys.size) return;
 
-    const r2 = getR2();
-    for (const key of keys) {
-      r2.deleteObject(key).catch(() => {});
+    if (del.size) {
+      const r2 = getR2();
+      for (const key of del) {
+        r2.deleteObject(key).catch(() => {});
+      }
     }
+
+    /**
+     * 记录「保留了几个」。
+     *
+     * 不能直接调 this._log(t.id, ...)：调用点（remove / clearFinished）
+     * 通常已经把任务从 this.tasks 删掉了，而 _log 内部会去
+     * this.logs.get(id) 取数组，拿不到就抛 TypeError。
+     * 这里只在该任务仍有日志缓冲时追加，否则静默跳过 ——
+     * 这条日志是给人看的说明，不该因为任务已删就炸掉整个删除流程。
+     */
+    if (keep.size) {
+      const buf = this.logs?.get?.(t.id);
+      if (Array.isArray(buf)) {
+        buf.push(
+          `${new Date().toLocaleTimeString('zh-CN', {
+            hour12: false,
+            timeZone: 'Asia/Shanghai',
+          })} 保留了 ${keep.size} 个转码失败的分段（可重试），未删除`,
+        );
+      }
+    }
+
+    return { deleted: del.size, kept: keep.size };
   }
 
   /**
@@ -475,13 +537,23 @@ export class TaskManager extends EventEmitter {
    * 运行中的任务拒绝删除（this.running 里有的），
    * 否则 ffmpeg 还在往目录里写，删了会出错。
    */
-  async remove(id) {
+  /**
+   * 删除单个任务。
+   *
+   * @param {string} id 任务 id
+   * @param {{force?: boolean}} [opts]
+   *   force=true 时连「转码失败的分段」也从 R2 删掉。
+   *   默认 false —— 失败分段的源文件是重跑的唯一希望，
+   *   误删会让整场直播永久丢失（真实事故，见 _disposeTask 注释）。
+   * @returns {Promise<boolean>}
+   */
+  async remove(id, { force = false } = {}) {
     const t = this.tasks.get(id);
     if (!t) return false;
     if (this.running.has(id)) return false;
 
     this.tasks.delete(id);
-    this._disposeTask(t);
+    this._disposeTask(t, { force });
     this._saveState();
     this.emit('removed', { id });
 
@@ -492,6 +564,10 @@ export class TaskManager extends EventEmitter {
 
   /**
    * 清掉所有已结束任务的磁盘目录。
+   *
+   * 这里**永不 force**：批量清理最容易误伤，而且用户点这个按钮时
+   * 想的是"清掉界面上那些已完成的任务"，不是"把失败任务的源文件也烧了"。
+   * 失败分段要清，得走单个 remove({force:true})。
    *
    * @returns {Promise<number>} 清掉的任务数
    */
@@ -505,7 +581,7 @@ export class TaskManager extends EventEmitter {
     for (const id of done) {
       const t = this.tasks.get(id);
       this.tasks.delete(id);
-      this._disposeTask(t);
+      this._disposeTask(t, { force: false });
     }
     if (done.length) this._saveState();
 

@@ -367,3 +367,19 @@ export function getR2() {
 export function resetR2() {
   _r2 = null;
 }
+
+/**
+ * 测试专用：把单例替换成假对象。
+ *
+ * 为什么需要这个：getR2() 返回模块级缓存的 _r2，
+ * 测试里没法用 monkey-patch 覆盖 ESM 的具名导出（赋值会报
+ * "Cannot assign to read only property"）。留一个显式注入点
+ * 比在每个测试里 hack 模块对象干净。
+ *
+ * 生产代码**不要调用**。
+ *
+ * @param {object|null} fake 传 null 等同于 resetR2()
+ */
+export function __setR2ForTest(fake) {
+  _r2 = fake;
+}

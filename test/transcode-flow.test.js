@@ -204,16 +204,34 @@ test('超过超时时间仍未落地则标记失败，并计入历史', async ()
   assert.equal(rec.transcodePending, 0);
 });
 
-test('删除任务会清掉 R2 源文件，但不碰转码中的', async () => {
+test('删除任务：默认保留失败分段的 R2 源文件，force 才清', async () => {
+  /**
+   * 这条测试原来断言的是旧行为「删除任务会清掉失败的 R2 源文件」。
+   *
+   * 那个行为出过事故：一场 2.4 小时直播转码超时，用户看到"失败"
+   * 就点删除，29 段源文件全被清掉，修好后也没法重跑，直播永久丢失。
+   *
+   * 现在的规则反过来了：失败分段默认**保留**，只有 force 才删。
+   * 详细的分支覆盖见 test/keep-failed-segments.test.js，
+   * 这里保留一条最核心的对照，防止有人把默认值改回去。
+   */
   const t = makeLiveTask('live-dispose', { mp4State: 'failed' });
   calls.length = 0;
   mgr._disposeTask(t);
   await new Promise((r) => setTimeout(r, 50));
-  assert.equal(count('delete-r2'), 2, '失败的段应清理 R2 源文件');
+  assert.equal(count('delete-r2'), 0, '默认不该删失败分段的源文件');
 
-  const t2 = makeLiveTask('live-dispose-2', { mp4State: 'pending' });
+  // force 时才删
+  const t2 = makeLiveTask('live-dispose-force', { mp4State: 'failed' });
   calls.length = 0;
-  mgr._disposeTask(t2);
+  mgr._disposeTask(t2, { force: true });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(count('delete-r2'), 2, 'force 时应清理失败分段的源文件');
+
+  // 正在转码的无论如何都不删
+  const t3 = makeLiveTask('live-dispose-2', { mp4State: 'pending' });
+  calls.length = 0;
+  mgr._disposeTask(t3, { force: true });
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(count('delete-r2'), 0, '正在转码的源文件不能删（Actions 还在下载）');
 });

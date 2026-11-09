@@ -654,4 +654,45 @@ async function main() {
   }
 }
 
-main().catch((e) => fail(e.stack || e.message));
+main().catch((e) => {
+  /**
+   * 失败时把「怎么重跑」打出来。
+   *
+   * 这里**不删 R2 上的分段** —— 删除逻辑只在上面的成功路径里。
+   * 这是有意的：转码失败（超时、OOM、ffmpeg 崩）时，
+   * R2 上的源分段是重跑的唯一依据，删了就永久丢失。
+   *
+   * 曾经踩过：一场 2.4 小时直播转码超时被取消，分段还在 R2，
+   * 但主程序清理任务时把它们删了，于是没法重跑，直播彻底丢失。
+   * 主程序那边已经加了保护（_disposeTask 不再删 failed 分段），
+   * 这里再从 Actions 侧保证一次。
+   */
+  const keys = (process.env.R2_KEYS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  console.log('\n=== TRANSCODE_RESULT ===');
+  console.log(
+    JSON.stringify({
+      ok: false,
+      error: String(e.message || e).slice(0, 500),
+      task: process.env.TASK_ID || '',
+      segments: keys.length || 1,
+      // 关键：告诉主程序源文件还在，可以重跑
+      sourcesKept: true,
+      rerunKeys: keys.join(','),
+    }),
+  );
+  console.log('=== END ===');
+
+  console.log('\n源分段仍保留在 R2，可修复后重新触发：');
+  if (keys.length) {
+    console.log(`  分段数：${keys.length}`);
+    console.log(`  重新触发时把 r2_keys 设成上面那串（已在上面的 rerunKeys 里）`);
+  } else {
+    console.log(`  单文件模式：${process.env.R2_KEY || '(未设置 R2_KEY)'}`);
+  }
+
+  process.exit(1);
+});

@@ -319,9 +319,19 @@ app.post('/api/tasks/:id/retry-upload', async (req, res) => {
 /** 删除记录（同时清掉磁盘目录） */
 app.delete('/api/tasks/:id', async (req, res) => {
   try {
-    const ok = await mgr.remove(req.params.id);
+    /**
+     * force=1 时连「转码失败的分段」也从 R2 删掉。
+     *
+     * 默认不删：失败分段的源文件是重跑的唯一希望。
+     * 曾经有用户看到任务显示失败就点删除，结果 29 段（1.42GB）
+     * 全被清掉，等修好转码想重跑时源数据已经没了 —— 整场直播永久丢失。
+     *
+     * 真要清空间时前端会二次确认，那时才传 force。
+     */
+    const force = req.query.force === '1' || req.body?.force === true;
+    const ok = await mgr.remove(req.params.id, { force });
     if (!ok) return res.status(400).json({ error: '无法删除（任务进行中）' });
-    res.json({ ok: true });
+    res.json({ ok: true, force });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

@@ -703,7 +703,53 @@ async function act(kind, id) {
       for (const nt of j.created) upsertTask(nt);
       toast('已重新加入队列', 'ok');
     } else if (kind === 'remove') {
-      const r = await fetch(`/api/tasks/${id}`, { method: 'DELETE' });
+      /**
+       * 删除任务。
+       *
+       * 如果这个任务有「转码失败的分段」，默认**不删 R2 上的源文件** ——
+       * 那是重跑的唯一希望。删任务只清界面和本地磁盘。
+       *
+       * 但用户可能真的想清空间，所以二次询问：
+       *   取消     → 什么都不做
+       *   确定     → 删任务，保留失败分段的 R2 源文件（默认行为）
+       *   强制清理 → 连源文件一起删（force=1）
+       *
+       * 出过真实事故：一场 2.4 小时直播转码超时，用户看到"失败"
+       * 就点删除，29 段源文件全被清掉，修好后也没法重跑。
+       */
+      const t = state.tasks.get(id);
+      const failedCount = (t?.segments || []).filter((s) => s.mp4State === 'failed').length
+        + (t?.mp4State === 'failed' && !(t?.segments || []).length ? 1 : 0);
+
+      let force = false;
+      if (failedCount > 0) {
+        /**
+         * 用原生 confirm 两段询问，不引入自定义弹窗组件。
+         *
+         * 第一问：确定要移除这个任务吗（说明源文件会保留）
+         * 第二问：要不要连源文件一起删（危险操作，默认否）
+         *
+         * 这样默认路径（点两下"确定"）是**安全**的：只移除列表项，
+         * R2 上的失败分段保留。真要清空间得在第二问点"确定"，
+         * 而那一问的文案写明了后果。
+         */
+        const okRemove = confirm(
+          `这个任务有 ${failedCount} 个转码失败的分段。\n\n`
+          + '从列表移除后，R2 上的源文件会**保留**，方便以后修复了重新转码。\n\n'
+          + '确定要移除吗？',
+        );
+        if (!okRemove) return;
+
+        force = confirm(
+          `要不要连 R2 上的 ${failedCount} 个分段源文件一起删掉？\n\n`
+          + '⚠️ 删了就再也无法重跑转码，这个视频会永久丢失。\n\n'
+          + '点「取消」= 保留源文件（推荐）\n'
+          + '点「确定」= 彻底删除',
+        );
+      }
+
+      const url = force ? `/api/tasks/${id}?force=1` : `/api/tasks/${id}`;
+      const r = await fetch(url, { method: 'DELETE' });
       if (!r.ok) throw new Error((await r.json()).error);
       state.tasks.delete(id);
       state.logs.delete(id);
@@ -711,6 +757,7 @@ async function act(kind, id) {
       if (!state.tasks.size) renderAll();
       updateStats();
       updateTabCounts();
+      toast(force ? '已删除（含 R2 源文件）' : '已移除（源文件保留）', 'ok');
     }
   } catch (e) {
     toast(e.message, 'err');
