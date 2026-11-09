@@ -24,16 +24,18 @@ const {
   R2_KEYS = '',
   OUT_NAME = 'output.mp4',
   OPENLIST_DIR = '',
+  /**
+   * CRF / PRESET / THREADS 保留只是为了**不破坏已有的 workflow 调用**
+   * （transcode.yml 还在传 crf / preset 两个 input）。
+   *
+   * 2026-11-09 起改成了 `-c copy` 纯封装，**不重编码**，所以这三个值
+   * 已经不影响任何行为。留着是为了让旧的 `gh workflow run -f crf=18`
+   * 不会因为「未知 input」而失败。
+   *
+   * 如果以后确认没人再传这些参数，可以连同 workflow 里的 input 一起删。
+   */
   CRF = '18',
   PRESET = 'ultrafast',
-  /**
-   * 编码线程数。0 = 不传 `-threads`，交给 libx264 按自己探测的核数决定。
-   *
-   * 这里以前硬编码 4，理由是「GitHub runner 4 核」—— 实测标准 runner
-   * 是 **2 核**。4 线程跑在 2 核上属于超订，只会多出上下文切换和
-   * 帧缓冲延迟，不会有任何加速。x264 探测到的线程数和 nproc 一致，
-   * 交给它比自己猜准。
-   */
   THREADS = '0',
   TASK_ID = '',
   // OpenList 凭据
@@ -269,9 +271,31 @@ async function probeFrameRate(file) {
   }
 }
 
-async function transcode(input, output) {
-  const threads = String(THREADS);
-
+/**
+ * 把 FLV 封装成 MP4 —— **不重编码**。
+ *
+ * ---- 2026-11-09 改成纯 remux ----
+ *
+ * 之前这里做的是 H.264 重编码（CRF 18 / ultrafast / fps_mode passthrough）。
+ * 虽然 passthrough 已经把速度从 0.452x 提到 15x，但用户明确要求
+ * **不要再重编码**，理由充分：
+ *
+ *   1. 源本来就是 H.264 + AAC，重编码只会有代际损失，不可能提升画质
+ *   2. remux 是**字面零损失** —— 码流原样搬运，一帧不改
+ *   3. remux 只要几秒，重编码要 20-30 分钟
+ *   4. 体积不膨胀（重编码 CRF 18 会让 1.42GB 涨到 3.5GB）
+ *
+ * 代价（必须让用户知道）：
+ *   - 源是变帧率（约 19.8fps）+ 容器声称 1000fps，remux 会**原样保留**
+ *     这个假帧率。某些播放器拖进度条可能不准。
+ *   - 这不能用 `-fps_mode cfr` 修 —— copy 模式下该参数无效。
+ *
+ * 所以这里只做三件事：
+ *   - `-c copy`：码流原样搬运
+ *   - `-avoid_negative_ts make_zero`：兜住个别分段首帧为负的情况
+ *   - `-movflags +faststart`：索引移到文件头，浏览器可边下边播
+ */
+async function remuxToMp4(input, output) {
   const probe = await probeFrameRate(input);
   if (probe.r || probe.avg) {
     log(`源视频：codec=${probe.codec} r_frame_rate=${probe.r} avg_frame_rate=${probe.avg}`);
@@ -279,100 +303,59 @@ async function transcode(input, output) {
   /**
    * 假帧率告警。
    *
-   * 真实内容约 20fps，而容器声称 1000fps —— 这正是历史上那次
-   * 5 小时超时的直接原因。看到这条日志就说明源文件又是老样子，
-   * 下面的 `-fps_mode passthrough` 会兜住它，但值得留个记录。
+   * 真实内容约 20fps，容器声称 1000fps。remux 会原样保留它 ——
+   * 这是「不重编码」的固有代价，不是 bug。留一行日志让人知道。
    */
-  const claimed = Number(String(probe.r).split('/')[0]) / (Number(String(probe.r).split('/')[1]) || 1);
+  const parts = String(probe.r).split('/');
+  const claimed = Number(parts[0]) / (Number(parts[1]) || 1);
   if (claimed > 120) {
-    log(`⚠️ 容器声称 ${probe.r} fps（明显是假帧率），已用 -fps_mode passthrough 忽略它`);
+    log(`⚠️ 容器声称 ${probe.r} fps（假帧率）。remux 会原样保留，播放器拖进度条可能不准`);
   }
 
-  log(`转码：H.264 + AAC，CRF ${CRF}，preset ${PRESET}，threads ${threads === '0' ? '自动' : threads}`);
+  log('封装：-c copy（不重编码，画质零损失）');
 
   const args = [
     '-hide_banner',
     '-loglevel', 'warning',
     '-stats',
     '-i', input,
-    /**
-     * ★ 这一行是整个转码链路最关键的一行，不要删。
-     *
-     * 不加它时，ffmpeg 会走默认的 `-fps_mode auto`：对 MP4 这种
-     * 「按帧率播放」的容器，auto 会解析成 CFR，并拿输入流声明的
-     * r_frame_rate 当目标帧率。直播 FLV 声称 1000fps，实际只有 20fps，
-     * 于是 ffmpeg 每秒补 980 个重复帧 —— 编码器做了 50 倍无用功。
-     *
-     * 实测（720x1280，同 3 段合并样本，4 核）：
-     *   CFR 模式：frame=10000 dup=9837 speed=0.472x  ← 和线上 0.452x 一致
-     *   passthrough：frame=187   dup=0     speed=15.9x
-     * 同样 10 秒输出，相差 33 倍。
-     *
-     * passthrough 的意思是「每帧用自己的 PTS，不补不丢」，输出是 VFR
-     * MP4。MP4 的 stts 表本来就支持变帧率，播放器按 PTS 走，观感与源一致。
-     *
-     * 注意：**不要**用 `setpts=N/(25*TB)` 之类的办法重排时间戳来「修」
-     * 这个问题。源是变帧率（实测约 19.8fps），按 25fps 等距重排会让
-     * 画面比声音快 1.26 倍，音画越播越不同步（实测 90s 素材：视频
-     * 71.7s / 音频 90.1s，结尾差 18 秒）。
-     */
-    '-fps_mode', 'passthrough',
-    // 视频：libx264，yuv420p 保证兼容性（手机/浏览器/电视都能播）
-    '-c:v', 'libx264',
-    '-preset', PRESET,
-    '-crf', String(CRF),
-    '-pix_fmt', 'yuv420p',
-    /**
-     * 强制 limited range。
-     *
-     * 源 FLV 若带 full range 标记（yuvj420p），直接转出来会保留
-     * yuvj420p，部分电视和旧手机按 full range 解读会偏灰或偏艳。
-     * 显式声明 tv 范围可以让输出稳定在标准 yuv420p。
-     */
-    '-color_range', 'tv',
-    // 偶数宽高，否则部分播放器会花屏
-    '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-    // 音频：AAC 128k
-    '-c:a', 'aac',
-    '-b:a', '128k',
-    // 关键帧间隔 2 秒左右，方便拖动进度条
-    '-g', '50',
-    '-keyint_min', '50',
-    // faststart 把索引移到文件头，浏览器可以边下边播
+    // 码流原样搬运，不解码、不重编码
+    '-c', 'copy',
+    // 兜住负时间戳
+    '-avoid_negative_ts', 'make_zero',
+    // 索引移到文件头，浏览器可边下边播
     '-movflags', '+faststart',
+    '-y', output,
   ];
-
-  // 0 表示不干预，让 x264 自己按核数开线程
-  if (threads !== '0') args.push('-threads', threads);
-  args.push('-y', output);
 
   await run('ffmpeg', args);
   const sz = await sizeOf(output);
-  if (sz === 0) fail('转码输出是 0 字节');
-  log(`转码完成：${humanSize(sz)}`);
+  if (sz === 0) fail('封装输出是 0 字节');
+  log(`封装完成：${humanSize(sz)}`);
   return sz;
 }
 
-// ---------------- 2b. 合并多段 + 转码 ----------------
+// ---------------- 2b. 合并多段 ----------------
 /**
- * 把 N 个分段合并成一个 MP4 并转码。
+ * 把 N 个分段合并成一个 MP4。
  *
- * 两步走：
- *   1) ffmpeg concat demuxer 把分段拼成一个 FLV（-c copy，不解码，很快）
- *   2) 再对这个 FLV 做 H.264 + AAC 转码
+ * **一步到位**：concat demuxer 直接输出 MP4，全程 `-c copy`。
  *
- * 为什么不一步到位（concat + 转码同时做）：
- *   concat demuxer 配合 -c copy 只是重新封装，几乎不耗 CPU；
- *   分成两步后，如果转码失败，合并好的中间文件还在，方便排查。
- *   而且两步的日志更清晰，能看出是"拼接"还是"转码"出的问题。
+ * 之前是两步（先拼 FLV，再转码成 MP4），现在不重编码了，
+ * 两步没有任何好处 —— 反而多写一遍 1.4GB 磁盘、多花时间。
+ *
+ * 为什么 concat demuxer 而不是 filter_complex：
+ *   concat demuxer 直接把多个 FLV 当同一路流拼接，不解码，
+ *   内存占用恒定。filter_complex 会把所有输入同时打开，
+ *   36 个分段很容易把 runner 的内存吃满。
  */
 async function mergeAndTranscode(parts, workDir, output) {
   if (parts.length === 1) {
-    // 只有一段，不用合并
-    return transcode(parts[0], output);
+    // 只有一段，直接封装
+    return remuxToMp4(parts[0], output);
   }
 
-  log(`合并 ${parts.length} 个分段…`);
+  log(`合并 ${parts.length} 个分段（-c copy，不解码）…`);
 
   /**
    * concat demuxer 需要一个列表文件，每行 `file '路径'`。
@@ -387,51 +370,51 @@ async function mergeAndTranscode(parts, workDir, output) {
     .join('\n');
   await fsp.writeFile(listPath, listBody + '\n', 'utf8');
 
-  const merged = path.join(workDir, 'merged.flv');
-  await run('ffmpeg', [
+  const probe = await probeFrameRate(parts[0]);
+  if (probe.r) {
+    const seg = String(probe.r).split('/');
+    const claimed = Number(seg[0]) / (Number(seg[1]) || 1);
+    if (claimed > 120) {
+      log(`⚠️ 容器声称 ${probe.r} fps（假帧率）。remux 会原样保留，播放器拖进度条可能不准`);
+    }
+  }
+
+  log('封装：concat + -c copy（不重编码，画质零损失）');
+
+  const args = [
     '-hide_banner',
     '-loglevel', 'warning',
     '-stats',
-    /**
-     * +genpts 放在输入侧，只在这里用一次。
-     *
-     * 它的作用是在读包时补出缺失的 PTS。实测源分段的 PTS 是**存在**的
-     * （只是间隔抖动，属于变帧率），所以这行其实不改变什么，留着是
-     * 为了万一某个分段真的丢了 PTS 时不至于整场失败。
-     *
-     * 注意：它**不能**解决「转码慢」的问题 —— 慢的根因是输出侧在补帧，
-     * 和 PTS 缺失无关。真正管用的是 transcode() 里的 `-fps_mode passthrough`。
-     */
-    '-fflags', '+genpts',
     '-f', 'concat',
     '-safe', '0',
     '-i', listPath,
+    // 码流原样搬运
+    '-c', 'copy',
     /**
      * 把负时间戳平移到 0。
      *
      * concat demuxer 会按每个分段的**实际末帧 PTS** 给下一段加偏移，
-     * 所以各段虽然都从 0 开始，拼起来仍然是连续的（实测 0.18 → 30.23
-     * → 60.35 → 90.07，无重叠）。这里只是兜住个别分段首帧为负的情况。
+     * 所以各段虽然都从 0 开始，拼起来仍然是连续的。这里只是兜住
+     * 个别分段首帧为负的情况。
      */
     '-avoid_negative_ts', 'make_zero',
-    // 不解码，只重新封装
-    '-c', 'copy',
-    '-y',
-    merged,
-  ]);
+    // 索引移到文件头
+    '-movflags', '+faststart',
+    '-y', output,
+  ];
 
-  const mergedSize = await sizeOf(merged);
-  if (mergedSize === 0) fail('合并输出是 0 字节');
-  log(`合并完成：${humanSize(mergedSize)}`);
+  await run('ffmpeg', args);
 
-  // 合并完就把分段删掉，给转码腾出磁盘空间
-  // （runner 有 14GB，但一场 3 小时直播的分段加起来能到 1-2GB，
-  //   加上转码输出的中间文件，早点清更安全）
+  const sz = await sizeOf(output);
+  if (sz === 0) fail('合并输出是 0 字节');
+  log(`合并完成：${humanSize(sz)}`);
+
+  // 输出已经生成，分段没用了，删掉腾磁盘
   for (const p of parts) {
     await fsp.rm(p, { force: true }).catch(() => {});
   }
 
-  return transcode(merged, output);
+  return sz;
 }
 
 // ---------------- 3. 上传 OpenList ----------------
