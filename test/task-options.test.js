@@ -90,6 +90,18 @@ test('两个参数同时传都生效', () => {
   assert.equal(t.maxSeconds, 7200);
 });
 
+test('历史记录保留 mode / maxSeconds（「重下」要沿用原设置）', () => {
+  const mgr = fresh();
+  const t = mgr.create({
+    url: 'https://example.com/live.flv',
+    mode: 'remux',
+    maxSeconds: 1800,
+  });
+  const rec = mgr._historyRecord(t);
+  assert.equal(rec.mode, 'remux', '历史记录丢了 mode，重下会退回 cfr');
+  assert.equal(rec.maxSeconds, 1800, '历史记录丢了 maxSeconds，重下会变成不限时长');
+});
+
 test('cleanup', async () => {
   await fsp.rm(TMP, { recursive: true, force: true });
 });

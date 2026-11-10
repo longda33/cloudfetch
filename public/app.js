@@ -707,7 +707,14 @@ async function act(kind, id) {
       const r = await fetch('/api/tasks', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: t.url, upload: t.upload !== false }),
+        // 重试沿用原任务的选项，别把用户选的 remux / 时长限制丢掉
+        body: JSON.stringify({
+          url: t.url,
+          upload: t.upload !== false,
+          segment: t.segment !== false,
+          mode: t.mode || 'cfr',
+          maxSeconds: Number(t.maxSeconds) || 0,
+        }),
       });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || '重试失败');
@@ -1089,7 +1096,7 @@ function renderHistItem(h) {
     : '';
 
   return `
-  <div class="hist-item" data-hid="${h.id}" data-url="${esc(h.url)}" data-rpath="${esc(h.remotePath || '')}" data-dir="${esc(dir)}" data-segment="${h.segment === false ? '0' : '1'}">
+  <div class="hist-item" data-hid="${h.id}" data-url="${esc(h.url)}" data-rpath="${esc(h.remotePath || '')}" data-dir="${esc(dir)}" data-segment="${h.segment === false ? '0' : '1'}" data-mode="${esc(h.mode || 'cfr')}" data-maxseconds="${Number(h.maxSeconds) || 0}">
     <span class="hist-icon">${icon(km.icon)}</span>
     <div class="hist-body">
       <div class="hist-title">
@@ -1356,11 +1363,22 @@ document.addEventListener('click', async (e) => {
     }
   } else if (hact === 'retry') {
     try {
-      // 沿用原任务的模式重下
+      /**
+       * 沿用原任务的模式重下。
+       *
+       * 必须把 mode / maxSeconds 一起带上：用户特意选了 remux 或
+       * 「只录 30 分钟」，重下时悄悄退回 cfr + 不限，等于把他的设置吃了。
+       */
       const r = await fetch('/api/tasks', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, upload: true, segment: item?.dataset.segment !== '0' }),
+        body: JSON.stringify({
+          url,
+          upload: true,
+          segment: item?.dataset.segment !== '0',
+          mode: item?.dataset.mode || 'cfr',
+          maxSeconds: Number(item?.dataset.maxseconds) || 0,
+        }),
       });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error);

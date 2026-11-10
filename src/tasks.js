@@ -1864,6 +1864,14 @@ export class TaskManager extends EventEmitter {
       live: Boolean(t.live),
       upload: Boolean(t.upload),
       segment: t.segment !== false,
+      /**
+       * 转码输出方式与录制时长上限。
+       *
+       * 历史记录里也要存：「重下」按钮要沿用原任务的设置，
+       * 否则用户特意选的 remux / 「只录 30 分钟」会在重下时被重置。
+       */
+      mode: t.mode || 'cfr',
+      maxSeconds: t.maxSeconds || 0,
       status: t.status,
       size: t.size || 0,
       createdAt: t.createdAt,
