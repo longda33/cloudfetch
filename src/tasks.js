@@ -463,15 +463,16 @@ export class TaskManager extends EventEmitter {
    * @param {string} [opts.filename]
    * @param {boolean} [opts.upload=true]
    * @param {boolean} [opts.segment=true]
-   * @param {'cfr'|'remux'} [opts.mode='cfr']
-   *   转码输出方式。cfr = 重编码成恒定帧率（兼容性最好），
-   *   remux = 纯 -c copy（快 10 倍、字面无损，但部分播放器拖不动进度条）。
+   * @param {'cfr'|'remux'} [opts.mode='remux']
+   *   转码输出方式。remux = 纯 -c copy（快 1600 倍、字面无损，
+   *   但把源里坏掉的帧率原样带进 MP4，部分播放器拖不动进度条）；
+   *   cfr = 重编码成恒定帧率（兼容性最好，但要花几十分钟）。
    *   见 scripts/transcode-worker.mjs 里 remuxToMp4 的说明。
    * @param {number} [opts.maxSeconds=0]
    *   最长录制秒数，0 = 不限制（录到用户手动停止或直播结束）。
    *   只对直播生效，普通文件下载忽略。
    */
-  create({ url, filename, upload = true, segment = true, mode = 'cfr', maxSeconds = 0 }) {
+  create({ url, filename, upload = true, segment = true, mode = 'remux', maxSeconds = 0 }) {
     if (!url || typeof url !== 'string') throw new Error('缺少 url');
     let parsed;
     try {
@@ -507,11 +508,12 @@ export class TaskManager extends EventEmitter {
       upload: Boolean(upload),
       segment: segment !== false,
       /**
-       * 转码输出方式。'cfr'（默认）| 'remux'。
+       * 转码输出方式。'remux'（默认）| 'cfr'。
        * 校验放在这里而不是信任前端 —— 前端传错值时退回默认，
        * 不要让一个拼写错误导致 Actions 那边跑出意外的产物。
+       * 顺手做 trim + 小写：'CFR' / ' remux ' 这种也认，别让大小写把人坑了。
        */
-      mode: mode === 'remux' ? 'remux' : 'cfr',
+      mode: String(mode || '').trim().toLowerCase() === 'cfr' ? 'cfr' : 'remux',
       /**
        * 最长录制秒数。0 = 不限制。
        * 上限 24 小时，避免有人传个巨大数字把 ffmpeg 挂到天荒地老。
@@ -1041,7 +1043,14 @@ export class TaskManager extends EventEmitter {
     t.expectedPath = `${openlistDir}/${outName}`;
 
     await dispatchTranscode(
-      buildTranscodeInputs({ r2Keys: keys, outName, openlistDir, taskId: t.id }),
+      buildTranscodeInputs({
+        r2Keys: keys,
+        outName,
+        openlistDir,
+        taskId: t.id,
+        // 重试要沿用任务原本的输出方式，否则用户选的 cfr 会被换成默认的 remux
+        mode: t.mode,
+      }),
     );
 
     t.mergedSubmitted = true;
@@ -1096,6 +1105,7 @@ export class TaskManager extends EventEmitter {
         outName,
         openlistDir,
         taskId: t.id,
+        mode: t.mode,
       }),
     );
   }
@@ -1627,6 +1637,8 @@ export class TaskManager extends EventEmitter {
                 outName: `${base}.mp4`,
                 openlistDir,
                 taskId: t.id,
+                // 单文件也要带上输出方式：表单里选了 cfr 就该走 cfr
+                mode: t.mode,
               }),
             );
 
@@ -1870,7 +1882,7 @@ export class TaskManager extends EventEmitter {
        * 历史记录里也要存：「重下」按钮要沿用原任务的设置，
        * 否则用户特意选的 remux / 「只录 30 分钟」会在重下时被重置。
        */
-      mode: t.mode || 'cfr',
+      mode: t.mode || 'remux',
       maxSeconds: t.maxSeconds || 0,
       status: t.status,
       size: t.size || 0,

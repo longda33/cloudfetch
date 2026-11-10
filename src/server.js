@@ -249,12 +249,13 @@ app.post('/api/tasks', (req, res) => {
   // segment=false 表示「全段下载」：直播整场录成单个文件，不切段
   const segment = body.segment !== false;
   /**
-   * 转码输出方式：'cfr'（默认）| 'remux'。
+   * 转码输出方式：'remux'（默认）| 'cfr'。
    *
-   * cfr   —— 重编码成恒定帧率，任何播放器都能拖进度条，145 分钟约 25 分钟
-   * remux —— 纯 -c copy，快 1600 倍、字面无损，但 PotPlayer 拖不动进度条
+   * remux —— 纯 -c copy，秒级完成、字面无损，但会把源的假帧率带进 MP4，
+   *          PotPlayer 拖不动进度条
+   * cfr   —— 重编码成恒定帧率，任何播放器都能拖，但 145 分钟约 25 分钟
    *
-   * 合法性校验在 TaskManager.create() 里，非法值会退回 'cfr'。
+   * 合法性校验在 TaskManager.create() 里，非法值会退回 'remux'。
    */
   const mode = body.mode;
   /**

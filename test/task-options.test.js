@@ -26,24 +26,36 @@ function fresh() {
   return new TaskManager();
 }
 
-test('mode 默认是 cfr（不传时）', () => {
+test('mode 默认是 remux（不传时）', () => {
   const mgr = fresh();
   const t = mgr.create({ url: 'https://example.com/a.mp4' });
-  assert.equal(t.mode, 'cfr');
-});
-
-test('mode=remux 能存下来', () => {
-  const mgr = fresh();
-  const t = mgr.create({ url: 'https://example.com/a.mp4', mode: 'remux' });
   assert.equal(t.mode, 'remux');
 });
 
-test('mode 传非法值时退回 cfr，不抛错', () => {
+test('mode=cfr 能存下来', () => {
+  const mgr = fresh();
+  const t = mgr.create({ url: 'https://example.com/a.mp4', mode: 'cfr' });
+  assert.equal(t.mode, 'cfr');
+});
+
+test('mode 大小写/空白会被归一化', () => {
+  const mgr = fresh();
+  for (const v of ['CFR', 'cfr ', ' Cfr ']) {
+    const t = mgr.create({ url: 'https://example.com/a.mp4', mode: v });
+    assert.equal(t.mode, 'cfr', `mode=${JSON.stringify(v)} 应识别为 cfr`);
+  }
+  for (const v of ['REMUX', ' remux ']) {
+    const t = mgr.create({ url: 'https://example.com/a.mp4', mode: v });
+    assert.equal(t.mode, 'remux', `mode=${JSON.stringify(v)} 应识别为 remux`);
+  }
+});
+
+test('mode 传非法值时退回默认 remux，不抛错', () => {
   const mgr = fresh();
   // 前端被改坏、或者有人手工打 API 时可能出现任意字符串
-  for (const bad of ['CFR', 'copy', '', null, undefined, 'REMUX ', 123]) {
+  for (const bad of ['copy', '', null, undefined, 123, 'transcode']) {
     const t = mgr.create({ url: 'https://example.com/a.mp4', mode: bad });
-    assert.equal(t.mode, 'cfr', `mode=${JSON.stringify(bad)} 应退回 cfr`);
+    assert.equal(t.mode, 'remux', `mode=${JSON.stringify(bad)} 应退回 remux`);
   }
 });
 

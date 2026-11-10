@@ -58,12 +58,13 @@ on:
         # 代价是体积（1.4GB 源大约出 3.5GB）
         default: 'ultrafast'
       mode:
-        description: '输出方式：cfr（重编码成恒定帧率，任何播放器都能拖进度条）| remux（纯封装，无损但部分播放器拖不动）'
+        description: '输出方式：remux（纯封装，秒级且无损，但部分播放器拖不动进度条）| cfr（重编码成恒定帧率，任何播放器都能拖）'
         required: false
         type: string
-        # cfr 是默认：remux 虽然快 10 倍且字面无损，但会把源里坏掉的
-        # r_frame_rate=1000/1 原样带进 MP4，PotPlayer 拖不动进度条。
-        default: 'cfr'
+        # remux 是默认：长直播用 cfr 要跑几十分钟甚至撞 timeout，remux 是秒级。
+        # 代价是把源里坏掉的 r_frame_rate=1000/1 原样带进 MP4，PotPlayer 拖不动进度条；
+        # 需要兼容性就在表单里切 cfr。
+        default: 'remux'
       task_id:
         description: '来源任务 id（仅用于标记）'
         required: false

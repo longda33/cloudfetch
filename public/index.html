@@ -117,15 +117,17 @@
 
           <!--
             输出方式。
-              cfr   —— 重编码成恒定帧率，任何播放器都能拖进度条（默认）
-              remux —— 纯 -c copy，快 1600 倍且字面无损，但 PotPlayer 拖不动进度条
-            默认 cfr：拿到一个拖不动进度条的视频等于不能用。
+              remux —— 纯 -c copy，秒级完成且字面无损（默认），
+                       但会把源里坏掉的帧率原样带进 MP4，PotPlayer 拖不动进度条
+              cfr   —— 重编码成恒定帧率，任何播放器都能拖，但 2 小时的直播要跑几十分钟
+            默认 remux：长直播用 cfr 容易撞 Actions 超时，而 remux 是秒级。
+            拖不动进度条时再切 cfr。
           -->
-          <label class="select-field" title="cfr 兼容性最好；remux 快 1600 倍且无损，但部分播放器拖不动进度条">
+          <label class="select-field" title="remux 秒级完成且无损，但部分播放器拖不动进度条；cfr 兼容性最好，但要重编码几十分钟">
             <span class="select-label">输出</span>
             <select class="select select-sm" id="modeSelect" aria-label="转码输出方式">
-              <option value="cfr" selected>CFR（通用）</option>
-              <option value="remux">原样封装（快·无损）</option>
+              <option value="remux" selected>原样封装（快·无损）</option>
+              <option value="cfr">CFR（通用）</option>
             </select>
           </label>
 

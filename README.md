@@ -25,12 +25,22 @@ Unikraft 录制 FLV（5 分钟一段）
    ↓ 每段 PUT 到 Cloudflare R2，成功后删本地（转码开启时不再往 OpenList 传原始 FLV）
    ↓ 整场录完，workflow_dispatch 一次，传 R2 对象键列表（不传文件）
 GitHub Actions（ubuntu-24.04，4 核）
-   ↓ 逐段从 R2 下载 → concat 合并 → ffmpeg 转 H.264 + AAC CRF23 → faststart
+   ↓ 逐段从 R2 下载 → concat 合并 → 封装成 MP4 → faststart
    ↓ 分片上传 MP4 到 OpenList
    ↓ 成功后才删掉 R2 里的源文件（失败保留，供重试）
 Unikraft 定期轮询 OpenList
    ↓ 真的看到 MP4 才把任务标成「已完成」
 ```
+
+**两种输出方式**（表单里可切，默认 `remux`）：
+
+| 方式 | 做法 | 耗时 | 代价 |
+|---|---|---|---|
+| `remux`（默认） | 纯 `-c copy` 重新封装 | 秒级 | 源里坏掉的帧率（`r_frame_rate=1000/1`）会原样带进 MP4，PotPlayer 拖不动进度条 |
+| `cfr` | 重编码成恒定帧率 | 2 小时直播约 25 分钟 | 画质有损、占用 Actions 分钟数 |
+
+默认选 `remux`：长直播用 `cfr` 容易撞 Actions 超时（曾出现跑 5 小时只到 45%），
+而 `remux` 是秒级且字面无损。遇到拖不动进度条的播放器，在表单里切 `cfr` 重下即可。
 
 **为什么合并后统一转**：每段单独转再拼，接缝处时间戳跳变、拖动会卡；一次转码还能重新分配码率，
 体积更小，Actions 分钟数也只花一次。3 小时直播 = 36 段，逐段触发就是 36 次 Actions。

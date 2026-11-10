@@ -289,6 +289,31 @@ test('合并失败后重试只触发一次合并，不逐段拆', async () => {
   assert.equal(inputs.out_name, 'live_x.mp4', '输出应是整场一个文件名');
 });
 
+test('重试合并要沿用任务的 mode，不能悄悄换成默认值', async () => {
+  const t = makeMergedTask('merged-mode', { mp4State: 'failed' });
+  t.mode = 'cfr'; // 用户特意选了重编码
+  calls.length = 0;
+  dispatched.length = 0;
+
+  await mgr.retryFailedSegments(t.id);
+
+  assert.equal(dispatched[0].mode, 'cfr', '重试时把 cfr 丢了，产物会变成 remux');
+});
+
+test('buildTranscodeInputs 不传 mode 时按默认 remux', () => {
+  const inputs = buildTranscodeInputs({
+    r2Keys: ['a'],
+    outName: 'x.mp4',
+    openlistDir: '/d',
+    taskId: 't',
+  });
+  assert.equal(inputs.mode, 'remux', '默认输出方式应为原样封装');
+  assert.equal(
+    buildTranscodeInputs({ r2Keys: ['a'], outName: 'x.mp4', openlistDir: '/d', taskId: 't', mode: 'cfr' }).mode,
+    'cfr',
+  );
+});
+
 test('缺段时补传后再合并，仍然只提交一次', async () => {
   const t = makeMergedTask('merged-fill', { mp4State: 'failed' });
   // 第 2 段丢了 R2，但本地还在

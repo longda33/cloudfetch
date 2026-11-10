@@ -48,14 +48,17 @@ export function buildTranscodeInputs({ sourceUrl, r2Key, r2Keys, outName, openli
     out_name: String(outName),
     openlist_dir: String(openlistDir),
     /**
-     * 输出方式：'cfr' | 'remux'。
+     * 输出方式：'remux'（默认）| 'cfr'。
      *
-     * cfr   —— 重编码成恒定帧率，任何播放器都能拖进度条（默认）
-     * remux —— 纯 -c copy，快 1600 倍、字面无损，但 PotPlayer 拖不动进度条
+     * remux —— 纯 -c copy，快 1600 倍、字面无损；缺点是把源里坏掉的
+     *          帧率原样带进 MP4，部分播放器（PotPlayer）拖不动进度条
+     * cfr   —— 重编码成恒定帧率，任何播放器都能拖，但要花几十分钟
      *
-     * 空值时让 worker 自己用默认值 'cfr'。
+     * 这里**始终发显式值**，不发空串：GitHub 的 workflow input 有默认值，
+     * 但显式传空串会覆盖它，到了 worker 里 MODE='' 又会被当成"未设置"，
+     * 默认值等于被绕过两次，行为很难追踪。默认值只在 tasks.js 里定义一次。
      */
-    mode: String(mode || ''),
+    mode: mode === 'cfr' ? 'cfr' : 'remux',
     crf: String(config.transcode.crf),
     preset: String(config.transcode.preset),
     task_id: String(taskId),

@@ -651,13 +651,14 @@ async function addTasks() {
   /**
    * 输出方式与录制时长。
    *
-   * mode：'cfr'（默认，任何播放器都能拖进度条）| 'remux'（快 1600 倍且
-   *   字面无损，但会把源的假帧率带进 MP4，PotPlayer 拖不动进度条）。
+   * mode：'remux'（默认，秒级且字面无损，但会把源的假帧率带进 MP4，
+   *   PotPlayer 拖不动进度条）| 'cfr'（重编码成恒定帧率，任何播放器都能拖，
+   *   但 2 小时的直播要跑几十分钟）。
    * maxSeconds：0 = 不限。只对直播生效，普通文件按文件本身长度。
    *
    * 用 ?. 兜底：老版本页面缓存里没有这两个元素时不要让提交直接抛异常。
    */
-  const mode = $('#modeSelect')?.value || 'cfr';
+  const mode = $('#modeSelect')?.value || 'remux';
   const maxSeconds = Number($('#durationSelect')?.value) || 0;
   const btn = $('#btnAdd');
   const original = btn.innerHTML;
@@ -712,7 +713,7 @@ async function act(kind, id) {
           url: t.url,
           upload: t.upload !== false,
           segment: t.segment !== false,
-          mode: t.mode || 'cfr',
+          mode: t.mode || 'remux',
           maxSeconds: Number(t.maxSeconds) || 0,
         }),
       });
@@ -1096,7 +1097,7 @@ function renderHistItem(h) {
     : '';
 
   return `
-  <div class="hist-item" data-hid="${h.id}" data-url="${esc(h.url)}" data-rpath="${esc(h.remotePath || '')}" data-dir="${esc(dir)}" data-segment="${h.segment === false ? '0' : '1'}" data-mode="${esc(h.mode || 'cfr')}" data-maxseconds="${Number(h.maxSeconds) || 0}">
+  <div class="hist-item" data-hid="${h.id}" data-url="${esc(h.url)}" data-rpath="${esc(h.remotePath || '')}" data-dir="${esc(dir)}" data-segment="${h.segment === false ? '0' : '1'}" data-mode="${esc(h.mode || 'remux')}" data-maxseconds="${Number(h.maxSeconds) || 0}">
     <span class="hist-icon">${icon(km.icon)}</span>
     <div class="hist-body">
       <div class="hist-title">
@@ -1376,7 +1377,7 @@ document.addEventListener('click', async (e) => {
           url,
           upload: true,
           segment: item?.dataset.segment !== '0',
-          mode: item?.dataset.mode || 'cfr',
+          mode: item?.dataset.mode || 'remux',
           maxSeconds: Number(item?.dataset.maxseconds) || 0,
         }),
       });

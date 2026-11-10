@@ -27,14 +27,17 @@ const {
   /**
    * 输出方式。
    *
-   *   cfr   —— 重编码成恒定帧率（默认）。产物是标准 MP4，任何播放器都能拖进度条。
-   *   remux —— 纯 `-c copy` 封装。画质字面零损失、几秒钟，但会原样保留源里
-   *            那个坏掉的帧率声明，部分播放器（PotPlayer 等）拖不动。
+   *   remux —— 纯 `-c copy` 封装（默认）。画质字面零损失、几秒钟，但会原样保留
+   *            源里那个坏掉的帧率声明，部分播放器（PotPlayer 等）拖不动进度条。
+   *   cfr   —— 重编码成恒定帧率。产物是标准 MP4，任何播放器都能拖，但要花几十分钟。
    *
-   * 默认 cfr 是踩坑换来的：remux 出的文件浏览器能拖、PotPlayer 拖不动。
-   * 详见 07-转码超时-已解决.md 的「为什么最后没有用 remux」。
+   * 默认 remux：长直播（2 小时以上）用 cfr 要跑几十分钟甚至撞 timeout，
+   * 而 remux 是秒级。想兼容性优先就在表单里切 cfr。
+   *
+   * 注意 MODE 的默认值只在这里兜底；正常链路里 service 每次都会显式传值
+   * （见 src/transcode.js 的 buildTranscodeInputs），空串按 remux 处理。
    */
-  MODE = 'cfr',
+  MODE = 'remux',
   CRF = '18',
   PRESET = 'ultrafast',
   /**
@@ -486,9 +489,16 @@ async function mergeAndTranscode(parts, workDir, output) {
     log(`⚠️ 容器声称 ${probe.r} fps（假帧率，真实约 15-20fps）`);
   }
 
-  log(`合并 ${parts.length} 个分段（MODE=${MODE}）…`);
-  const sz =
-    MODE === 'remux' ? await remuxToMp4(inputArgs, output) : await transcodeToCfr(inputArgs, output);
+  /**
+   * 只有显式传 cfr 才重编码，其它情况（含空串）一律走 remux。
+   *
+   * 不写成 `MODE === 'remux' ? ... : ...`：环境变量被设成空串时，
+   * 解构默认值不生效，MODE 会是 ''，那样反而会掉进 cfr 分支 ——
+   * 和"默认 remux"的约定正好相反。
+   */
+  const useCfr = String(MODE || '').toLowerCase() === 'cfr';
+  log(`合并 ${parts.length} 个分段（MODE=${useCfr ? 'cfr' : 'remux'}）…`);
+  const sz = useCfr ? await transcodeToCfr(inputArgs, output) : await remuxToMp4(inputArgs, output);
 
   // 输出已经生成，分段没用了，删掉腾磁盘
   for (const p of parts) {
