@@ -109,7 +109,17 @@
         </div>
 
         <div class="composer-actions">
-          <label class="switch" title="关闭后文件只留在服务器本地">
+          <!--
+            上传开关。
+
+              开：下载 → R2 → Actions 转码 → OpenList 存 MP4 → 删本地
+              关：下载 → R2 → 删本地（不转码，不进 OpenList）
+
+            关掉时文件仍然会传 R2 —— R2 是持久存储，容器重建也不丢。
+            以前关掉是「保留本地」，那是错的：容器无状态，实例一重建
+            文件就没了；而且 973MB 的卷放不下几个大文件。
+          -->
+          <label class="switch" title="关闭后文件只存 R2（不转码、不进 OpenList），本地仍然会删掉">
             <input type="checkbox" id="uploadToggle" checked>
             <span class="switch-track"><span class="switch-thumb"></span></span>
             <span>转码后存 OpenList</span>

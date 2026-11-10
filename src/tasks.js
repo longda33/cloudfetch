@@ -1395,8 +1395,45 @@ export class TaskManager extends EventEmitter {
      * 并登记到 failedSegments，用户可以在历史记录里点「重传」。
      */
     const doUploadSegment = async (rec) => {
+      /**
+       * upload=false 的语义：**只留 R2，不传 OpenList，本地立即删**。
+       *
+       * 以前这里是「保留本地」—— 那是错的。卷只有 973MB，一场 2 小时
+       * 直播的 29 段共 1.4GB，留本地当场就把盘写满，后续任务全废。
+       *
+       * 而且「保留本地」对用户毫无价值：容器是无状态的，实例一重建
+       * （每次部署都会重建）本地文件就没了，用户拿不到任何东西。
+       *
+       * R2 是持久存储，分段放那儿随时能取。所以这个分支只做一件事：
+       * 把分段传上 R2，然后删本地。
+       */
       if (!t.upload) {
-        onLog(`第 ${rec.index} 段：未开启上传，保留本地`);
+        if (!getR2().configured) {
+          /**
+           * 没配 R2 就没地方放。
+           *
+           * 不能静默保留本地（盘会满），也不能直接删（数据全丢）。
+           * 只能失败，并明确告诉用户原因 —— 这比悄悄丢数据好。
+           */
+          recordFailure(rec, '未开启上传且未配置 R2，分段无处安放');
+          onLog(`第 ${rec.index} 段：未开启上传，且 R2 未配置 —— 无法保留，已记为失败`);
+          return;
+        }
+        onLog(`第 ${rec.index} 段：只存 R2（不传 OpenList），本地删除`);
+        try {
+          await uploadSegmentToR2(rec);
+          /**
+           * 传完立即删本地。
+           *
+           * 这里不依赖外层清理：外层要等整场录完才跑，而分段是边录
+           * 边产的，不即时删的话峰值磁盘占用还是整场大小。
+           */
+          await fsp.rm(rec.path, { force: true }).catch(() => {});
+          rec.deleted = true;
+        } catch (e) {
+          onLog(`第 ${rec.index} 段 R2 上传失败：${e.message}（文件保留本地）`);
+          recordFailure(rec, `R2 上传失败：${e.message}`);
+        }
         return;
       }
       if (!transcodeConfigured()) {
@@ -1700,6 +1737,55 @@ export class TaskManager extends EventEmitter {
       onLog(`下载完成：${dl.filename}  ${humanSize(dl.size)}`);
 
       // ---------- 2. 上传 ----------
+      /**
+       * upload=false 的单文件路径：只传 R2，不传 OpenList，然后删本地。
+       *
+       * 和分段模式同样的理由：本地留文件没意义（容器无状态，重建就没了），
+       * 而且 973MB 的卷放不下几个大文件。R2 是持久存储，放那儿随时能取。
+       */
+      if (!t.upload) {
+        const r2 = getR2();
+        if (!r2.configured) {
+          onLog('未开启上传，且 R2 未配置 —— 文件无处安放，任务失败');
+          throw new Error('未开启上传且未配置 R2，文件无法保留');
+        }
+        t.status = STATUS.UPLOADING;
+        t.phase = '存入 R2（不上传 OpenList）';
+        t.percent = 0;
+        this._emit(t);
+        this._saveState();
+
+        const ext = path.extname(String(dl.filename || '')).toLowerCase() || '.bin';
+        const base = stemOf(dl.filename);
+        const key = `${config.r2.prefix}/${t.id}/${base}${ext}`;
+        onLog(`只存 R2：${key}（${humanSize(dl.size)}）`);
+        await r2.putFile(dl.filePath, key, {
+          contentType: contentTypeOf(dl.filename),
+          signal: ac.signal,
+        });
+
+        t.r2Key = key;
+        t.remotePath = `r2://${config.r2.bucket}/${key.replace(`${config.r2.prefix}/`, '')}`;
+        /**
+         * 立刻删本地。
+         *
+         * 和 upload=true 不同：那条路要等 Actions 转码完才删，
+         * 因为转码读的是 R2 上的副本，本地确实可以马上删 —— 但历史上
+         * 是等确认后才删。这里明确不走转码，传完就没用了，立即释放。
+         */
+        await fsp.rm(dl.filePath, { force: true }).catch(() => {});
+        t.localPath = '';
+
+        t.status = STATUS.DONE;
+        t.phase = '已存入 R2';
+        t.finishedAt = Date.now();
+        t.percent = 100;
+        onLog(`已存入 R2，本地已删除。路径：${t.remotePath}`);
+        this._emit(t);
+        this._saveState();
+        return;
+      }
+
       if (t.upload) {
         const ol = getOpenList();
         if (!ol.configured) {
@@ -1930,7 +2016,20 @@ export class TaskManager extends EventEmitter {
       const mayHaveUnuploaded =
         Boolean(t._stopRequested) ||
         (t.failedSegments?.length || 0) > 0 ||
-        (t.upload && !allHandled && ((t.size || 0) > 0 || segs.length > 0));
+        /**
+         * 这里**不能**再带 `t.upload &&`。
+         *
+         * 以前 upload=false 表示「保留本地」，所以那时「未上传」不算
+         * 需要保留的东西 —— 本来就要留着，谈不上"未上传会丢"。
+         *
+         * 现在 upload=false 表示「只存 R2」，语义反过来了：本地文件
+         * 应该在传完 R2 后删掉。如果上传失败（failedSegments 非空），
+         * 上面第一个条件已经兜住了；如果连 failedSegments 都没登记
+         * （比如进程被 kill），本地那份就是唯一的副本，更不能删。
+         *
+         * 所以去掉 upload 判断，只要「有内容且没全部着落」就保留。
+         */
+        (!allHandled && ((t.size || 0) > 0 || segs.length > 0));
 
       if (!mayHaveUnuploaded) {
         try {
