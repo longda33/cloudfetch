@@ -99,7 +99,15 @@ export class R2Client {
      * canonical request 的哈希对不上时是看不出差异的，
      * 只能靠比对请求路径发现。
      */
-    const canonicalUri = '/' + uriEncode(this.bucket, false) + '/' + uriEncode(key, false);
+    /**
+     * key 为空 = 列桶（ListObjectsV2），此时路径**只有 /{bucket}**，
+     * 末尾不能有斜杠。
+     *
+     * 这是第三次踩这个坑（前两次见 03 踩坑记录）。列桶和取对象的
+     * canonicalUri 规则不同，写成同一个表达式必然有一边是错的。
+     */
+    const canonicalUri =
+      '/' + uriEncode(this.bucket, false) + (key ? '/' + uriEncode(key, false) : '');
     const canonicalQuery = query;
 
     /**
@@ -153,8 +161,18 @@ export class R2Client {
     };
   }
 
+  /**
+   * 拼请求 URL。
+   *
+   * key 为空表示列桶，路径只有 /{bucket}，**不能带尾斜杠** ——
+   * 否则和 _sign() 算出的 canonicalUri 差一个字符，
+   * R2 直接回 SignatureDoesNotMatch，且报错里看不出差异。
+   */
   _url(key, query = '') {
-    return `${this.endpoint}/${this.bucket}/${uriEncode(key, false)}${query ? '?' + query : ''}`;
+    const p = key
+      ? `/${this.bucket}/${uriEncode(key, false)}`
+      : `/${this.bucket}`;
+    return `${this.endpoint}${p}${query ? '?' + query : ''}`;
   }
 
   /**
@@ -322,6 +340,82 @@ export class R2Client {
   }
 
   /**
+   * 统计桶里占了多少空间。
+   *
+   * ⚠️ 需要 ListBucket 权限。上面的 ping() 特意避开列桶就是因为
+   * 最小权限的密钥常常只有 Object Read & Write。所以这里**必须**
+   * 把 403 当成「拿不到」，而不是「出错」——前端据此显示「R2 正常」
+   * 而不带用量，不能让整个状态灯变红。
+   *
+   * R2 的 ListObjectsV2 单次最多返回 1000 个 key，超过要翻页。
+   * 翻页靠 NextContinuationToken，直到响应里没有它为止。
+   *
+   * 防呆：最多翻 50 页（5 万个对象）。真到那个量级，这个接口
+   * 本身就不该挂在每 30 秒一次的状态轮询上。
+   *
+   * @returns {Promise<{ok: boolean, bytes?: number, count?: number, reason?: string}>}
+   */
+  async usage({ prefix = '' } = {}) {
+    if (!this.configured) {
+      return { ok: false, reason: '未配置 R2' };
+    }
+
+    let bytes = 0;
+    let count = 0;
+    let token = null;
+
+    for (let page = 0; page < 50; page++) {
+      const params = ['list-type=2', 'max-keys=1000'];
+      if (prefix) params.push(`prefix=${encodeURIComponent(prefix)}`);
+      if (token) params.push(`continuation-token=${encodeURIComponent(token)}`);
+      const query = params.join('&');
+
+      /**
+       * 列桶的 canonicalUri 只有 /{bucket}，**不能多一个斜杠**。
+       * 这个坑踩过两次（见 03 踩坑记录），多写 `/` 就是 SignatureDoesNotMatch。
+       */
+      const headers = this._sign({ method: 'GET', key: '', query, payloadHash: EMPTY_SHA256 });
+
+      let res;
+      try {
+        res = await fetch(this._url('', query), {
+          method: 'GET',
+          headers,
+          signal: AbortSignal.timeout(10000),
+        });
+      } catch (e) {
+        return { ok: false, reason: `R2 列桶失败：${e.message}` };
+      }
+
+      if (res.status === 403) {
+        // 没权限 ≠ 故障。让调用方知道"连通但拿不到用量"。
+        return { ok: false, reason: '密钥没有 ListBucket 权限，无法统计用量' };
+      }
+      if (!res.ok) {
+        return { ok: false, reason: `R2 列桶 HTTP ${res.status}` };
+      }
+
+      const xml = await res.text();
+      /**
+       * 用正则扒 XML 而不是引 XML 解析库。
+       *
+       * 响应结构固定（<Contents><Key>..</Key><Size>..</Size></Contents>），
+       * 为一个字段引一个依赖不值得。注意 `<Size>` 也可能出现在别的
+       * 元素里，但 ListObjectsV2 的响应里只有 Contents 带 Size。
+       */
+      const sizes = [...xml.matchAll(/<Size>(\d+)<\/Size>/g)];
+      for (const m of sizes) bytes += Number(m[1]);
+      count += sizes.length;
+
+      const next = xml.match(/<NextContinuationToken>([^<]+)<\/NextContinuationToken>/);
+      if (!next) break;
+      token = next[1];
+    }
+
+    return { ok: true, bytes, count };
+  }
+
+  /**
    * 生成预签名 GET URL。
    *
    * 给 GitHub Actions 用：Actions 里不存 R2 密钥，
@@ -340,7 +434,15 @@ export class R2Client {
       `X-Amz-SignedHeaders=host`,
     ].join('&');
 
-    const canonicalUri = '/' + uriEncode(this.bucket, false) + '/' + uriEncode(key, false);
+    /**
+     * key 为空 = 列桶（ListObjectsV2），此时路径**只有 /{bucket}**，
+     * 末尾不能有斜杠。
+     *
+     * 这是第三次踩这个坑（前两次见 03 踩坑记录）。列桶和取对象的
+     * canonicalUri 规则不同，写成同一个表达式必然有一边是错的。
+     */
+    const canonicalUri =
+      '/' + uriEncode(this.bucket, false) + (key ? '/' + uriEncode(key, false) : '');
     const canonicalRequest = [
       'GET',
       canonicalUri,

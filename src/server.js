@@ -452,7 +452,23 @@ app.get('/api/status', async (req, res) => {
   const [r2, openlist] = await Promise.all([
     (async () => {
       try {
-        return await getR2().ping({ prefix: config.r2.prefix });
+        /**
+         * 连通性 + 用量并发。
+         *
+         * ping 是 HEAD（毫秒级），usage 是 ListObjectsV2 翻页（对象多时慢）。
+         * 串行会让状态灯白等一次列桶。
+         *
+         * usage 失败**不影响**连通性判断：密钥没 ListBucket 权限时
+         * 返回 ok:false，前端只显示「R2 正常」不带用量，
+         * 而不是把整个灯变红 —— 「连得上但看不到用量」是另一种状态。
+         */
+        const [p, u] = await Promise.all([
+          getR2().ping({ prefix: config.r2.prefix }),
+          getR2()
+            .usage({ prefix: config.r2.prefix })
+            .catch((e) => ({ ok: false, reason: e.message })),
+        ]);
+        return { ...p, usage: u };
       } catch (e) {
         return { ok: false, reason: e.message };
       }
@@ -477,6 +493,10 @@ app.get('/api/status', async (req, res) => {
       reason: r2.reason || '',
       ms: r2.ms || 0,
       bucket: r2.bucket || '',
+      /** 桶占用字节数。拿不到时为 null，前端据此决定要不要显示用量 */
+      used: r2.usage?.ok ? r2.usage.bytes : null,
+      usedCount: r2.usage?.ok ? r2.usage.count : null,
+      usedReason: r2.usage?.ok ? '' : r2.usage?.reason || '',
     },
     openlist: {
       ok: Boolean(openlist.ok),

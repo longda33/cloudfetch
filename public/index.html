@@ -75,9 +75,11 @@
         <span class="pill" id="chipOpenlist" data-state="idle" title="OpenList 连通性">
           <i class="dot"></i><span data-role="text">OpenList 检测中</span>
         </span>
-        <span class="pill" id="chipDisk" data-state="idle" title="临时目录磁盘空间">
-          <i class="dot"></i><span data-role="text">磁盘</span>
-        </span>
+        <!--
+          这里原来还有一个 chipDisk（「磁盘 973 MB 可用」）。
+          下方概览卡片已经显示同一份数据，重复且占地方，已删除。
+          磁盘状态只看下方那张卡片。
+        -->
       </div>
       <button class="icon-btn" id="btnTheme" type="button" title="切换明暗主题" aria-label="切换明暗主题">
         <svg class="ic" aria-hidden="true"><use href="#i-moon"></use></svg>

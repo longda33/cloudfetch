@@ -821,7 +821,12 @@ async function refreshChips() {
     const d = await (await fetch('/api/disk')).json();
     if (d.total > 0) {
       const used = ((d.total - d.free) / d.total) * 100;
-      setPill('#chipDisk', used > 90 ? 'off' : 'on', `磁盘 ${d.freeText} 可用`);
+      /**
+       * 只更新下方的磁盘卡片，**不再设 chipDisk**。
+       *
+       * 右上角那个「磁盘 973 MB 可用」和下方的「磁盘可用 973 MB」
+       * 是同一份数据，重复显示占地方。用户要求删掉右上角那个。
+       */
       $('#statDisk').textContent = d.freeText;
       $('#statDiskSub').textContent = `已用 ${used.toFixed(0)}% · 共 ${d.totalText}`;
       const bar = $('#diskBar');
@@ -880,8 +885,22 @@ async function refreshServiceStatus() {
     setPill('#chipR2', 'idle', 'R2 未配置');
     $('#chipR2').title = '未配置 Cloudflare R2，转码链路关闭（原始文件直接传 OpenList）';
   } else if (s.r2?.ok) {
-    setPill('#chipR2', 'on', `R2 正常${s.r2.ms ? ` ${s.r2.ms}ms` : ''}`);
-    $('#chipR2').title = `Cloudflare R2 连通正常（桶 ${s.r2.bucket || '-'}，${s.r2.ms || 0}ms）`;
+    /**
+     * 正常时显示「R2 正常 已用 100.5 MB」。
+     *
+     * 不显示延迟（之前是 `R2 正常 330ms`）—— 用户要求换成用量。
+     * 延迟放在 title 里，想看的鼠标悬停就能看到，不占标签宽度。
+     *
+     * used 为 null 表示拿不到用量（密钥没有 ListBucket 权限）。
+     * 这时只显示「R2 正常」，**不能**把灯变红 —— 连得上就是正常，
+     * 看不到用量是权限问题，不是故障。
+     */
+    const usedText =
+      typeof s.r2.used === 'number' ? ` 已用 ${fmtBytes(s.r2.used)}` : '';
+    setPill('#chipR2', 'on', `R2 正常${usedText}`);
+    $('#chipR2').title = s.r2.usedReason
+      ? `R2 连通正常（桶 ${s.r2.bucket || '-'}），但拿不到用量：${s.r2.usedReason}`
+      : `R2 连通正常（桶 ${s.r2.bucket || '-'}，${s.r2.usedCount ?? 0} 个对象，${s.r2.ms || 0}ms）`;
   } else {
     setPill('#chipR2', 'off', 'R2 异常');
     $('#chipR2').title = `Cloudflare R2 不可用：${s.r2?.reason || '未知原因'}`;
@@ -1451,21 +1470,22 @@ document.addEventListener('click', async (e) => {
     /**
      * 删除一条历史记录。
      *
-     * 之前这段只有 6 行，问题有三个，用户反馈「点了没反应」：
+     * 用户明确要求：**不要二次确认**，删除成功后**不重新拉列表**。
      *
-     *   1. 没有确认框 —— 手滑就删了，而且不可恢复
-     *   2. 没有加载态 —— 请求发出到返回这段时间按钮毫无变化，
-     *      用户以为没点上，会连点好几下
-     *   3. loadHistory() 没有 await —— toast 先弹、列表后刷，
-     *      而且失败时只弹一句「删除失败」，不告诉用户为什么
+     * 所以这里的做法是：
+     *   - 点了就删，不弹 confirm
+     *   - 成功后直接把这一行从 DOM 移除（不需要网络请求）
+     *   - 计数本地减 1
      *
-     * 现在补齐：确认 → 按钮禁用 + 文案变化 → 请求 → 精确的成败提示
-     * → 等列表刷新完再收尾。
+     * 为什么不 loadHistory()：
+     *   重新拉一次列表会闪一下（整块 innerHTML 重建），而且多一次往返。
+     *   删一条就少一条，本地同步移除最自然，视觉上也是连续的。
+     *   只有失败时才需要回退按钮状态。
+     *
+     * 仍然保留的部分：
+     *   - 加载态（防止连点发出多个 DELETE）
+     *   - 精确报错（401/404/500 不再都显示「删除失败」）
      */
-    const ok = confirm('删除这条历史记录？\n\n只删记录，不影响已经传到 OpenList / R2 的文件。');
-    if (!ok) return;
-
-    // 按钮进入「处理中」状态，防止连点
     const delBtn = item?.querySelector('[data-hact="del"]');
     const original = delBtn ? delBtn.innerHTML : '';
     if (delBtn) {
@@ -1480,12 +1500,6 @@ document.addEventListener('click', async (e) => {
         return;
       }
 
-      /**
-       * 解析响应体拿具体错误。
-       *
-       * 之前是 `if (r.ok) ... else toast('删除失败')` —— 401/404/500
-       * 全都显示同一句话，用户无从判断是网络问题还是记录已经没了。
-       */
       let j = {};
       try {
         j = await r.json();
@@ -1493,25 +1507,51 @@ document.addEventListener('click', async (e) => {
         /* 非 JSON 响应，下面用状态码兜底 */
       }
 
-      if (!r.ok) {
-        const why = j.error || `HTTP ${r.status}`;
-        throw new Error(why);
+      /**
+       * 404 不算失败。
+       *
+       * 「记录不存在」意味着服务端已经没有这条了 —— 可能是另一个标签页
+       * 删过，也可能上次请求其实成功了只是响应丢了。这种情况下界面上
+       * 那条记录**本来就该消失**，报错反而让用户困惑。
+       */
+      if (!r.ok && r.status !== 404) {
+        throw new Error(j.error || `HTTP ${r.status}`);
       }
 
-      toast('已删除该条历史记录', 'ok');
-
       /**
-       * 必须 await。
+       * 直接从 DOM 移除，不重新拉列表。
        *
-       * 不 await 的话，toast 弹出来的瞬间列表还是旧的，
-       * 用户看到「已删除」但那条记录还在，会以为删除失败了。
-       * 等刷新完再结束，视觉上才是连贯的。
+       * item 是 .hist-item 那个 div。移除后如果列表空了，
+       * 补一句「暂无记录」——否则用户看到一片空白，以为页面坏了。
        */
-      await loadHistory();
-      await refreshHistoryCount();
+      if (item) {
+        const parent = item.parentElement;
+        item.remove();
+        if (parent && !parent.querySelector('.hist-item')) {
+          /**
+           * 用和 loadHistory() 完全一样的空状态 HTML。
+           *
+           * 自己另写一个 class（比如 .hist-empty）会因为没定义样式而
+           * 变成一个光秃秃的 div —— 用户看到一片空白，以为页面坏了。
+           * 复用 .empty 结构，视觉上和「一开始就没有记录」完全一致。
+           */
+          parent.innerHTML = `
+            <div class="empty">
+              <div class="empty-icon">${icon('layers')}</div>
+              <p class="empty-title">还没有历史记录</p>
+              <p class="empty-sub">完成的任务会自动出现在这里</p>
+            </div>`;
+        }
+      }
+
+      // 计数本地减 1，不请求 /api/history
+      state.histTotal = Math.max(0, (state.histTotal || 0) - 1);
+      updateTabCounts();
+
+      toast(r.status === 404 ? '该记录已不存在，已从列表移除' : '已删除', 'ok');
     } catch (err) {
       toast(`删除失败：${err.message}`, 'err');
-    } finally {
+      // 只有失败才需要恢复按钮 —— 成功时整行都没了
       if (delBtn) {
         delBtn.disabled = false;
         delBtn.innerHTML = original;
