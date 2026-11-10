@@ -57,6 +57,13 @@ on:
         # ultrafast + CRF 18 是「视觉无损 + 尽量快」的组合，
         # 代价是体积（1.4GB 源大约出 3.5GB）
         default: 'ultrafast'
+      mode:
+        description: '输出方式：cfr（重编码成恒定帧率，任何播放器都能拖进度条）| remux（纯封装，无损但部分播放器拖不动）'
+        required: false
+        type: string
+        # cfr 是默认：remux 虽然快 10 倍且字面无损，但会把源里坏掉的
+        # r_frame_rate=1000/1 原样带进 MP4，PotPlayer 拖不动进度条。
+        default: 'cfr'
       task_id:
         description: '来源任务 id（仅用于标记）'
         required: false
@@ -148,6 +155,7 @@ jobs:
           OPENLIST_DIR: ${{ inputs.openlist_dir }}
           CRF: ${{ inputs.crf }}
           PRESET: ${{ inputs.preset }}
+          MODE: ${{ inputs.mode }}
           TASK_ID: ${{ inputs.task_id }}
           OPENLIST_URL: ${{ vars.OPENLIST_URL }}
           OPENLIST_TOKEN: ${{ secrets.OPENLIST_TOKEN }}
@@ -171,6 +179,7 @@ jobs:
             echo "| 目标目录 | \`${{ inputs.openlist_dir }}\` |"
             echo "| 分段数 | $(echo "${{ inputs.r2_keys }}" | tr ',' '\n' | grep -c . || echo 0) |"
             echo "| CRF | ${{ inputs.crf }} |"
+            echo "| 输出方式 | ${{ inputs.mode }} |"
             echo "| 任务 | \`${{ inputs.task_id }}\` |"
             echo "| 状态 | ${{ job.status }} |"
           } >> "$GITHUB_STEP_SUMMARY"
