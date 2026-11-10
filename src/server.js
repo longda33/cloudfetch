@@ -248,6 +248,20 @@ app.post('/api/tasks', (req, res) => {
   const upload = body.upload !== false;
   // segment=false 表示「全段下载」：直播整场录成单个文件，不切段
   const segment = body.segment !== false;
+  /**
+   * 转码输出方式：'cfr'（默认）| 'remux'。
+   *
+   * cfr   —— 重编码成恒定帧率，任何播放器都能拖进度条，145 分钟约 25 分钟
+   * remux —— 纯 -c copy，快 1600 倍、字面无损，但 PotPlayer 拖不动进度条
+   *
+   * 合法性校验在 TaskManager.create() 里，非法值会退回 'cfr'。
+   */
+  const mode = body.mode;
+  /**
+   * 最长录制秒数，0 = 不限制。只对直播生效。
+   * 前端下拉框传「30 分钟 / 1 小时 / 2 小时 / 不限」对应的秒数。
+   */
+  const maxSeconds = body.maxSeconds;
 
   // 批量：{ urls: [...] } 或 { text: "多行链接" }
   let urls = [];
@@ -275,7 +289,7 @@ app.post('/api/tasks', (req, res) => {
   const errors = [];
   for (const u of urls) {
     try {
-      const t = mgr.create({ url: u, filename: body.filename, upload, segment });
+      const t = mgr.create({ url: u, filename: body.filename, upload, segment, mode, maxSeconds });
       created.push(mgr.get(t.id));
     } catch (e) {
       errors.push({ url: u, error: e.message });

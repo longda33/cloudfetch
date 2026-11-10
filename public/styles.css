@@ -824,6 +824,34 @@ body[data-view="history"] .hero { display: none; }
 }
 .select:focus { outline: none; border-color: var(--accent); }
 
+/**
+ * 紧凑型下拉框 —— 给输入区那两个「输出方式 / 录制时长」用。
+ *
+ * 主表单里的 .select 高 38px，和主按钮齐平；但这里旁边已经有开关和
+ * 按钮，三个 38px 的控件挤在一行会换行。28px 刚好在视觉上「附属」
+ * 于主按钮，不抢焦点。
+ */
+.select-sm {
+  height: 28px;
+  padding: 0 26px 0 9px;
+  font-size: 12px;
+  border-radius: 8px;
+  background-position: right 7px center;
+  background-size: 14px 14px;
+}
+
+/* 下拉框 + 前置小标签的组合 */
+.select-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.select-label {
+  font-size: 12px;
+  color: var(--text-3, var(--text-2));
+  white-space: nowrap;
+}
+
 .hist-item {
   display: flex;
   align-items: flex-start;

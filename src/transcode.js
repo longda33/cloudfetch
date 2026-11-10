@@ -29,7 +29,7 @@ export class TranscodeError extends Error {
  * transcode.yml 里声明的一致。之前三个调用点各拼一遍，改一个字段
  * 很容易漏掉另外两个。
  */
-export function buildTranscodeInputs({ sourceUrl, r2Key, r2Keys, outName, openlistDir, taskId }) {
+export function buildTranscodeInputs({ sourceUrl, r2Key, r2Keys, outName, openlistDir, taskId, mode }) {
   /**
    * 返回的每个键都必须在 transcode.yml 的 `on.workflow_dispatch.inputs`
    * 里声明过。
@@ -47,6 +47,15 @@ export function buildTranscodeInputs({ sourceUrl, r2Key, r2Keys, outName, openli
     r2_keys: Array.isArray(r2Keys) ? r2Keys.join(',') : String(r2Keys || ''),
     out_name: String(outName),
     openlist_dir: String(openlistDir),
+    /**
+     * 输出方式：'cfr' | 'remux'。
+     *
+     * cfr   —— 重编码成恒定帧率，任何播放器都能拖进度条（默认）
+     * remux —— 纯 -c copy，快 1600 倍、字面无损，但 PotPlayer 拖不动进度条
+     *
+     * 空值时让 worker 自己用默认值 'cfr'。
+     */
+    mode: String(mode || ''),
     crf: String(config.transcode.crf),
     preset: String(config.transcode.preset),
     task_id: String(taskId),

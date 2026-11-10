@@ -648,6 +648,17 @@ async function addTasks() {
   if (!text) return toast('请先粘贴链接', 'err');
 
   const upload = $('#uploadToggle').checked;
+  /**
+   * 输出方式与录制时长。
+   *
+   * mode：'cfr'（默认，任何播放器都能拖进度条）| 'remux'（快 1600 倍且
+   *   字面无损，但会把源的假帧率带进 MP4，PotPlayer 拖不动进度条）。
+   * maxSeconds：0 = 不限。只对直播生效，普通文件按文件本身长度。
+   *
+   * 用 ?. 兜底：老版本页面缓存里没有这两个元素时不要让提交直接抛异常。
+   */
+  const mode = $('#modeSelect')?.value || 'cfr';
+  const maxSeconds = Number($('#durationSelect')?.value) || 0;
   const btn = $('#btnAdd');
   const original = btn.innerHTML;
   btn.disabled = true;
@@ -655,14 +666,14 @@ async function addTasks() {
 
   try {
     /**
-     * 只有一种下载模式了：直播按 5 分钟切段存 R2，结束后由 Actions
-     * 合并转码。segment 恒为 true —— 普通直链/HLS 本来就不走分段
-     * 逻辑（downloader 会自己判断），传 true 不影响它们。
+     * segment 恒为 true —— 直播按段切，结束后由 Actions 合并。
+     * 普通直链/HLS 本来就不走分段逻辑（downloader 会自己判断），
+     * 传 true 不影响它们。
      */
     const res = await fetch('/api/tasks', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, upload, segment: true }),
+      body: JSON.stringify({ text, upload, segment: true, mode, maxSeconds }),
     });
     if (res.status === 401) { showLogin(); return; }
 

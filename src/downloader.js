@@ -1350,6 +1350,17 @@ async function downloadLive(job, ctx) {
         baseName,
         startNumber: segOffset,
         segmentSeconds: effectiveSec,
+        /**
+         * 剩余可录时长 = 总上限 - 已经录掉的秒数。
+         *
+         * 外层循环每次重连都会重新起一个 ffmpeg，如果每轮都传完整的
+         * maxSeconds，重连几次就会录超。用「已产出段数 × 段长」估算
+         * 已经用掉的时间，传剩余量。
+         */
+        maxSeconds:
+          ctx.maxSeconds > 0
+            ? Math.max(ctx.maxSeconds - segOffset * effectiveSec, 0)
+            : 0,
         signal,
         onLog,
         onSegmentFile: handleSegment,
@@ -1411,7 +1422,7 @@ async function downloadLive(job, ctx) {
  * -segment_time 按秒切，ffmpeg 会自动找关键帧对齐
  */
 function runFfmpegSegments(opts) {
-  const { url, dir, baseName, startNumber, segmentSeconds, signal, onLog, onSegmentFile } = opts;
+  const { url, dir, baseName, startNumber, segmentSeconds, signal, onLog, onSegmentFile, maxSeconds = 0 } = opts;
 
   return new Promise((resolve, reject) => {
     // 序号在前，与 handleSegment 的最终命名保持一致，
@@ -1444,6 +1455,17 @@ function runFfmpegSegments(opts) {
       '-reconnect_at_eof', '1',
 
       '-i', url,
+      /**
+       * 录制时长上限。
+       *
+       * 放在 -i 之后作为**输出选项**：让 ffmpeg 在写出足够时长的数据后
+       * 自己正常退出，而不是靠外层定时器去 kill 进程。
+       * kill 会让最后一段（正在写的那个）来不及 flush，丢掉尾巴。
+       *
+       * maxSeconds=0 表示不限，此时不传这个参数
+       * （不能传 -t 0，那会被 ffmpeg 理解成「输出 0 秒」直接退出）。
+       */
+      ...(maxSeconds > 0 ? ['-t', String(maxSeconds)] : []),
       '-c', 'copy',
       '-f', 'segment',
       '-segment_format', 'flv',

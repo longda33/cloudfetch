@@ -455,7 +455,23 @@ export class TaskManager extends EventEmitter {
    *   false = 「全段下载」，整个直播录成一个大文件，不切段。
    *   注意：不分段时单文件会持续增长，需自行承担磁盘与上传体积风险。
    */
-  create({ url, filename, upload = true, segment = true }) {
+  /**
+   * 创建任务。
+   *
+   * @param {object} opts
+   * @param {string} opts.url
+   * @param {string} [opts.filename]
+   * @param {boolean} [opts.upload=true]
+   * @param {boolean} [opts.segment=true]
+   * @param {'cfr'|'remux'} [opts.mode='cfr']
+   *   转码输出方式。cfr = 重编码成恒定帧率（兼容性最好），
+   *   remux = 纯 -c copy（快 10 倍、字面无损，但部分播放器拖不动进度条）。
+   *   见 scripts/transcode-worker.mjs 里 remuxToMp4 的说明。
+   * @param {number} [opts.maxSeconds=0]
+   *   最长录制秒数，0 = 不限制（录到用户手动停止或直播结束）。
+   *   只对直播生效，普通文件下载忽略。
+   */
+  create({ url, filename, upload = true, segment = true, mode = 'cfr', maxSeconds = 0 }) {
     if (!url || typeof url !== 'string') throw new Error('缺少 url');
     let parsed;
     try {
@@ -490,6 +506,18 @@ export class TaskManager extends EventEmitter {
       status: STATUS.QUEUED,
       upload: Boolean(upload),
       segment: segment !== false,
+      /**
+       * 转码输出方式。'cfr'（默认）| 'remux'。
+       * 校验放在这里而不是信任前端 —— 前端传错值时退回默认，
+       * 不要让一个拼写错误导致 Actions 那边跑出意外的产物。
+       */
+      mode: mode === 'remux' ? 'remux' : 'cfr',
+      /**
+       * 最长录制秒数。0 = 不限制。
+       * 上限 24 小时，避免有人传个巨大数字把 ffmpeg 挂到天荒地老。
+       * 只对直播有意义，普通下载由文件本身长度决定。
+       */
+      maxSeconds: Math.min(Math.max(Number(maxSeconds) || 0, 0), 86400),
       createdAt: Date.now(),
       startedAt: null,
       finishedAt: null,
@@ -1400,6 +1428,11 @@ export class TaskManager extends EventEmitter {
         dir: jobDir,
         filename: t.filename,
         segment: t.segment !== false,
+        /**
+         * 最长录制秒数，0 = 不限。
+         * 只有直播会读它，普通文件下载忽略。
+         */
+        maxSeconds: t.maxSeconds || 0,
         signal: ac.signal,
         onProgress,
         onLog,
@@ -1485,6 +1518,7 @@ export class TaskManager extends EventEmitter {
                 outName,
                 openlistDir,
                 taskId: t.id,
+                mode: t.mode,
               }),
             );
             t.mergedSubmitted = true;

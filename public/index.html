@@ -114,6 +114,37 @@
             <span class="switch-track"><span class="switch-thumb"></span></span>
             <span>转码后存 OpenList</span>
           </label>
+
+          <!--
+            输出方式。
+              cfr   —— 重编码成恒定帧率，任何播放器都能拖进度条（默认）
+              remux —— 纯 -c copy，快 1600 倍且字面无损，但 PotPlayer 拖不动进度条
+            默认 cfr：拿到一个拖不动进度条的视频等于不能用。
+          -->
+          <label class="select-field" title="cfr 兼容性最好；remux 快 1600 倍且无损，但部分播放器拖不动进度条">
+            <span class="select-label">输出</span>
+            <select class="select select-sm" id="modeSelect" aria-label="转码输出方式">
+              <option value="cfr" selected>CFR（通用）</option>
+              <option value="remux">原样封装（快·无损）</option>
+            </select>
+          </label>
+
+          <!--
+            录制时长。只对直播生效，普通文件按文件本身长度。
+            0 = 不限，一直录到手动停止或直播结束。
+          -->
+          <label class="select-field" title="只对直播生效。到时间自动停止并开始合并转码">
+            <span class="select-label">录制</span>
+            <select class="select select-sm" id="durationSelect" aria-label="最长录制时长">
+              <option value="0" selected>不限</option>
+              <option value="1800">30 分钟</option>
+              <option value="3600">1 小时</option>
+              <option value="7200">2 小时</option>
+              <option value="10800">3 小时</option>
+              <option value="21600">6 小时</option>
+            </select>
+          </label>
+
           <button class="btn btn-primary" id="btnAdd" type="submit" title="直播按 5 分钟切段存到 R2，结束后由 GitHub Actions 合并成一个 MP4 传到 OpenList">
             <svg class="ic" aria-hidden="true"><use href="#i-download"></use></svg>
             确认下载
