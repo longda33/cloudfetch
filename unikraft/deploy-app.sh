@@ -60,6 +60,16 @@ fi
 #   -m ${MEMORY}            ffmpeg rootfs 常驻内存，给足
 #   -p 443:8080/http+tls    容器内 PORT=8080
 log "部署 ${INSTANCE}（${MEMORY}，metro=${METRO}）"
+
+# 转码链路是可选能力：只有显式提供了才注入，避免把空值写进实例环境
+# （空字符串会覆盖镜像里的默认值）。
+EXTRA_ENV=()
+for k in R2_ACCOUNT_ID R2_ENDPOINT R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET R2_PREFIX \
+         GH_REPO GH_TOKEN GH_WORKFLOW GH_REF TRANSCODE_ENABLED TRANSCODE_TIMEOUT; do
+  v="${!k:-}"
+  [ -n "$v" ] && EXTRA_ENV+=(-e "${k}=${v}")
+done
+
 unikraft run \
   --metro "$METRO" \
   --name "$INSTANCE" \
@@ -75,7 +85,8 @@ unikraft run \
   -e "OPENLIST_UPLOAD_DIR=${OPENLIST_UPLOAD_DIR:-/od-20200439/cloudfetch}" \
   -e "PANEL_PASSWORD=${PANEL_PASSWORD}" \
   -e "DELETE_AFTER_UPLOAD=${DELETE_AFTER_UPLOAD:-true}" \
-  -e "LIVE_SEGMENT_SECONDS=${LIVE_SEGMENT_SECONDS:-300}"
+  -e "LIVE_SEGMENT_SECONDS=${LIVE_SEGMENT_SECONDS:-300}" \
+  ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"}
 
 # ---------- 4) 等就绪 ----------
 log "等待 running"

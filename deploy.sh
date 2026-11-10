@@ -78,6 +78,15 @@ if [ -n "${EXISTING}" ]; then
     local key="$1" val="$2"
     [ -z "${val}" ] && return 0
 
+    # 密钥不回显：
+    # 上面特意用环境变量传值，就是为了不让密钥出现在 ps/proc 里；
+    # 但如果这里原样 echo 出来，CI 日志（GitHub Actions 控制台）会把它
+    # 明文留下来，等于换个地方泄露。凡 key 名像密钥的一律打成 ***。
+    local shown="$val"
+    case "$key" in
+      *PASSWORD*|*TOKEN*|*SECRET*|*KEY*) shown="***" ;;
+    esac
+
     # 查这个 key 是否已存在
     local vid
     vid="$(echo "${VARS_JSON}" | python -c "
@@ -105,7 +114,7 @@ except Exception: pass
     fi
 
     if [ "${code}" = "200" ] || [ "${code}" = "201" ]; then
-      echo "      ${key} = ${val} ✓"
+      echo "      ${key} = ${shown} ✓"
     else
       echo "      ${key} 写入返回 HTTP ${code}：$(head -c 200 /tmp/_v.out)"
     fi
@@ -121,6 +130,20 @@ except Exception: pass
   [ -n "${PANEL_PASSWORD:-}" ] && set_var "PANEL_PASSWORD" "${PANEL_PASSWORD}"
   [ -n "${OPENLIST_URL:-}" ]   && set_var "OPENLIST_URL" "${OPENLIST_URL}"
   [ -n "${OPENLIST_TOKEN:-}" ] && set_var "OPENLIST_TOKEN" "${OPENLIST_TOKEN}"
+
+  # 转码链路（可选）。不传就是关闭状态，行为退回「原始文件直接传 OpenList」。
+  # 之前这些变量完全没有透传，导致用本脚本部署出来的实例永远开不了转码。
+  [ -n "${R2_ACCOUNT_ID:-}" ]       && set_var "R2_ACCOUNT_ID" "${R2_ACCOUNT_ID}"
+  [ -n "${R2_ENDPOINT:-}" ]         && set_var "R2_ENDPOINT" "${R2_ENDPOINT}"
+  [ -n "${R2_ACCESS_KEY_ID:-}" ]    && set_var "R2_ACCESS_KEY_ID" "${R2_ACCESS_KEY_ID}"
+  [ -n "${R2_SECRET_ACCESS_KEY:-}" ] && set_var "R2_SECRET_ACCESS_KEY" "${R2_SECRET_ACCESS_KEY}"
+  [ -n "${R2_BUCKET:-}" ]           && set_var "R2_BUCKET" "${R2_BUCKET}"
+  [ -n "${R2_PREFIX:-}" ]           && set_var "R2_PREFIX" "${R2_PREFIX}"
+  [ -n "${GH_REPO:-}" ]             && set_var "GH_REPO" "${GH_REPO}"
+  [ -n "${GH_TOKEN:-}" ]            && set_var "GH_TOKEN" "${GH_TOKEN}"
+  [ -n "${GH_WORKFLOW:-}" ]         && set_var "GH_WORKFLOW" "${GH_WORKFLOW}"
+  [ -n "${GH_REF:-}" ]              && set_var "GH_REF" "${GH_REF}"
+  [ -n "${TRANSCODE_ENABLED:-}" ]   && set_var "TRANSCODE_ENABLED" "${TRANSCODE_ENABLED}"
   rm -f /tmp/_v.out
 
   echo "    触发重新部署"
