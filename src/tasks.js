@@ -677,6 +677,118 @@ export class TaskManager extends EventEmitter {
     return { removed: done.length, kept };
   }
 
+  /**
+   * 彻底清空临时目录 —— 「清空磁盘」按钮。
+   *
+   * 和 clearFinished() 的区别：
+   *
+   *   clearFinished  只删**已知任务**的目录，而且会跳过有受保护源分段的
+   *                  任务。它是「整理列表」，不是「腾空间」。
+   *
+   *   purgeDisk      扫 tmpDir 下**所有**条目，不管有没有对应任务。
+   *                  残留目录（任务被删了但目录没删干净、上次进程崩溃
+   *                  留下的半截文件、手动上传的测试文件）都能清掉。
+   *
+   * 为什么需要它：卷只有 973MB，实测用着用着会剩 929MB 可用、44MB 不翼而飞。
+   * 那些字节不属于任何已知任务，clearFinished 永远够不着。
+   *
+   * 安全边界：
+   *   - 正在跑的任务目录**跳过**，否则 ffmpeg 还在往里写
+   *   - 只处理 tmpDir 的直接子项，不递归到 tmpDir 之外
+   *   - 每个路径都做 resolve + 前缀校验，防止软链或路径穿越
+   *
+   * @returns {Promise<{freed: number, removed: number, skipped: number}>}
+   */
+  async purgeDisk() {
+    /**
+     * 正在跑的任务 id 集合。
+     *
+     * 同时看 running（正在下载）和 queue 里已经拿到 _abort 的，
+     * 但排队中的任务还没建目录，只需要保护 running。
+     */
+    const busy = new Set(this.running.keys());
+
+    let freed = 0;
+    let removed = 0;
+    let skipped = 0;
+
+    const root = path.resolve(config.tmpDir);
+    let entries;
+    try {
+      entries = await fsp.readdir(root, { withFileTypes: true });
+    } catch (e) {
+      // 目录不存在 = 本来就干净，不算错误
+      if (e.code === 'ENOENT') return { freed: 0, removed: 0, skipped: 0 };
+      throw e;
+    }
+
+    for (const ent of entries) {
+      // 正在跑的任务，目录里可能有 ffmpeg 正在写的文件，别动
+      if (busy.has(ent.name)) {
+        skipped++;
+        continue;
+      }
+
+      const target = path.join(root, ent.name);
+      /**
+       * 双重校验：resolve 之后必须仍在 root 之内。
+       * readdir 返回的名字理论上不会有 ..，但软链可以指向外面，
+       * 而 fsp.rm(recursive) 会顺着软链删 —— 那是灾难。
+       */
+      const resolved = path.resolve(target);
+      if (!resolved.startsWith(root + path.sep)) {
+        skipped++;
+        continue;
+      }
+
+      // 先算体积，删完就没法算了
+      const sz = await this._sizeOfPath(resolved);
+
+      try {
+        await fsp.rm(resolved, { recursive: true, force: true });
+        freed += sz;
+        removed++;
+      } catch (e) {
+        this.emit('log', { id: '', line: `[清空磁盘] ${ent.name} 删除失败：${e.message}` });
+        skipped++;
+      }
+    }
+
+    /**
+     * 任务对象还在内存里，但目录已经没了。
+     * 不清掉这些任务的 localPath，界面会显示一个不存在的路径，
+     * 用户点「重传」会报 ENOENT。所以顺手把指向已删目录的 localPath 抹掉。
+     */
+    for (const t of this.tasks.values()) {
+      if (t.localPath && !fs.existsSync(t.localPath)) t.localPath = '';
+    }
+
+    return { freed, removed, skipped };
+  }
+
+  /** 递归算一个路径占多少字节。出错就返回已累计的部分，不抛 */
+  async _sizeOfPath(p) {
+    let total = 0;
+    let st;
+    try {
+      st = await fsp.lstat(p);
+    } catch {
+      return 0;
+    }
+    if (!st.isDirectory()) return st.size;
+
+    let names;
+    try {
+      names = await fsp.readdir(p);
+    } catch {
+      return 0;
+    }
+    for (const n of names) {
+      total += await this._sizeOfPath(path.join(p, n));
+    }
+    return total;
+  }
+
   /** 删除某个任务的临时目录，失败只记日志不抛错 */
   async _removeJobDir(id) {
     // 只允许删 tmpDir 下、名字是任务 id 的目录，防止路径穿越

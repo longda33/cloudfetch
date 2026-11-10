@@ -1249,6 +1249,64 @@ $('#btnClear').addEventListener('click', async () => {
     toast(e.message, 'err');
   }
 });
+/**
+ * 清空磁盘。
+ *
+ * 和上面的「清空已结束」不是一回事：
+ *   清空已结束  只删已完成任务的目录，且跳过有受保护源分段的
+ *   清空磁盘    扫临时目录下所有东西，包括没有对应任务的残留
+ *
+ * 卷只有 973MB，残留几十 MB 就开不了新任务，所以这个按钮是必须的。
+ * 正在运行的任务目录服务端会跳过，不用担心把 ffmpeg 写坏。
+ */
+$('#btnDiskPurge').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  /**
+   * 二次确认。
+   *
+   * 这个操作不可撤销，而且它会删掉「转码失败任务的本地分段」——
+   * 那些分段虽然 R2 上有备份，但本地这份删了就得重新下载。
+   * 用户可能只是看到数字不好看随手点一下，所以要拦一道。
+   */
+  const ok = confirm(
+    '清空临时目录里的所有文件？\n\n' +
+      '· 正在运行的任务会被跳过\n' +
+      '· 已上传的文件不受影响（OpenList 上的都在）\n' +
+      '· 但本地未上传的分段会丢失，需要重新下载',
+  );
+  if (!ok) return;
+
+  const original = btn.innerHTML;
+  btn.disabled = true;
+  btn.textContent = '清理中…';
+  try {
+    const r = await fetch('/api/disk/purge', { method: 'POST' });
+    if (r.status === 401) { showLogin(); return; }
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || '清理失败');
+
+    /**
+     * 文案要同时给出「删了多少」和「现在还剩多少」。
+     *
+     * 只报 freed 会让人困惑：删了 40MB 但可用只涨了 2MB
+     * （块对齐、元数据、别的进程在写）。两个数都给，用户自己判断。
+     */
+    let msg = `已清理 ${j.removed} 项`;
+    if (j.freed > 0) msg += `，释放 ${j.freedText}`;
+    if (j.skipped > 0) msg += `，跳过 ${j.skipped} 项（运行中或删除失败）`;
+    msg += `；磁盘可用 ${j.freeAfterText}`;
+
+    toast(msg, j.skipped > 0 ? 'warn' : 'ok');
+
+    // 刷新磁盘显示和任务列表（localPath 可能被服务端清空了）
+    await Promise.all([reloadTasks().catch(() => {}), refreshChips().catch(() => {})]);
+  } catch (err) {
+    toast(err.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = original;
+  }
+});
 
 $('#btnLogin').addEventListener('click', doLogin);
 $('#pwdInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });

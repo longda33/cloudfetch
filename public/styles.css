@@ -1137,3 +1137,17 @@ html[data-theme="light"] .badge.processing { color: #1d4ed8; }
 
 .toast.warn { border-color: color-mix(in srgb, var(--warn, #f59e0b) 40%, var(--line)); }
 .toast.warn .ic { color: var(--warn, #f59e0b); }
+/**
+ * 磁盘卡片里的「清空磁盘」按钮。
+ *
+ * 卡片本身很窄，按钮不能撑满：撑满会把磁盘进度条挤变形。
+ * 用 align-self: flex-start 让它只占自己需要的宽度，靠左对齐。
+ */
+.disk-purge {
+  margin-top: 8px;
+  align-self: flex-start;
+  font-size: 11px;
+  padding: 3px 8px;
+  gap: 4px;
+}
+.disk-purge .ic { width: 12px; height: 12px; }

@@ -197,6 +197,17 @@
         <div class="stat-value" id="statDisk">—</div>
         <div class="stat-sub" id="statDiskSub">临时目录</div>
         <div class="disk-bar"><i id="diskBar"></i></div>
+        <!--
+          「清空磁盘」和上面的「清空已结束」不是一回事：
+            清空已结束 只删已完成任务的目录，且跳过有受保护源分段的
+            清空磁盘   扫临时目录下所有东西，包括没有对应任务的残留
+          卷只有 973MB，残留几十 MB 就没法开新任务了，所以需要这个。
+        -->
+        <button class="btn btn-ghost btn-xs disk-purge" id="btnDiskPurge" type="button"
+                title="清空临时目录里的所有文件（正在运行的任务会跳过）">
+          <svg class="ic" aria-hidden="true"><use href="#i-trash"></use></svg>
+          <span class="btn-label">清空磁盘</span>
+        </button>
       </div>
     </div>
   </section>

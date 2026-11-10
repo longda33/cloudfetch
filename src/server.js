@@ -386,6 +386,55 @@ app.post('/api/probe', (req, res) => {
 });
 
 /**
+ * 清空临时目录 —— 「清空磁盘」按钮。
+ *
+ * 和 /api/tasks/clear 的区别，这一点必须说清，否则用户会以为两者等价：
+ *
+ *   /api/tasks/clear   只清「已完成任务」的目录，而且跳过有受保护源分段的
+ *                      任务。它是整理列表，不是腾空间。
+ *
+ *   /api/disk/purge    扫 tmpDir 下**所有**条目，不管有没有对应任务。
+ *                      残留目录、崩溃留下的半截文件都能清掉。
+ *
+ * 实测过：卷 973MB，用着用着剩 929MB 可用，44MB 不翼而飞。那部分
+ * 不属于任何已知任务，clear 永远够不着 —— 这个端点就是为它准备的。
+ *
+ * 保护：正在跑的任务目录会跳过（ffmpeg 还在往里写）。
+ */
+app.post('/api/disk/purge', async (req, res) => {
+  /** 读 tmpDir 所在文件系统的可用字节。statfs 在个别平台会失败，失败就当 0 */
+  const freeNow = async () => {
+    try {
+      const s = await fs.promises.statfs(config.tmpDir);
+      return s.bfree * s.bsize;
+    } catch {
+      return 0;
+    }
+  };
+
+  try {
+    const before = await freeNow();
+    const r = await mgr.purgeDisk();
+    const after = await freeNow();
+    res.json({
+      ok: true,
+      removed: r.removed,
+      skipped: r.skipped,
+      freed: r.freed,
+      freedText: humanSize(r.freed),
+      freeBefore: before,
+      freeAfter: after,
+      freeAfterText: humanSize(after),
+      // 实际回收量可能和 r.freed 有出入（元数据、块对齐），两个都给出
+      reclaimed: after - before,
+      reclaimedText: humanSize(Math.max(after - before, 0)),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/**
  * 后端服务连通性（给右上角的状态灯用）。
  *
  * 和 /api/health 的区别：
