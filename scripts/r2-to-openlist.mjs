@@ -47,7 +47,20 @@ function parseArgs(argv) {
     else if (a === '--dry-run') out.dryRun = true;
     else if (a === '--keep-r2') out.keepR2 = true;
     else if (a === '--delete-only') out.deleteOnly = true;
-    else if (a === '--limit') out.limit = Number(argv[++i]) || 0;
+    else if (a === '--limit') {
+      /**
+       * 必须是正整数。
+       *
+       * 之前写成 `Number(argv[++i]) || 0`，而 0 的语义是「不限」——
+       * 用户打错成 `--limit 10x` 会得到 0，于是**处理全部对象**，
+       * 而这是个会删 R2 源文件的脚本，误操作的代价太大。
+       */
+      const v = Number(argv[++i]);
+      if (!Number.isInteger(v) || v <= 0) {
+        throw new Error(`--limit 需要一个正整数，收到：${argv[i]}`);
+      }
+      out.limit = v;
+    }
     else if (a === '--help' || a === '-h') {
       console.log(
         [
@@ -134,6 +147,21 @@ function r2Url(key, query = '') {
   return `${R2_BASE}${p}${query ? '?' + query : ''}`;
 }
 
+/**
+ * 解析 ListObjectsV2 的 XML。
+ *
+ * Key 里可能有 `&amp;` `&lt;` 这类实体（文件名带 & 就会转义），
+ * 不还原就会拿一个不存在的 key 去 GET，白白失败。
+ */
+const unescapeXml = (s) =>
+  s
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(Number(d)))
+    .replace(/&amp;/g, '&');
+
 /** 列出前缀下所有对象，自动翻页 */
 async function r2List(prefix) {
   const out = [];
@@ -158,7 +186,7 @@ async function r2List(prefix) {
       throw new Error(`R2 LIST 失败 HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
     }
     const body = await res.text();
-    const keys = [...body.matchAll(/<Key>([^<]+)<\/Key>/g)].map((m) => m[1]);
+    const keys = [...body.matchAll(/<Key>([^<]+)<\/Key>/g)].map((m) => unescapeXml(m[1]));
     const sizes = [...body.matchAll(/<Size>(\d+)<\/Size>/g)].map((m) => Number(m[1]));
     keys.forEach((key, i) => out.push({ key, size: sizes[i] || 0 }));
 
@@ -250,6 +278,13 @@ async function olEnsureDir(dir) {
       throw new Error(`建目录失败 ${cur}: ${msg.slice(0, 160)}`);
     }
   }
+}
+
+/** 读取远端文件大小，读不到返回 null */
+async function olSize(remotePath) {
+  const r = await olRequest('POST', '/api/fs/get', { body: { path: remotePath } });
+  const size = Number(r.json?.data?.size);
+  return Number.isFinite(size) ? size : null;
 }
 
 /**
@@ -352,6 +387,22 @@ async function streamR2ToOpenList(r2Key, remotePath, size) {
   if (!compRes.ok || (compRes.json?.code !== undefined && compRes.json.code !== 200)) {
     throw new Error(`分片合并失败：${(compRes.json?.message || compRes.text).slice(0, 200)}`);
   }
+
+  /**
+   * 删 R2 之前必须核对远端大小。
+   *
+   * 这个脚本的下一步就是 r2Delete —— 一旦传上去的东西不对（分片缺失、
+   * 驱动写坏），源文件又被删掉，那就是不可恢复的数据丢失。
+   * 读不到大小也按失败处理（宁可留着，也不要赌）。
+   */
+  const remoteSize = await olSize(remotePath);
+  if (remoteSize === null) {
+    throw new Error('上传完成但读不到远端大小，为安全起见不删除 R2 源文件');
+  }
+  if (remoteSize !== size) {
+    throw new Error(`远端大小不符：应为 ${size}，实际 ${remoteSize}，不删除 R2 源文件`);
+  }
+
   return remotePath;
 }
 
@@ -368,8 +419,17 @@ const human = (n) => {
 async function main() {
   const args = parseArgs(process.argv);
 
-  if (!R2_ACCOUNT_ID || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET) {
-    throw new Error('缺少 R2 环境变量');
+  /**
+   * 只要求「能拼出 endpoint」+ 密钥 + 桶。
+   *
+   * 和 src/r2.js、transcode-worker 保持一致：R2 用 accountId 拼域名，
+   * MinIO / B2 这类只能给 R2_ENDPOINT，不该强制填 accountId。
+   */
+  const hasEndpoint = Boolean(R2_ENDPOINT || R2_ACCOUNT_ID);
+  if (!hasEndpoint || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET) {
+    throw new Error(
+      '缺少 R2 环境变量（需要 R2_ENDPOINT 或 R2_ACCOUNT_ID，以及 KEY/SECRET/BUCKET）',
+    );
   }
   if (!args.prefix) throw new Error('缺少 --prefix');
   if (!args.deleteOnly && !args.dir) throw new Error('缺少 --dir');
