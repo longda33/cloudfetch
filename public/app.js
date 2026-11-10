@@ -1448,12 +1448,74 @@ document.addEventListener('click', async (e) => {
       toast(err.message, 'err');
     }
   } else if (hact === 'del') {
-    const r = await fetch(`/api/history/${hid}`, { method: 'DELETE' });
-    if (r.ok) {
-      toast('已删除');
-      loadHistory();
-    } else {
-      toast('删除失败', 'err');
+    /**
+     * 删除一条历史记录。
+     *
+     * 之前这段只有 6 行，问题有三个，用户反馈「点了没反应」：
+     *
+     *   1. 没有确认框 —— 手滑就删了，而且不可恢复
+     *   2. 没有加载态 —— 请求发出到返回这段时间按钮毫无变化，
+     *      用户以为没点上，会连点好几下
+     *   3. loadHistory() 没有 await —— toast 先弹、列表后刷，
+     *      而且失败时只弹一句「删除失败」，不告诉用户为什么
+     *
+     * 现在补齐：确认 → 按钮禁用 + 文案变化 → 请求 → 精确的成败提示
+     * → 等列表刷新完再收尾。
+     */
+    const ok = confirm('删除这条历史记录？\n\n只删记录，不影响已经传到 OpenList / R2 的文件。');
+    if (!ok) return;
+
+    // 按钮进入「处理中」状态，防止连点
+    const delBtn = item?.querySelector('[data-hact="del"]');
+    const original = delBtn ? delBtn.innerHTML : '';
+    if (delBtn) {
+      delBtn.disabled = true;
+      delBtn.textContent = '删除中…';
+    }
+
+    try {
+      const r = await fetch(`/api/history/${hid}`, { method: 'DELETE' });
+      if (r.status === 401) {
+        showLogin();
+        return;
+      }
+
+      /**
+       * 解析响应体拿具体错误。
+       *
+       * 之前是 `if (r.ok) ... else toast('删除失败')` —— 401/404/500
+       * 全都显示同一句话，用户无从判断是网络问题还是记录已经没了。
+       */
+      let j = {};
+      try {
+        j = await r.json();
+      } catch {
+        /* 非 JSON 响应，下面用状态码兜底 */
+      }
+
+      if (!r.ok) {
+        const why = j.error || `HTTP ${r.status}`;
+        throw new Error(why);
+      }
+
+      toast('已删除该条历史记录', 'ok');
+
+      /**
+       * 必须 await。
+       *
+       * 不 await 的话，toast 弹出来的瞬间列表还是旧的，
+       * 用户看到「已删除」但那条记录还在，会以为删除失败了。
+       * 等刷新完再结束，视觉上才是连贯的。
+       */
+      await loadHistory();
+      await refreshHistoryCount();
+    } catch (err) {
+      toast(`删除失败：${err.message}`, 'err');
+    } finally {
+      if (delBtn) {
+        delBtn.disabled = false;
+        delBtn.innerHTML = original;
+      }
     }
   }
 });
