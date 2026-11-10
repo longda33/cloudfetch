@@ -249,7 +249,21 @@ async function downloadSingleStream(url, dest, job, ctx, expectedTotal) {
         throw new FatalError(`HTTP ${res.status}`);
       }
       if (res.status === 416) {
-        // 已经下完了
+        /**
+         * 416 = 请求起点超过远端长度。
+         *
+         * 正常情况下这意味着「已经下完」（startAt === expectedTotal），
+         * 直接改名收工。但如果远端文件在中途变小了，startAt 会大于新长度 ——
+         * 这时把 .part 当成完整文件 rename 出去，上传的就是一份
+         * "前半段是新文件、后半段是旧文件"的坏数据，而且没有任何报错。
+         * 长度对不上就丢掉重下。
+         */
+        if (expectedTotal && startAt !== expectedTotal) {
+          await fsp.rm(partPath, { force: true });
+          throw new RetryableError(
+            `续传位置与远端不一致（本地 ${startAt} / 远端 ${expectedTotal}），已丢弃重下`,
+          );
+        }
         await fsp.rename(partPath, dest);
         return;
       }
@@ -531,6 +545,29 @@ async function sizeOf(p) {
   } catch {
     return 0;
   }
+}
+
+/**
+ * 直播录制还允许再录多少秒。
+ *
+ * maxSeconds=0 表示不限，返回 0（调用方据此不传 `-t`）。
+ * 注意不能返回负数，也不能把「已到上限」表达成 0 —— 0 的含义是"不限"，
+ * 会把「该停了」变成「一直录」。
+ */
+export function remainingRecordSeconds(recordedSec, maxSeconds) {
+  if (!(maxSeconds > 0)) return 0;
+  return Math.max(maxSeconds - Math.max(0, recordedSec || 0), 0);
+}
+
+/**
+ * 是否已经录满（该停止重连了）。
+ *
+ * 单独抽出来是因为它容易被写错：ffmpeg 到点会**正常退出**（code 0），
+ * 外层循环不会报错、也不会命中"连续无数据"，只能靠这个判断收尾。
+ * 漏了它就会在剩余量为 0 之后继续重连，而 0 表示不限 → 无限录制。
+ */
+export function recordingBudgetExhausted(recordedSec, maxSeconds) {
+  return maxSeconds > 0 && (recordedSec || 0) >= maxSeconds;
 }
 
 /**
@@ -1218,6 +1255,13 @@ async function downloadLive(job, ctx) {
   let emptyStreak = 0;
   let segOffset = 0; // 已产出的段数，用于续接编号
   let totalBytes = 0;
+  /**
+   * 已录制时长（秒），由每段的真实媒体时长累加。
+   *
+   * 不能用「段数 × 段长」估算：最后一段通常是残缺的（到上限就收尾），
+   * 按段长算会高估，导致提前停止；而且重连时段的实际时长也会漂移。
+   */
+  let recordedSec = 0;
   let segStartAt = Date.now(); // 当前段的起始时间，用于反推码率
 
   // 每段产出后立即回调（上传/删本地由上层负责）
@@ -1287,6 +1331,7 @@ async function downloadLive(job, ctx) {
      * 这里只记录码率用于日志。
      */
     const elapsedSec = segDurSec > 0 ? segDurSec : Math.max(1, (Date.now() - segStartAt) / 1000);
+    recordedSec += elapsedSec;
     const bytesPerSec = sz / elapsedSec;
     if (bytesPerSec > 0 && idx === 1) {
       onLog?.(
@@ -1354,13 +1399,9 @@ async function downloadLive(job, ctx) {
          * 剩余可录时长 = 总上限 - 已经录掉的秒数。
          *
          * 外层循环每次重连都会重新起一个 ffmpeg，如果每轮都传完整的
-         * maxSeconds，重连几次就会录超。用「已产出段数 × 段长」估算
-         * 已经用掉的时间，传剩余量。
+         * maxSeconds，重连几次就会录超。传剩余量，用真实累计时长算。
          */
-        maxSeconds:
-          ctx.maxSeconds > 0
-            ? Math.max(ctx.maxSeconds - segOffset * effectiveSec, 0)
-            : 0,
+        maxSeconds: remainingRecordSeconds(recordedSec, ctx.maxSeconds),
         signal,
         onLog,
         onSegmentFile: handleSegment,
@@ -1384,6 +1425,24 @@ async function downloadLive(job, ctx) {
       }
     } finally {
       if (sampler) clearInterval(sampler);
+    }
+
+    /**
+     * 到达录制上限就结束，别再重连。
+     *
+     * ffmpeg 是按 `-t 剩余秒数` **正常退出**（code 0）的，所以下面
+     * 不会抛错、也不会命中「连续无数据」的分支。少了这个判断，循环会
+     * 立刻再起一个 ffmpeg —— 而这时剩余量已经是 0，`maxSeconds > 0`
+     * 不成立就不传 `-t`，于是变成**无限录制**，用户设的 30 分钟形同虚设。
+     */
+    if (recordingBudgetExhausted(recordedSec, ctx.maxSeconds)) {
+      // 上限可能小于 1 分钟（测试/试录），别显示成「0 分钟」
+      const limitText =
+        ctx.maxSeconds >= 60
+          ? `${Math.round(ctx.maxSeconds / 60)} 分钟`
+          : `${Math.round(ctx.maxSeconds)} 秒`;
+      onLog?.(`已达到录制上限 ${limitText}（实际 ${Math.round(recordedSec)} 秒），停止录制`);
+      break;
     }
 
     const produced = segOffset - before;
